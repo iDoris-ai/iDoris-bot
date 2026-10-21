@@ -1,0 +1,2 @@
+# Preserve the original v0.1 artifact byte-for-byte (Markdown hard-line-break spaces).
+docs/archive/IDORIS-SNS-BRIDGE-ARCHITECTURE-v0.1.md whitespace=-blank-at-eol
