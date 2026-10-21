@@ -2,6 +2,8 @@
 
 **版本：** 2026-10-21 v0.2 · **状态：** 规划，尚未开始功能实施；本版本取代以前的 G0–G5 六段主计划（完整历史版见 [归档](archive/2026-10-21-G0-G5-baseline.md)）。
 
+初版综合方案 [IDORIS-SNS-BRIDGE-ARCHITECTURE-v0.1.md](archive/IDORIS-SNS-BRIDGE-ARCHITECTURE-v0.1.md) 已原文保留；逐章节对照见 [历史文档索引](archive/README.md)。
+
 ## 总体承诺与不能延后的约束
 
 **第一阶段 LINE：** 先让个人本地 Agent24 与自有 LINE OA 真实通信，逐步扩展到小商家和社区/组织，共 **LINE 三步**。**第二阶段其他 SNS：** Telegram → WhatsApp Business（基于官方 Cloud API），兼容更多渠道。**第三阶段开放生态与可运营：** 通用 AgentAdapter、正式开放自托管/托管 Relay、可移植性、发布与服务生态。
