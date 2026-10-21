@@ -34,9 +34,9 @@ LINE Thailand 另提供可选 **OA Chat Package（฿555/月，未含 VAT）**�
 
 ## 3. WhatsApp Business Platform
 
-**与 LINE 不同。** WhatsApp Cloud API 采用 Meta 按消息类别、收件人市场等计价；2026-10-01 起第三方资料对政策变动描述为：服务类非模板回复在每个商业号码月度 1,000 条免费额度之后按相应地区费率计费，原本免费的某些 utility 模板在服务窗口内也改为收费。具体费率、Meta 条款、号码等级和 BSP 附加费，必须在 G4 使用**Meta 当期官方 pricing / rate cards**核对，不能仅依据第三方宣传或旧 2025 文档付款。公开参考：[Flowcall 2026-10 费率概述](https://www.flowcall.co/blog/whatsapp-business-api-pricing)、[Meta 开发者入口](https://developers.facebook.com/docs/whatsapp/)。
+**与 LINE 不同。** WhatsApp Cloud API 采用 Meta 按消息类别、收件人市场等计价；2026-10-01 起第三方资料对政策变动描述为：服务类非模板回复在每个商业号码月度 1,000 条免费额度之后按相应地区费率计费，原本免费的某些 utility 模板在服务窗口内也改为收费。具体费率、Meta 条款、号码等级和 BSP 附加费，必须在 P2-W 使用**Meta 当期官方 pricing / rate cards**核对，不能仅依据第三方宣传或旧 2025 文档付款。公开参考：[Flowcall 2026-10 费率概述](https://www.flowcall.co/blog/whatsapp-business-api-pricing)、[Meta 开发者入口](https://developers.facebook.com/docs/whatsapp/)。
 
-此外 Meta 2026 起限制把通用第三方 AI 助手作为 WhatsApp Business 解决方案的主要功能；商户自有业务客服/订购/预约 Agent 与“开放式 ChatGPT 替代品”应严格区分，需政策审核后才能承诺 G4 功能。参考：[政策变化报道](https://techcrunch.com/2025/10/18/whatssapp-changes-its-terms-to-bar-general-purpose-chatbots-from-its-platform/)。
+此外 Meta 2026 起限制把通用第三方 AI 助手作为 WhatsApp Business 解决方案的主要功能；商户自有业务客服/订购/预约 Agent 与“开放式 ChatGPT 替代品”应严格区分，需政策审核后才能承诺 P2-W 功能。参考：[政策变化报道](https://techcrunch.com/2025/10/18/whatssapp-changes-its-terms-to-bar-general-purpose-chatbots-from-its-platform/)。
 
 ## 4. 多种收费不可混为一谈
 

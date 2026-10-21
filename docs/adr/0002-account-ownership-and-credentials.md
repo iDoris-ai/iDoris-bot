@@ -1,6 +1,6 @@
 # ADR-0002 · Customer-owned SNS accounts and scoped credentials
 
-- **Status:** Accepted product direction; detailed credential design pending G0
+- **Status:** Accepted product direction; detailed credential design pending P1-F0
 - **Date:** 2026-10-21
 
 ## Context

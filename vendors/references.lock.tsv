@@ -1,0 +1,11 @@
+# name	upstream-owner/repo	pinned-commit	license-summary
+chatwoot	chatwoot/chatwoot	8006117055a0d4f9e6d6340a13f7ef5c33dfeec8	MIT-outside-enterprise;proprietary-enterprise
+line-line-bot-mcp-server	line/line-bot-mcp-server	50571082d4ad9296b335ae6168dd288b09134cfd	Apache-2.0
+line-line-bot-sdk-go	line/line-bot-sdk-go	0bfb14360ec2ac1928d7454076825932da969d34	Apache-2.0
+line-line-bot-sdk-nodejs	line/line-bot-sdk-nodejs	181fe3f961a5ac8dd79aac8715f97e3248fdfc3a	Apache-2.0
+line-openapi	line/line-openapi	fa5577c9ea874d2dbd8fadc85a4cb3a1b29d8cbe	Apache-2.0
+matterbridge	42wim/matterbridge	c4157a4d5b49fce79c80a30730dc7c404bacd663	Apache-2.0
+mautrix-telegram	mautrix/telegram	a1281de301dc655ece17f384709c025f58367720	AGPL-3.0
+mautrix-whatsapp	mautrix/whatsapp	054a7dee77b571b7716a3b0d02ef55adaa4c8c22	AGPL-3.0
+openclaw	openclaw/openclaw	ef6d500b534062f352aa6d7ceef01c97d907c511	MIT
+teloxide	teloxide/teloxide	3c46b96e0dc0cabc75d6430c4566d7e2e12fd233	MIT

@@ -1,6 +1,6 @@
 # 03 · 系统架构：公共 Relay + 本地 Connector + 既有 Agent
 
-**状态：建议架构，G0 待冻结。** 架构目标是可靠桥接，不扩大云端可信计算范围。
+**状态：建议架构，P1-F0 待冻结。** 架构目标是可靠桥接，不扩大云端可信计算范围。
 
 ## 1. 全景
 
@@ -49,7 +49,7 @@ flowchart TB
 | Other Agent Adapter | 客户侧 | 标准 Task/Message 接口，标记能力缺失 | 伪造不支持的能力 |
 | Agent24 + iDoris | 客户侧 | 客户授权的知识库/工具/模型工作 | 根据 Relay 请求静默改变模型隐私策略 |
 
-**连接方向**：Connector 主动建立出站 TLS WebSocket/HTTP2 长连接（G0 PoC 决定最终传输），不要求 NAT 穿透或对公网暴露本地端口。Heartbeat、租约与 reconnect/resume 必需。尽可能将 Relay 视为可被攻破的低可信组件。
+**连接方向**：Connector 主动建立出站 TLS WebSocket/HTTP2 长连接（P1-F0 PoC 决定最终传输），不要求 NAT 穿透或对公网暴露本地端口。Heartbeat、租约与 reconnect/resume 必需。尽可能将 Relay 视为可被攻破的低可信组件。
 
 **渠道凭据设计**：LINE 等平台接入签名校验需要某些渠道机密存在公网入口；建议 Relay 持有最小入站验证材料；发送 Access Token 优先留在本地 Connector，经 Connector 直接调用平台 API。若客户特别需要离线模板通知，由客户单独显式授权 Relay 的有限发送凭据及额度，并增加隔离审计。
 
@@ -88,8 +88,8 @@ sequenceDiagram
 参见 [Agent24 README](https://github.com/iDoris-ai/Agent24/blob/main/README.md)。
 
 - 生产 Agent Host 是 Rust **agent24d**；桌面 Electron 是壳。HTTP/WS v1 API 包含 sessions、runs、events、approvals 等。Bridge 应以 daemon 为调用目标，不依赖 UI 长期开启。
-- 已有进程外领域 OS / agent24-os-sdk（原型）及 Attached Module 机制。**G0 比较两条路径**：A. 作为 Agent24 Attached/OS 模块；B. 独立守护进程走受限本地 REST/WS Agent24Adapter。优先复用稳定接口，禁止为了 Bridge 修改 Agent24 权限模型。
-- README 指出 Agent24 当前生产 ModelRouter 仍以 oMLX/Ollama 为主，而 iDoris Provider 完整对接属于后续工作；必须通过精确源码/测试/实际运行核查最新状态。**G1 先证明真实 Agent24→本地模型路径；单独验收 Agent24→iDoris Provider 路径，不得把假实现当成已完成。**
+- 已有进程外领域 OS / agent24-os-sdk（原型）及 Attached Module 机制。**P1-F0 比较两条路径**：A. 作为 Agent24 Attached/OS 模块；B. 独立守护进程走受限本地 REST/WS Agent24Adapter。优先复用稳定接口，禁止为了 Bridge 修改 Agent24 权限模型。
+- README 指出 Agent24 当前生产 ModelRouter 仍以 oMLX/Ollama 为主，而 iDoris Provider 完整对接属于后续工作；必须通过精确源码/测试/实际运行核查最新状态。**P1-L1 先证明真实 Agent24→本地模型路径；单独验收 Agent24→iDoris Provider 路径，不得把假实现当成已完成。**
 - Agent24 的领域 OS 模块隔离不等于安全沙箱（同 UID/文件权限可带来旁路访问）。Bridge 的内容和插件必须由 Agent Host 实际执行安全策略。
 
 ### iDoris
@@ -125,7 +125,9 @@ docs/                      design, ADR, operations and policies
 tests/                     fixtures, contract, fault injection, E2E
 ~~~
 
-MVP 队列建议 PostgreSQL inbox/outbox + 租约/游标，规模扩大后再抽象 NATS/Redis，不在 G1 过早建复杂集群。所有客户端/服务使用明确版本握手和兼容矩阵。
+MVP 队列建议 PostgreSQL inbox/outbox + 租约/游标，规模扩大后再抽象 NATS/Redis，不在 P1-L1 过早建复杂集群。所有客户端/服务使用明确版本握手和兼容矩阵。
+
+**开源复用顺序（详见 [OSS Audit](11-OSS-REUSE-AUDIT.md)）：** LINE 消息类型优先以 [官方 line-openapi](https://github.com/line/line-openapi) 驱动 Rust codegen/Schema 兼容测试；OpenClaw 的 LINE 事件验签、持久队列、模糊账号拒绝和发送重试主要用作测试设计参考；后续 Telegram 可直接考虑 Rust Teloxide；Matterbridge 的 Go Gateway 和 Chatwoot 的 Rails Inbox 不作为第二个 Agent/Relay 运行时。所有复用需对应 LICENSE、固定提交和供应链审查。
 
 ## 6. 设计约束与非功能目标
 

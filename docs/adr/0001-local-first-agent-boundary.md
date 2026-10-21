@@ -1,6 +1,6 @@
 # ADR-0001 · Local-first Agent, transport-only Bridge
 
-- **Status:** Accepted product direction; implementation pending G0
+- **Status:** Accepted product direction; implementation pending P1-F0
 - **Date:** 2026-10-21
 
 ## Context

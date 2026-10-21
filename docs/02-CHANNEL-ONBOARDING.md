@@ -23,7 +23,7 @@ Bridge 不需要一个“专用 LINE Bot 账号”给所有客户。系统**只�
 
 **B/C 的 LINE 账号收费由客户套餐与消息使用量决定，并不会因为 C 是 OAuth 或第三方 Module 而变成免费。** Module 是授权/集成模式，不是取消运营商计费的办法。
 
-## 2. LINE B 模式开通向导（G1）
+## 2. LINE B 模式开通向导（P1-L1）
 
 1. 用户本地安装 Connector，在 Agent24 中选定某个 Agent；Connector 产生设备身份并配对 Relay。
 2. 已拥有 LINE OA 的用户直接跳到开启 Messaging API。其他用户从 LINE 官方 OA Manager 创建属于自己的 OA；普通个人亦可创建。
@@ -42,11 +42,11 @@ LINE Module 使用 OAuth 2.0 向 OA 管理员请求明确 scope，某些情况�
 
 ## 3. Telegram 的两条正式路径
 
-- **G2 保底：BotFather。** 用户在 Telegram 自己通过 @BotFather 创建 Bot，使用安全输入方式关联到 Connector，不把完整 Token 粘贴到可公开的客服对话或日志中。
-- **G2 可选：Managed Bots。** Telegram 2026 Bot API/MTProto 增加由用户创建、经理 Bot 协助管理的流程（含深链、授权按钮）。**所有者仍是用户**，管理 Bot 有管理 Token 的能力；必须征得明确授权并提供撤销机制，不能冒充无需任何用户操作的自动代注册。首版先做可行性 PoC，技术与客户端兼容性通过后上线。
+- **P2-T 保底：BotFather。** 用户在 Telegram 自己通过 @BotFather 创建 Bot，使用安全输入方式关联到 Connector，不把完整 Token 粘贴到可公开的客服对话或日志中。
+- **P2-T 可选：Managed Bots。** Telegram 2026 Bot API/MTProto 增加由用户创建、经理 Bot 协助管理的流程（含深链、授权按钮）。**所有者仍是用户**，管理 Bot 有管理 Token 的能力；必须征得明确授权并提供撤销机制，不能冒充无需任何用户操作的自动代注册。首版先做可行性 PoC，技术与客户端兼容性通过后上线。
 - Telegram 的 Webhook 和 getUpdates 不能同时使用。对于纯本地部署用户可支持 getUpdates 出站长轮询，绕开公网 Relay；统一模式仍推荐 Relay。
 
-## 4. WhatsApp Business（G4）
+## 4. WhatsApp Business（P2-W）
 
 客户拥有 Meta Business 资产、WhatsApp 商业号码、适当的 WABA/Cloud API 权限。首版建议通过 Meta 允许的 Business Onboarding/Embedded Signup 或官方人工接入流程；本地 Connector 负责业务 Agent 调用，Relay 处理其指定 Webhook。
 

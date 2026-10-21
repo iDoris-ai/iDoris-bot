@@ -51,7 +51,7 @@
 | [AIYA AiOA](https://web.aiya.ai/th/products/ai-oa) | LINE OA Rich Menu、自动回复、客户分析/广播，官网展示按月套餐 | 可作为 LINE onboarding 和 UI/小店产品体验参考；Bridge 不复制完整 CRM |
 | [AIYA Sales CRM](https://web.aiya.ai/th/products/sales-crm) | 多渠道 CRM、销售工作流、AI 助手（官网介绍） | 可能成为未来 Bridge 对接的外部业务系统，而非首版重建对象 |
 
-这些厂商显示泰国 LINE 商家沟通、机器人和自动化需求存在，但营销页面的客户数、满意度和套餐价格属于**厂商自述**，不可直接作为可信市场规模或 iDoris 定价证据。G0/G1 可与 3–5 家清迈真实商家做匿名需求/开户和费用测试。
+这些厂商显示泰国 LINE 商家沟通、机器人和自动化需求存在，但营销页面的客户数、满意度和套餐价格属于**厂商自述**，不可直接作为可信市场规模或 iDoris 定价证据。P1-F0/P1-L1 可与 3–5 家清迈真实商家做匿名需求/开户和费用测试。
 
 ## 研究纪律
 

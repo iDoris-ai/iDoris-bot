@@ -1,6 +1,6 @@
 # ADR-0003 · At-least-once delivery, idempotent work, cost-controlled outbound
 
-- **Status:** Proposed default; G0 protocol/security review required
+- **Status:** Proposed default; P1-F0 protocol/security review required
 - **Date:** 2026-10-21
 
 ## Context
