@@ -1,0 +1,30 @@
+// Same ACL as policy.manual.hujson, plus autoApprovers for the lab prefix.
+// Headscale v0.29 syntax (checked with `headscale policy check`): a node that
+// carries tag:acme-gateway may announce 10.251.73.0/24 and the server approves
+// that route without `nodes approve-routes`. lan_test.go substitutes the prefix.
+{
+  "groups": {
+    "group:admins": ["admin@"],
+  },
+  "tagOwners": {
+    "tag:acme-local-ai": ["group:admins"],
+    "tag:acme-gateway": ["group:admins"],
+  },
+  "autoApprovers": {
+    "routes": {
+      "10.251.73.0/24": ["tag:acme-gateway"],
+    },
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["acme@"],
+      "dst": ["tag:acme-local-ai:8740"],
+    },
+    {
+      "action": "accept",
+      "src": ["acme@"],
+      "dst": ["10.251.73.0/24:8740"],
+    },
+  ],
+}

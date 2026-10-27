@@ -1,0 +1,61 @@
+# HTTPS on 443 inside the compose network. tailscaled forces TLS on port 443
+# when it re-dials the control server, so this lab Headscale cannot be plain HTTP.
+# Throwaway certs are generated into integration/.pki-lan (not committed) and
+# bind-mounted at /etc/headscale/runtime.
+server_url: https://headscale
+listen_addr: 0.0.0.0:443
+tls_cert_path: /etc/headscale/runtime/tls.crt
+tls_key_path: /etc/headscale/runtime/tls.key
+metrics_listen_addr: 127.0.0.1:9090
+grpc_listen_addr: 127.0.0.1:50443
+grpc_allow_insecure: false
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+derp:
+  server:
+    # Embedded DERP. The region hostname is taken from server_url ("headscale"),
+    # which matches the lab certificate SAN. STUN listens on UDP 3478.
+    # ipv4/ipv6 are left unset so clients dial the DNS name, which Docker DNS
+    # resolves to this container's address on the caller's own network.
+    enabled: true
+    region_id: 999
+    region_code: "lan"
+    region_name: "Lab embedded DERP"
+    verify_clients: true
+    stun_listen_addr: "0.0.0.0:3478"
+    private_key_path: /var/lib/headscale/derp_server_private.key
+    automatically_add_embedded_derp_region: true
+  urls: []
+  paths: []
+  auto_update_enabled: false
+  update_frequency: 24h
+disable_check_updates: true
+node:
+  expiry: 0
+  ephemeral:
+    inactivity_timeout: 30m
+database:
+  type: sqlite
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+log:
+  format: text
+  level: info
+policy:
+  mode: file
+  path: /etc/headscale/runtime/policy.active.hujson
+dns:
+  magic_dns: true
+  base_domain: lan.idoris.internal
+  override_local_dns: false
+  nameservers:
+    global: []
+  search_domains: []
+unix_socket: /var/run/headscale/headscale.sock
+unix_socket_permission: "0770"
+logtail:
+  enabled: false
