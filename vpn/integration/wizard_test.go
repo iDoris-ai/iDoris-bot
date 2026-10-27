@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -106,6 +107,22 @@ func (e *wizEnv) exec(d time.Duration, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), d)
 	defer cancel()
 	return e.run(ctx, args...)
+}
+
+func (e *wizEnv) runStdin(ctx context.Context, stdin string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "docker", append([]string{
+		"compose", "-p", e.project, "-f", "wizard/compose.yaml",
+	}, args...)...)
+	cmd.Env = e.baseEnv
+	cmd.Stdin = strings.NewReader(stdin)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+func (e *wizEnv) execStdin(d time.Duration, stdin string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	return e.runStdin(ctx, stdin, args...)
 }
 
 func (e *wizEnv) must(t *testing.T, d time.Duration, args ...string) string {
@@ -431,6 +448,8 @@ func TestWizardGatewayJoin(t *testing.T) {
 	e.waitMemberRoute(t, nets.echoB, true)
 	e.waitEcho(t, nets.echoB)
 	t.Logf("EVIDENCE pending hint %q; approve-routes by hostname=%v; member reached %s after approval", pending.AdminHint, e.hostnameApprove, nets.echoB)
+
+	r3w2SideConfigChecks(t, e, enrollURL, codeA, nets.echo)
 }
 
 type wizSnap struct {
@@ -519,17 +538,163 @@ func (e *wizEnv) pinHeadscale(t *testing.T, host string) {
 
 func (e *wizEnv) join(t *testing.T, host, code, device string) string {
 	t.Helper()
-	out, err := e.exec(60*time.Second, "exec", "-e", "HOME=/root", "-T", host,
-		"/opt/idoris-vpnd", "join",
-		"--yes", "--device", device, "--no-service", "--allow-insecure", code)
-	red := e.redact(out)
+	out, err := e.r3w2Join(t, host, code, "--device", device)
 	if err != nil {
-		t.Fatalf("join %s: %v\n%s", host, err, red)
+		t.Fatalf("join %s: %v\n%s", host, err, e.redact(out))
 	}
-	if strings.Contains(out, code) || strings.Contains(out, "idv1_") {
+	return e.redact(out)
+}
+
+// r3w2Join writes the join code on stdin into a 0600 file and passes
+// --code-file. The code is not a positional argument of idoris-vpnd.
+func (e *wizEnv) r3w2Join(t *testing.T, host, code string, extra ...string) (string, error) {
+	t.Helper()
+	payload, err := join.Decode(code, join.Options{AllowInsecure: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse(payload.EnrollURL)
+	if err != nil || u.Host == "" {
+		t.Fatalf("enroll url %q", payload.EnrollURL)
+	}
+	wrote, err := e.execStdin(20*time.Second, code+"\n", "exec", "-e", "HOME=/root", "-T", host,
+		"sh", "-c", "umask 077; mkdir -p /root/.idoris; cat > /root/.idoris/join.code")
+	if err != nil {
+		t.Fatalf("write join code: %v\n%s", err, e.redact(wrote))
+	}
+	args := []string{"exec", "-e", "HOME=/root", "-T", host, "/opt/idoris-vpnd", "join",
+		"--yes", "--no-service", "--allow-insecure",
+		"--code-file", "/root/.idoris/join.code",
+		"--expect-authority", u.Host,
+	}
+	args = append(args, extra...)
+	out, err := e.exec(90*time.Second, args...)
+	if strings.Contains(out, code) || strings.Contains(out, payload.Token) {
 		t.Fatal("join stdout contains the join code or token")
 	}
-	return red
+	if err == nil && !strings.Contains(out, "enrollment-authority: "+u.Host) {
+		t.Fatalf("join did not print the enrollment authority:\n%s", e.redact(out))
+	}
+	return out, err
+}
+
+// r3w2SideConfigChecks uses the gateway container only. It does not point the
+// running daemon at these files. A member code whose token is not registered
+// still writes the SOCKS5 default, because discovery is allowed to fail.
+func r3w2SideConfigChecks(t *testing.T, e *wizEnv, enrollURL, gatewayCode, device string) {
+	t.Helper()
+	const keep = "/root/.idoris/keep.json"
+	const memberPath = "/root/.idoris/member.json"
+	liveBefore := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/vpn.json")
+	tokenBefore := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/enroll.token")
+	seed := "{\n" +
+		"  \"control_url\": \"https://headscale\",\n" +
+		"  \"accept_dns\": false,\n" +
+		"  \"tailscale_socket\": \"/var/run/tailscale/tailscaled.sock\",\n" +
+		"  \"state_dir\": \"/var/lib/idoris/state\",\n" +
+		"  \"takeover\": false,\n" +
+		"  \"forwards\": [{\"listen\": \"127.0.0.1:8740\", \"target\": \"10.1.2.3:8740\"}],\n" +
+		"  \"extra_kept\": \"yes\"\n" +
+		"}\n"
+	if wrote, err := e.execStdin(20*time.Second, seed, "exec", "-T", "wiz-gw", "sh", "-c", "umask 077; cat > "+keep); err != nil {
+		t.Fatalf("seed keep.json: %v\n%s", err, e.redact(wrote))
+	}
+	out, err := e.r3w2Join(t, "wiz-gw", gatewayCode, "--device", device, "--config", keep)
+	if err != nil {
+		t.Fatalf("side join: %v\n%s", err, e.redact(out))
+	}
+	body := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", keep)
+	for _, want := range []string{
+		`"control_url": "https://headscale"`,
+		`"accept_dns": false`,
+		`"tailscale_socket": "/var/run/tailscale/tailscaled.sock"`,
+		`"state_dir": "/var/lib/idoris/state"`,
+		`"takeover": false`,
+		`"listen": "127.0.0.1:8740"`,
+		`"extra_kept": "yes"`,
+		`"mode": "system"`,
+		`"role": "gateway"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("kept config missing %s:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "socks5_listen") || strings.Contains(body, "idv1_") {
+		t.Fatalf("gateway side config:\n%s", e.redact(body))
+	}
+	again, err := e.r3w2Join(t, "wiz-gw", gatewayCode, "--device", device, "--config", keep)
+	if err != nil {
+		t.Fatalf("idempotent join: %v\n%s", err, e.redact(again))
+	}
+	if body2 := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", keep); body2 != body {
+		t.Fatalf("second apply changed keep.json\n---\n%s\n---\n%s", body, body2)
+	}
+	const attackToken = "idv1_sideattacksideattacksideattack"
+	attacker, err := join.Encode(join.Payload{
+		V: 1, EnrollURL: "http://attacker.invalid:9", Token: attackToken,
+		Role: join.RoleGateway, Tenant: "wiz", HostnameHint: "wiz-gw",
+	}, join.Options{AllowInsecure: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.secrets = append(e.secrets, attacker, attackToken)
+	refused, err := e.r3w2Join(t, "wiz-gw", attacker, "--device", device, "--config", keep)
+	if err == nil || !strings.Contains(refused, "--replace") {
+		t.Fatalf("replace not required: %v\n%s", err, e.redact(refused))
+	}
+	if got := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", keep); got != body {
+		t.Fatal("refused apply changed keep.json")
+	}
+	switched, err := e.r3w2Join(t, "wiz-gw", attacker, "--device", device, "--config", keep, "--replace")
+	if err != nil {
+		t.Fatalf("replace: %v\n%s", err, e.redact(switched))
+	}
+	body = e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", keep)
+	if !strings.Contains(body, "http://attacker.invalid:9") || !strings.Contains(body, `"control_url": "https://headscale"`) || !strings.Contains(body, `"extra_kept": "yes"`) {
+		t.Fatalf("replaced config:\n%s", body)
+	}
+	const memberToken = "idv1_sidemembersidemembersidemember"
+	memberCode, err := join.Encode(join.Payload{
+		V: 1, EnrollURL: enrollURL, Token: memberToken,
+		Role: join.RoleMember, Tenant: "wiz", HostnameHint: "side-member",
+	}, join.Options{AllowInsecure: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.secrets = append(e.secrets, memberCode, memberToken)
+	mout, err := e.r3w2Join(t, "wiz-gw", memberCode, "--config", memberPath)
+	if err != nil {
+		t.Fatalf("member join: %v\n%s", err, e.redact(mout))
+	}
+	for _, want := range []string{
+		"access: SOCKS5 127.0.0.1:1080",
+		"access: SOCKS5 credential file /root/.idoris/vpn-state/socks5.auth",
+		"side-member.idoris.internal",
+	} {
+		if !strings.Contains(mout, want) {
+			t.Fatalf("member access missing %s:\n%s", want, e.redact(mout))
+		}
+	}
+	mb := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", memberPath)
+	if !strings.Contains(mb, `"socks5_listen": "127.0.0.1:1080"`) || strings.Contains(mb, "socks5_auth_file") || strings.Contains(mb, "socks5_allow_anonymous") || !strings.Contains(mb, `"role": "member"`) {
+		t.Fatalf("member config:\n%s", e.redact(mb))
+	}
+	if live := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/vpn.json"); live != liveBefore {
+		t.Fatal("side joins rewrote the live gateway config")
+	}
+	if tok := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/enroll.token"); tok != tokenBefore {
+		t.Fatal("side joins rewrote the live enrollment token")
+	}
+	keepTok := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/keep.enroll-token")
+	memTok := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/member.enroll-token")
+	if strings.TrimSpace(keepTok) == strings.TrimSpace(tokenBefore) || strings.TrimSpace(memTok) == strings.TrimSpace(keepTok) {
+		t.Fatal("side configs did not keep distinct tokens")
+	}
+	ls := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "ls", "-l", keep)
+	if !strings.Contains(ls, "-rw-------") {
+		t.Fatalf("keep.json mode: %s", ls)
+	}
+	t.Log("EVIDENCE side config kept control_url across --replace; member SOCKS5 default written")
 }
 
 func (e *wizEnv) assertJoinPlan(t *testing.T, out string, nets wizNets, route string, auto bool) {
