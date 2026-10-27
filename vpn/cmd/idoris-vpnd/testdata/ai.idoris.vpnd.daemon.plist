@@ -13,6 +13,10 @@
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Background</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>STATE_DIRECTORY</key><string>/var/lib/idoris</string>
+  </dict>
   <key>StandardOutPath</key><string>/var/log/idoris/vpnd.log</string>
   <key>StandardErrorPath</key><string>/var/log/idoris/vpnd.log</string>
 </dict>
