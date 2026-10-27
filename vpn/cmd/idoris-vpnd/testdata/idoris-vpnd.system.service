@@ -11,9 +11,14 @@ Restart=always
 RestartSec=3
 NoNewPrivileges=yes
 ProtectSystem=strict
+StateDirectory=idoris
+StateDirectoryMode=0750
+RuntimeDirectory=idoris
+RuntimeDirectoryMode=0750
+Environment=XDG_RUNTIME_DIR=/run/idoris
 ReadWritePaths=/var/lib/idoris
-ReadWritePaths=/var/lib/idoris/node
 ReadWritePaths=/run/idoris
+ReadWritePaths=/var/lib/idoris/node
 
 [Install]
 WantedBy=multi-user.target
