@@ -59,7 +59,7 @@ func TestRenderServiceDefinitions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(paths) != 1 || paths[0] != "/var/lib/idoris" {
+	if len(paths) != 2 || paths[0] != "/var/lib/idoris" || paths[1] != "/run/idoris" {
 		t.Fatalf("paths %v", paths)
 	}
 	if _, err := systemReadWritePaths([]byte("{\"state_dir\":\"/var/lib/idoris\\nExecStartPre=/bin/true\"}")); err == nil {
