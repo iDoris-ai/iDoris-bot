@@ -186,6 +186,11 @@ func applyEnv(cfg *Config) error {
 		if !ok {
 			continue
 		}
+		// A blank credential variable is not set. Treating it as set would
+		// wipe the config-file value and still leave the other side in place.
+		if secretCredential(name) && strings.TrimSpace(raw) == "" {
+			continue
+		}
 		if err := assignEnv(v.Field(i), raw); err != nil {
 			return fmt.Errorf("%s: %w", envKey, err)
 		}
@@ -200,7 +205,53 @@ func applyEnv(cfg *Config) error {
 		sort.Strings(unknown)
 		return fmt.Errorf("unknown environment variable %s", strings.Join(unknown, ", "))
 	}
+	return applyCredentialEnv(cfg, present)
+}
+
+// secretCredential is one side of the enrollment token or the auth key.
+func secretCredential(jsonKey string) bool {
+	switch jsonKey {
+	case "enroll_token", "enroll_token_file", "auth_key", "auth_key_file":
+		return true
+	default:
+		return false
+	}
+}
+
+// applyCredentialEnv makes a higher layer replace the whole credential.
+// Env wins over the config file. Setting both sides in the env, or leaving
+// both sides set in the file when the env sets neither, is an error.
+// A blank variable is not set.
+func applyCredentialEnv(cfg *Config, present map[string]string) error {
+	pairs := []struct {
+		inline, file       string
+		inlineDst, fileDst *string
+	}{
+		{"enroll_token", "enroll_token_file", &cfg.EnrollToken, &cfg.EnrollTokenFile},
+		{"auth_key", "auth_key_file", &cfg.AuthKey, &cfg.AuthKeyFile},
+	}
+	for _, p := range pairs {
+		inlineSet := credentialEnvSet(present, p.inline)
+		fileSet := credentialEnvSet(present, p.file)
+		switch {
+		case inlineSet && fileSet:
+			return fmt.Errorf("%s and %s are both set; set only one", EnvName(p.inline), EnvName(p.file))
+		case inlineSet:
+			*p.fileDst = ""
+		case fileSet:
+			*p.inlineDst = ""
+		default:
+			if strings.TrimSpace(*p.inlineDst) != "" && strings.TrimSpace(*p.fileDst) != "" {
+				return fmt.Errorf("config file sets both %s and %s; set only one", p.inline, p.file)
+			}
+		}
+	}
 	return nil
+}
+
+func credentialEnvSet(present map[string]string, jsonKey string) bool {
+	raw, ok := present[EnvName(jsonKey)]
+	return ok && strings.TrimSpace(raw) != ""
 }
 
 func jsonFieldName(f reflect.StructField) string {
@@ -291,14 +342,17 @@ func readSecretFile(path string) (string, error) {
 
 // Resolve fills defaults, reads *_file secrets and validates.
 func (c *Config) Resolve() error {
-	if c.EnrollToken == "" && c.EnrollTokenFile != "" {
+	if err := c.rejectDualCredentials(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(c.EnrollToken) == "" && c.EnrollTokenFile != "" {
 		t, err := readSecretFile(c.EnrollTokenFile)
 		if err != nil {
 			return fmt.Errorf("enroll_token_file: %w", err)
 		}
 		c.EnrollToken = t
 	}
-	if c.AuthKey == "" && c.AuthKeyFile != "" {
+	if strings.TrimSpace(c.AuthKey) == "" && c.AuthKeyFile != "" {
 		k, err := readSecretFile(c.AuthKeyFile)
 		if err != nil {
 			return fmt.Errorf("auth_key_file: %w", err)
@@ -353,6 +407,18 @@ func (c *Config) Resolve() error {
 	}
 	if err := c.RejectEmbeddedRoutes(c.Mode); err != nil {
 		return err
+	}
+	return nil
+}
+
+// rejectDualCredentials refuses one source leaving both the inline value and
+// the file path set. Apply layers clear the other side before this runs.
+func (c *Config) rejectDualCredentials() error {
+	if strings.TrimSpace(c.EnrollToken) != "" && strings.TrimSpace(c.EnrollTokenFile) != "" {
+		return errors.New("enroll_token and enroll_token_file are both set; set only one")
+	}
+	if strings.TrimSpace(c.AuthKey) != "" && strings.TrimSpace(c.AuthKeyFile) != "" {
+		return errors.New("auth_key and auth_key_file are both set; set only one")
 	}
 	return nil
 }
