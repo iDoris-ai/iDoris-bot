@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"tailscale.com/client/local"
 	"tailscale.com/tsnet"
@@ -16,6 +17,12 @@ import (
 // stateFileName is the file tsnet.Server writes inside Dir. It is not part of
 // tsnet's public API surface beyond the documented "<Dir>/tailscaled.state".
 const stateFileName = "tailscaled.state"
+
+// registrationMarkerName is written when the node first reaches Running or
+// shows a node identity. tsnet creates tailscaled.state before registration
+// finishes, so the state file alone cannot tell a fresh login from one that
+// was interrupted.
+const registrationMarkerName = "registration-complete"
 
 // EmbeddedOptions configures the in-process userspace node.
 type EmbeddedOptions struct {
@@ -128,7 +135,84 @@ func stateFileMissing(dir string) (bool, error) {
 func (e *Embedded) Backend() Backend { return e.lc }
 
 // Fresh reports whether the state file was absent (or empty) before Start.
+// Login policy uses EmbeddedLoginMode, which also looks at the registration
+// marker. Fresh stays for logs.
 func (e *Embedded) Fresh() bool { return e.fresh }
+
+// EmbeddedLoginMode decides how a Starting backend should be treated.
+// Call it before tsnet.Start: Start creates the state file, which would
+// otherwise look like an interrupted registration.
+//
+// loginNow is true only when there is no state file and no marker, so the
+// first start mints immediately. recover is true when a state file exists
+// but registration never completed: wait persistedLoginSettle, then mint
+// once if the node still has no identity. A marker means neither. An
+// enrolled directory from before the marker existed has a state file and no
+// marker, so it takes the recover path; HaveNodeKey or Running writes the
+// marker and does not mint.
+func EmbeddedLoginMode(dir string) (loginNow, recover bool, err error) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return false, false, errors.New("embedded login mode: state dir is empty")
+	}
+	marker, err := fileNonEmpty(filepath.Join(dir, registrationMarkerName))
+	if err != nil {
+		return false, false, err
+	}
+	if marker {
+		return false, false, nil
+	}
+	missing, err := stateFileMissing(dir)
+	if err != nil {
+		return false, false, err
+	}
+	if missing {
+		return true, false, nil
+	}
+	return false, true, nil
+}
+
+// MarkRegistrationComplete writes the marker. It is idempotent. The file is
+// mode 0600 and does not contain a key.
+func MarkRegistrationComplete(dir string) error {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return errors.New("registration marker: state dir is empty")
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, registrationMarkerName)
+	if ok, err := fileNonEmpty(path); err != nil {
+		return err
+	} else if ok {
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600) //nolint:gosec // path is the daemon's own state directory
+	if err != nil {
+		return err
+	}
+	_, werr := f.WriteString("registered\n")
+	cerr := f.Close()
+	if werr != nil {
+		return werr
+	}
+	if cerr != nil {
+		return cerr
+	}
+	return os.Chmod(path, 0o600) //nolint:gosec // owner-only marker, no secret
+}
+
+func fileNonEmpty(path string) (bool, error) {
+	st, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return st.Size() > 0, nil
+}
 
 // Hostname is the name passed to tsnet and, by the daemon, to the reconciler.
 func (e *Embedded) Hostname() string { return e.hostname }
