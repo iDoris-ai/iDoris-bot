@@ -3,7 +3,6 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="csrf-token" content="__CSRF__">
 <title>iDoris 接入</title>
 <link rel="stylesheet" href="/app.css">
 </head>
@@ -21,6 +20,9 @@
   <label class="check"><input id="insecure" type="checkbox"> 实验室地址（http）</label>
   <button id="save-code" type="button">保存加入码</button>
   <p id="code-state" class="hint"></p>
+  <p class="trust">加入码不能证明签发它的人是谁。请只使用组织管理员通过你信任的渠道交给你的加入码。</p>
+  <p id="authority" class="authority">保存加入码后，这里会显示登记服务器。</p>
+  <label class="check"><input id="confirm-authority" type="checkbox"> 这是我组织的服务器（this is my organisation's server）</label>
 
   <p class="question">这台机器就是 Local AI 吗？</p>
   <div class="row">
@@ -50,7 +52,8 @@
 
 <section id="step3">
   <h2>3. 启用</h2>
-  <button id="enable" type="button">启用</button>
+  <label class="check"><input id="replace-existing" type="checkbox"> 替换另一组织的现有配置（replace the existing configuration for another organisation）</label>
+  <button id="enable" type="button" disabled>启用</button>
   <pre id="result"></pre>
   <pre id="status"></pre>
 </section>

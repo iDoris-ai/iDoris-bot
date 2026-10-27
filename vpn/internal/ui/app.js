@@ -1,25 +1,52 @@
 (function () {
-  var csrfMeta = document.querySelector('meta[name="csrf-token"]');
-  var csrf = csrfMeta ? csrfMeta.getAttribute("content") : "";
-  if (window.history && window.history.replaceState) {
-    window.history.replaceState({}, "", window.location.pathname);
-  }
-
+  var session = "";
+  var csrf = "";
   var localAI = null;
-  var lastReport = null;
 
   function showError(err) {
     var el = document.getElementById("error");
     el.textContent = err && err.message ? err.message : String(err || "");
   }
 
-  function post(path, body) {
-    return fetch(path, {
+  function stored(key) {
+    try {
+      return sessionStorage.getItem(key) || "";
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function store(key, value) {
+    try {
+      sessionStorage.setItem(key, value);
+    } catch (e) {
+      /* the in-memory copy still covers this page */
+    }
+  }
+
+  function clearFragment() {
+    if (window.history && window.history.replaceState) {
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+  }
+
+  // A hand-opened URL carries the bootstrap secret in the fragment only.
+  // The fragment is not sent on the request; this POST is the one exchange.
+  function bootstrap() {
+    var hash = window.location.hash || "";
+    var m = /^#k=([0-9a-fA-F]+)$/.exec(hash);
+    if (!m) {
+      session = stored("idoris_ui");
+      csrf = stored("idoris_csrf");
+      return Promise.resolve();
+    }
+    return fetch("/api/bootstrap", {
       method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf },
-      body: JSON.stringify(body || {})
+      credentials: "omit",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ k: m[1] })
     }).then(function (res) {
+      clearFragment();
       return res.text().then(function (text) {
         var data = {};
         if (text) {
@@ -28,13 +55,43 @@
         if (!res.ok) {
           throw new Error(data.error || ("请求失败 " + res.status));
         }
-        return data;
+        session = data.capability || "";
+        csrf = data.csrf || "";
+        store("idoris_ui", session);
+        store("idoris_csrf", csrf);
+      });
+    });
+  }
+
+  var ready = bootstrap().catch(showError);
+
+  function post(path, body) {
+    return ready.then(function () {
+      return fetch(path, {
+        method: "POST",
+        credentials: "omit",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": csrf,
+          "X-Idoris-UI": session
+        },
+        body: JSON.stringify(body || {})
+      }).then(function (res) {
+        return res.text().then(function (text) {
+          var data = {};
+          if (text) {
+            try { data = JSON.parse(text); } catch (e) { data = { error: text }; }
+          }
+          if (!res.ok) {
+            throw new Error(data.error || ("请求失败 " + res.status));
+          }
+          return data;
+        });
       });
     });
   }
 
   function renderReport(rep) {
-    lastReport = rep;
     var nets = document.getElementById("networks");
     nets.textContent = "";
     var list = rep.candidates || [];
@@ -98,6 +155,33 @@
     document.getElementById("plan").textContent = lines.join("\n");
   }
 
+  function clearPlanText() {
+    document.getElementById("plan").textContent = "先识别网络，再使用建议。";
+  }
+
+  var confirmBox = document.getElementById("confirm-authority");
+  var replaceBox = document.getElementById("replace-existing");
+  var enableBtn = document.getElementById("enable");
+  function syncEnable() {
+    enableBtn.disabled = !confirmBox.checked;
+  }
+  confirmBox.addEventListener("change", syncEnable);
+
+  function answers() {
+    var whole = document.getElementById("whole").checked;
+    var ip = document.getElementById("device").value.trim();
+    var body = {
+      this_machine_is_local_ai: localAI === true,
+      whole_subnet: whole,
+      device_ips: [],
+      confirm_authority: confirmBox.checked
+    };
+    if (localAI === false && !whole && ip) {
+      body.device_ips = [ip];
+    }
+    return body;
+  }
+
   document.getElementById("save-code").addEventListener("click", function () {
     showError("");
     var input = document.getElementById("code");
@@ -106,21 +190,26 @@
       allow_insecure: document.getElementById("insecure").checked
     }).then(function (view) {
       input.value = "";
-      document.getElementById("code-state").textContent = "已保存。租户 " + view.tenant + "，角色 " + view.role + "。加入码已从输入框清掉。";
+      clearPlanText();
+      document.getElementById("authority").textContent = "登记服务器：" + (view.authority || "");
+      document.getElementById("code-state").textContent = "已保存。租户 " + view.tenant + "，角色 " + view.role + "。加入码已从输入框清掉。请核对上面的登记服务器。";
     }).catch(showError);
   });
 
   document.getElementById("yes-ai").addEventListener("click", function () {
     localAI = true;
+    clearPlanText();
     document.getElementById("role-state").textContent = "将以 Local AI 主机加入，不通告局域网。";
   });
   document.getElementById("no-ai").addEventListener("click", function () {
     localAI = false;
+    clearPlanText();
     document.getElementById("role-state").textContent = "这台机器做网关，只通告你填的设备地址。";
   });
 
   document.getElementById("detect").addEventListener("click", function () {
     showError("");
+    clearPlanText();
     post("/api/detect", {}).then(renderReport).catch(showError);
   });
 
@@ -134,16 +223,15 @@
 
   document.getElementById("recommend").addEventListener("click", function () {
     showError("");
+    if (!confirmBox.checked) {
+      showError(new Error("先确认：这是我组织的服务器"));
+      return;
+    }
     if (localAI === null) {
       showError(new Error("先回答：这台机器就是 Local AI 吗？"));
       return;
     }
-    var whole = document.getElementById("whole").checked;
-    var ip = document.getElementById("device").value.trim();
-    var body = { this_machine_is_local_ai: localAI, whole_subnet: whole, device_ips: [] };
-    if (!localAI && !whole && ip) {
-      body.device_ips = [ip];
-    }
+    var body = answers();
     var chain = Promise.resolve();
     if (!localAI) {
       chain = post("/api/detect", {}).then(renderReport);
@@ -152,7 +240,12 @@
   });
 
   function poll() {
-    fetch("/api/status", { credentials: "same-origin" }).then(function (res) {
+    ready.then(function () {
+      return fetch("/api/status", {
+        credentials: "omit",
+        headers: { "X-Idoris-UI": session }
+      });
+    }).then(function (res) {
       return res.json();
     }).then(function (st) {
       var phase = st.phase || "";
@@ -180,7 +273,9 @@
 
   document.getElementById("enable").addEventListener("click", function () {
     showError("");
-    post("/api/apply", {}).then(function (res) {
+    var body = answers();
+    body.replace_existing = !!(replaceBox && replaceBox.checked);
+    post("/api/apply", body).then(function (res) {
       var lines = ["配置已写入 " + (res.config_path || "")];
       if (res.sudo_command) {
         lines.push("当前不是 root，没有改系统转发。请原样执行：");
@@ -189,6 +284,9 @@
       if (res.ip_forward_applied) {
         lines.push("已打开 IPv4 转发。");
       }
+      (res.access_info || []).forEach(function (line) {
+        lines.push(line);
+      });
       document.getElementById("result").textContent = lines.join("\n");
       poll();
     }).catch(showError);
