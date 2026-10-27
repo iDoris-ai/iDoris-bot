@@ -106,7 +106,7 @@ bash deploy/vpn/bootstrap.sh add-tenant globex --lan-cidr 192.168.50.0/24
 
 `token new`、`token revoke` 和 `offboard` 的 `--label` 都交给 `idoris-vpn-enroll`。标签字符集是 `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}`。同一注册项上重复的标签会被拒绝，错误里有 `already exists`。`--hash-prefix` 是 4 到 64 位十六进制，必须唯一命中一条。`token_hashes` 可以是旧的十六进制字符串，也可以是 `{"hash","label","created_at"}`；两种都能读，`invite` 写出对象。
 
-注册服务在 SIGHUP 时会按路径重读 `config.json`（非法文件会留下上一份），并且这次重读不更换进程里的 Headscale 客户端。compose 把 `enroll/config.json` 按**文件**绑进容器。`invite` / `revoke` 用 rename 换掉这个文件，绑定还指着旧 inode。本机 Docker 上，rename 之后容器里该路径是 ENOENT，重启才重新绑上新文件。`ctl.sh` 因此在服务正在跑时执行 `docker compose restart enroll`，否则等下次启动。只换 API key、不重启，客户端仍是旧的，见第 12 节。
+注册服务在 SIGHUP 时按路径重读 `config.json`（非法文件会留下上一份）和 `headscale_api_key_file`（读不到、为空或探测失败会留下旧的 Headscale 客户端，日志里没有 key）。compose 把这两个文件都按**文件**绑进容器。`invite` / `revoke` 用 rename 换掉 `config.json`，绑定还指着旧 inode：本机 Docker 上 rename 之后容器里该路径是 ENOENT，重启才重新绑上新文件；在 Linux 上没有验证，按 bind mount 的语义容器可能一直读到旧内容，吊销就会悄悄不生效。所以 SIGHUP 在这套部署里不可靠，`ctl.sh` 在服务正在跑时执行 `docker compose restart enroll`，否则等下次启动。换 API key 见第 12 节。
 
 ## 6. 恢复包
 
@@ -234,9 +234,11 @@ sudo tailscale set --advertise-routes=192.168.1.0/24
 
 ## 11. Linux 要在登录前就跑起来；Tailscale SSH
 
-`idoris-vpnd service install` 今天只写**用户**服务：Linux 是 `systemctl --user`，单元在 `~/.config/systemd/user/idoris-vpnd.service`，`WantedBy=default.target`，`NoNewPrivileges=yes`。它不会执行 `loginctl enable-linger`。用户单元在这个用户登录之前不会启动。
+`idoris-vpnd service install` 不带 `--system` 时只写**用户**服务：Linux 是 `systemctl --user`，单元在 `~/.config/systemd/user/idoris-vpnd.service`，`WantedBy=default.target`，`NoNewPrivileges=yes`。它不会执行 `loginctl enable-linger`。用户单元在这个用户登录之前不会启动。
 
-网关和 Local AI 这种必须在有人登录前就在线的主机，用下面两种之一。`service install --system` 还没有进二进制，下面是现在就能用的手工做法。
+网关和 Local AI 这种必须在有人登录前就在线的主机，用 `sudo idoris-vpnd service install --system --config FILE`：Linux 写 systemd 系统单元，macOS 写 LaunchDaemon，Windows 用开机以 SYSTEM 运行的计划任务。细节、权限和卸载见 docs/16 第 12 节。Linux 单元只做过 `systemd-analyze verify` 和 golden 文件对比，没有在真机上以 root 装过。
+
+没法用 `--system` 时，下面两种手工做法仍然可用。
 
 让用户单元在开机时启动：
 
@@ -274,18 +276,18 @@ macOS 的 `service install` 写的是 launchd 用户代理。Windows 今天会�
 
 ## 12. 该看的检查
 
-每天或接到告警时看这四件。`/healthz` 今天只写 `ok\n`，不检查 Headscale。建议 Go 增加 `GET /readyz`：用当前的 API key 打一次 Headscale（例如列出用户），成功返回 200，key 过期或 Headscale 不可达返回 503。另一个代理来实现。在那之前，用下面的命令。
+每天或接到告警时看这四件。`/healthz` 只写 `ok\n`，不检查 Headscale。`GET /readyz` 用当前的 API key 打一次 Headscale：成功返回 200（API key 不足 30 天到期时带 `warning`）；key 已过期、401/403 或 Headscale 不可达返回 503，响应里是固定短语，不回传上游正文。两个端点都不限速。也可以用下面的命令手动看。
 
 注册服务的 API key 是 365 天（`--expiration 8760h`）。`ctl.sh apikeys list` 能看到前缀和到期时间。轮换：
 
 ```bash
 bash deploy/vpn/ctl.sh apikeys create --expiration 8760h
 # 把打印出来的 hskey-api-... 写进 enroll/headscale.apikey，模式 0600
-docker compose kill -s HUP enroll
+docker compose restart enroll
 bash deploy/vpn/ctl.sh apikeys expire --prefix <旧前缀>
 ```
 
-`SIGHUP` 只重读 `config.json` 里的租户，进程里的 Headscale 客户端仍是启动时读到的那把 key，所以要 `restart`。写文件之前先把旧 key 留在备份里。Headplane 的个人登录 key 是另一把，`apikeys create` 的默认 90 天就是给它的；换登录 key 不必重启注册服务。
+`SIGHUP` 也会重读 `headscale_api_key_file`，读不到、为空或探测失败时保留旧客户端。但这个文件是单文件绑定：只有原地写入（同一个 inode，例如 `cat > enroll/headscale.apikey`）容器才看得到；用编辑器或 `mv` 换文件看不到。最稳妥的是写完后 `docker compose restart enroll`，不管文件怎么换的都有效。写文件之前先把旧 key 留在备份里。Headplane 的个人登录 key 是另一把，`apikeys create` 的默认 90 天就是给它的；换登录 key 不必重启注册服务。
 
 证书在反代上。`headscale/config.yaml` 的 `tls_cert_path` 和 `tls_key_path` 是空的，Headscale 自己不提供 TLS。看 `server_url` 和注册服务主机名的证书剩余天数（`openssl s_client` 或反代自己的检查）。这次没有对一台公网反代做这件事。
 
