@@ -183,3 +183,20 @@ iOS / Android 同时只允许一个活动 VPN。这次没有在手机上验证�
 - Windows 命名管道上的 LocalAPI、macOS GUI 版与嵌入式节点并存，这次没有再测。
 - iOS / Android 的单 VPN 限制没有在设备上验证。
 - docs/12 与 ADR-0005 仍写 takeover 默认 true。读那些文档的人会得到旧默认值。
+
+## 12. 本机转发与 SOCKS5 的访问控制
+
+日期：2026-10-27。
+
+回环地址上的 TCP 监听（`127.0.0.1` 或 `::1`）本机任何用户都能连。转发的目标如果说 HTTP，网页还可以通过 DNS rebinding 把浏览器指到这个端口，从而借用本节点的 tailnet 身份去访问内网。监听本身不区分是哪个用户、哪个页面发起的。
+
+因此两件事要分开做：
+
+- 传输层收紧。优先 `unix:<绝对路径>`，套接字创建后是 `0600`，只有拥有者能连。父目录不能是全员可写。已经有进程在听的套接字不会被清掉；没人听的残留文件会删掉再监听。SOCKS5 默认要用户名和密码（RFC 1929）。凭据放在 `0600` 的 `socks5_auth_file`，文件内容一行 `user:password`；或者交给状态目录，首次生成 `socks5.auth`（用户名 `idoris`，密码随机），重启继续用同一份。只有显式 `socks5_allow_anonymous: true` 才不认证，进程会打出警告。
+- 应用自己再认证一次。转到 Local AI 的流量，Local AI 应用必须自己验身份。转发和 SOCKS5 只决定谁能用这条通道，不代替应用的登录。
+
+每个监听单独限制。`max_connections` 默认 64，满了就立刻关掉新连接，不排队。`dial_timeout` 默认 10 秒。客户端在拨号期间断开，拨号的 goroutine 会跟着结束。`Accept` 遇到暂时错误会退避重试；致命错误把该监听的 `state` 写成 `failed`，并把错误放进状态的 `error` 字段。
+
+系统模式如果还没有连上本组织的控制面，Gate 关闭。状态是 `suspended`（`failed` 和 `closed` 优先）。新连接马上拒绝，不会向外拨号。Gate 由 daemon 在启动时接上：系统模式看协调器是否已经 `connected` 且控制 URL 是我们自己的；嵌入式模式 Gate 保持打开。
+
+`tailscale.com/net/socks5` 的 `Server` 能做用户名密码，但它自己 `Accept`、用固定 5 秒和 `context.Background` 拨号、不限连接数，第一次 `Accept` 失败就退出。所以这里没有用它的 `Serve`，CONNECT 和认证是一层薄实现。
