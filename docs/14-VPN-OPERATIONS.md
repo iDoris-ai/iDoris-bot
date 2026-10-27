@@ -45,7 +45,7 @@ Headplane 镜像的用户是 `0`（root），cookie 文件保持 0600，不改�
 
 管理员能做的事写在策略里：
 
-- `group:admins` → `tag:<组织>-local-ai:22`，外加一条 `ssh` 规则，`users` 是 `autogroup:nonroot`，`action` 是 `check`。这只打开了控制面的许可。Local AI 主机上还要执行 `tailscale set --ssh`，见第 11 节。`check` 会停住，等有人执行 `headscale auth approve --auth-id <id>`。
+- `group:admins` → `tag:<组织>-local-ai:22`，外加一条 `ssh` 规则，`users` 是 `autogroup:nonroot`，`action` 是 `check`。这只打开了控制面的许可。Local AI 主机在 system 模式的 idoris-vpnd 配置里写 `"ssh": true`，见第 11 节。策略里的 SSH 规则仍然决定谁可以连。`check` 会停住，等有人执行 `headscale auth approve --auth-id <id>`。
 - 启用了 tailnet 管理面时：`group:admins` → `tag:vpn-server:3000` 和 `:22`。成员没有到 `tag:vpn-server` 的规则。
 
 成员到本组织 Local AI 的端口是 8740（iDoris）、8742（Agent24）、443。管理员到不了成员的业务端口，成员之间也没有规则。不要在成员规则里加 `autogroup:member`、`autogroup:tagged` 或 `*`。
@@ -268,13 +268,7 @@ sudo systemctl enable --now idoris-vpnd.service
 
 这次是在 macOS 上读代码写的配方，没有在一台 Linux 上安装这个系统单元。system 模式要能连上本机 `tailscaled` 的套接字；嵌入模式不需要，也不能宣布路由。
 
-Tailscale SSH 同样不由策略单独打开。`vpn/` 里的守护进程没有设置 `RunSSH`。ACL 放行 tcp/22 只表示有人可以连这个端口。Local AI 主机在 system 模式注册完成之后还要：
-
-```bash
-sudo tailscale set --ssh
-```
-
-然后管理员的 SSH 才会走到策略里那条 `action: check`，并停在 `headscale auth approve --auth-id <id>`。这次没有对一台真实 Local AI 执行 `tailscale set --ssh`。
+Tailscale SSH 同样不由策略单独打开。Local AI 主机在 system 模式的 idoris-vpnd 配置里写 `"ssh": true`。策略里的 SSH 规则仍然决定谁可以连。管理员的 SSH 会走到策略里那条 `action: check`，并停在 `headscale auth approve --auth-id <id>`。
 
 macOS 的 `service install` 写的是 launchd 用户代理。Windows 今天会失败，原文是 `service install is not supported on windows; run idoris-vpnd run under your service manager`。见 `docs/17`。
 
