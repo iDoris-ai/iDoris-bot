@@ -459,11 +459,62 @@ def write_state(path: Path, state: dict) -> None:
     tmp.replace(path)
 
 
+def reconcile_gateway_lan_cidrs(cfg: dict, state: dict) -> bool:
+    """Set each existing {org}-gateway entry's lan_cidrs from managed state.
+
+    Does not create tenants and does not touch token_hashes. An empty list
+    removes the key so discover omits it.
+    """
+    wanted: dict[str, list[str]] = {}
+    for org in state.get("orgs") or []:
+        if not isinstance(org, dict) or not isinstance(org.get("name"), str):
+            die("state org is missing a name")
+        cidrs = org.get("lan_cidrs") or []
+        if not isinstance(cidrs, list):
+            die("organisation '%s' lan_cidrs must be a list" % org["name"])
+        wanted[org["name"]] = [str(item) for item in cidrs]
+    tenants = cfg.get("tenants")
+    if not isinstance(tenants, list):
+        die("enroll config has no tenants list")
+    changed = False
+    for tenant in tenants:
+        if not isinstance(tenant, dict):
+            continue
+        name = tenant.get("name") or ""
+        if not isinstance(name, str) or not name.endswith("-gateway"):
+            continue
+        org_name = name[: -len("-gateway")]
+        if org_name not in wanted:
+            continue
+        before = json.dumps(tenant.get("token_hashes"), sort_keys=True)
+        cidrs = wanted[org_name]
+        if cidrs:
+            if tenant.get("lan_cidrs") != cidrs:
+                tenant["lan_cidrs"] = list(cidrs)
+                changed = True
+        elif "lan_cidrs" in tenant:
+            tenant.pop("lan_cidrs")
+            changed = True
+        after = json.dumps(tenant.get("token_hashes"), sort_keys=True)
+        if after != before:
+            die("internal: reconcile changed token hashes for %s" % name)
+    return changed
+
+
+def write_enroll_config(path: Path, cfg: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    text = json.dumps(cfg, indent=2) + "\n"
+    tmp.write_text(text)
+    tmp.chmod(0o600)
+    tmp.replace(path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Render idoris-managed Headscale policy regions.")
-    parser.add_argument("command", choices=("init", "add-tenant"))
-    parser.add_argument("--policy", required=True, type=Path)
+    parser.add_argument("command", choices=("init", "add-tenant", "reconcile-enroll"))
+    parser.add_argument("--policy", type=Path)
     parser.add_argument("--state", required=True, type=Path)
+    parser.add_argument("--config", type=Path)
     parser.add_argument("--org", default="")
     parser.add_argument("--admin", default=DEFAULT_ADMIN)
     parser.add_argument("--lan-cidr", action="append", default=[], dest="lan_cidr")
@@ -479,6 +530,32 @@ def main() -> None:
     )
     parser.add_argument("--tailnet-admin", action="store_true")
     args = parser.parse_args()
+    if args.command == "reconcile-enroll":
+        if args.config is None:
+            die("reconcile-enroll needs --state and --config")
+        try:
+            state = json.loads(args.state.read_text())
+        except json.JSONDecodeError as exc:
+            die("cannot parse %s: %s" % (args.state, exc))
+        if not isinstance(state, dict):
+            die("state is not an object")
+        state.setdefault("admins", [])
+        state.setdefault("orgs", [])
+        validate_state(state, allow_public=False, requested=[])
+        try:
+            cfg = json.loads(args.config.read_text())
+        except json.JSONDecodeError as exc:
+            die("cannot parse %s: %s" % (args.config, exc))
+        if not isinstance(cfg, dict):
+            die("enroll config is not an object")
+        changed = reconcile_gateway_lan_cidrs(cfg, state)
+        if changed:
+            write_enroll_config(args.config, cfg)
+        json.dump({"changed": changed}, sys.stdout)
+        sys.stdout.write("\n")
+        return
+    if args.policy is None:
+        die("--policy is required")
     if args.command == "init":
         valid_name(args.admin, "admin user")
     if args.org:
