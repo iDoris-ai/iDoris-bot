@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"net/netip"
 	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -51,10 +54,22 @@ type Options struct {
 	AcceptRoutes  bool
 	AcceptDNS     bool
 	AdvertiseTags []string
+	// AdvertiseRoutes, when non-empty, is written into prefs at login and
+	// re-applied with EditPrefs while Running if the node has drifted.
+	// Empty means "do not manage routes".
+	AdvertiseRoutes []netip.Prefix
 	// Takeover allows switching away from a currently *running* foreign
 	// tailnet (e.g. the user's own Tailscale SaaS login). When false the
-	// daemon reports PhaseBlocked and waits.
+	// daemon reports PhaseBlocked and waits. The daemon default is false.
 	Takeover bool
+	// LoginWhileStarting treats a Starting backend that does not yet have a
+	// node identity as needing an auth-key login. tsnet.Server.Start on a
+	// fresh state directory calls StartLoginInteractive with no key and, on
+	// a reachable control server, can sit in Starting. The system client
+	// leaves this false. An embedded node sets it only when its state file
+	// did not exist yet, so a restart that is briefly Starting does not mint
+	// a new key.
+	LoginWhileStarting bool
 	// Interval between reconcile passes while healthy. Default 5s.
 	Interval time.Duration
 	// MaxBackoff caps the retry delay after failures. Default 2m.
@@ -73,8 +88,12 @@ type Snapshot struct {
 	KeyExpiry       time.Time `json:"key_expiry,omitempty"`
 	LastError       string    `json:"last_error,omitempty"`
 	Attempts        int       `json:"login_attempts"`
-	PreviousProfile string    `json:"previous_profile_id,omitempty"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	PreviousProfile string          `json:"previous_profile_id,omitempty"`
+	UpdatedAt       time.Time       `json:"updated_at"`
+	Mode            string          `json:"mode,omitempty"`
+	ModeReason      string          `json:"mode_reason,omitempty"`
+	Forwards        []ForwardStatus `json:"forwards,omitempty"`
+	SOCKS5          *SOCKS5Status   `json:"socks5,omitempty"`
 }
 
 // Reconciler converges tailscaled onto the configured control server.
@@ -99,6 +118,10 @@ type Reconciler struct {
 	// unreachable, TLS trust broken, ...) cannot burn a single-use key every
 	// 20s forever. Reset when the backend reaches Running.
 	unconverged int
+	// needsLoginSince is when a persisted node key was first seen in
+	// NeedsLogin/NoState. tsnet reports that state briefly while it resumes
+	// the stored key; minting immediately cancels that resume.
+	needsLoginSince time.Time
 }
 
 const (
@@ -107,6 +130,13 @@ const (
 	loginGrace = 20 * time.Second
 	// maxLoginGrace caps the exponential growth of the grace period.
 	maxLoginGrace = 10 * time.Minute
+	// persistedLoginSettle is how long a NeedsLogin state may last when a
+	// node key is already stored before it is treated as expiry. Observed on
+	// tailscale.com v1.104.2: tsnet.Server.Start resumes that key itself
+	// (doLogin regen=false) and is briefly NeedsLogin; a Start(AuthKey) during
+	// that window cancels the resume and burns a pre-auth key. A key that is
+	// actually expired stays NeedsLogin past this.
+	persistedLoginSettle = 15 * time.Second
 )
 
 // New builds a Reconciler. Options.ControlURL is required.
@@ -220,9 +250,16 @@ func (r *Reconciler) Step(ctx context.Context) (Snapshot, error) {
 	switch state {
 	case ipn.Running.String():
 		r.loginStarted = time.Time{}
+		r.needsLoginSince = time.Time{}
 		r.unconverged = 0
+		if err := r.reconcileRoutes(ctx, prefs); err != nil {
+			return r.fail(fmt.Errorf("advertise routes: %w", err)), err
+		}
 		return r.set(func(s *Snapshot) { fillSelf(s, st); s.Phase = PhaseConnected; s.LastError = "" }), nil
 	case ipn.Starting.String():
+		if r.needsLoginWhileStarting(st) {
+			return r.login(ctx, "starting-without-node")
+		}
 		return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil
 	case ipn.NeedsMachineAuth.String():
 		return r.set(func(s *Snapshot) { s.Phase = PhaseNeedsApprove }), nil
@@ -233,6 +270,9 @@ func (r *Reconciler) Step(ctx context.Context) (Snapshot, error) {
 		return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil
 	case ipn.NeedsLogin.String(), ipn.NoState.String():
 		if r.recentLogin() {
+			return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil
+		}
+		if persistedIdentity(st, prefs) && !r.persistedLoginDue() {
 			return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil
 		}
 		return r.login(ctx, "needs-login")
@@ -286,7 +326,7 @@ func (r *Reconciler) stepForeign(ctx context.Context, st *ipnstate.Status, prefs
 	if foreignRunning && !r.opt.Takeover {
 		return r.set(func(s *Snapshot) {
 			s.Phase = PhaseBlocked
-			s.LastError = fmt.Sprintf("tailscaled is logged into %s; takeover disabled", prefs.ControlURL)
+			s.LastError = fmt.Sprintf("tailscaled is logged into %s; takeover is disabled. Set mode: embedded to run alongside it, or takeover: true to switch this machine", prefs.ControlURL)
 		}), nil
 	}
 	if r.recentLogin() {
@@ -318,6 +358,9 @@ func (r *Reconciler) login(ctx context.Context, reason string) (Snapshot, error)
 	prefs.RouteAll = r.opt.AcceptRoutes
 	prefs.Hostname = r.opt.Hostname
 	prefs.AdvertiseTags = r.opt.AdvertiseTags
+	if len(r.opt.AdvertiseRoutes) > 0 {
+		prefs.AdvertiseRoutes = append([]netip.Prefix(nil), r.opt.AdvertiseRoutes...)
+	}
 	if err := r.be.CheckPrefs(ctx, prefs); err != nil {
 		return r.fail(fmt.Errorf("check prefs: %w", err)), err
 	}
@@ -335,6 +378,81 @@ func (r *Reconciler) login(ctx context.Context, reason string) (Snapshot, error)
 	r.loginStarted = r.now()
 	r.unconverged++
 	return r.set(func(s *Snapshot) { s.Phase = PhaseStarting; s.LastError = "" }), nil
+}
+
+// persistedIdentity reports whether this profile already has a node key.
+// That key is what tsnet resumes on process start. A fresh install has none.
+//
+// LocalAPI GetPrefs strips private keys (ipnlocal.stripKeysFromPrefs in
+// tailscale.com v1.104.2), so PublicNodeKeyOK on those prefs is always false.
+// Status.HaveNodeKey is computed from the unsanitized profile and is the
+// signal a LocalAPI client can see. Prefs are still checked for a backend
+// that returns the key in-process.
+func persistedIdentity(st *ipnstate.Status, p *ipn.Prefs) bool {
+	if st != nil && st.HaveNodeKey {
+		return true
+	}
+	if p == nil || p.Persist == nil {
+		return false
+	}
+	_, ok := p.Persist.PublicNodeKeyOK()
+	return ok
+}
+
+// persistedLoginDue reports whether a stored node key has stayed logged-out
+// long enough to be an expiry rather than tsnet's brief NeedsLogin. The first
+// observation only starts the clock.
+func (r *Reconciler) persistedLoginDue() bool {
+	if r.needsLoginSince.IsZero() {
+		r.needsLoginSince = r.now()
+		return false
+	}
+	return !r.now().Before(r.needsLoginSince.Add(persistedLoginSettle))
+}
+
+// needsLoginWhileStarting reports whether a Starting backend is the keyless
+// login tsnet performs on a fresh node, rather than a login this reconciler
+// already issued or a restart of a node that already has an identity.
+func (r *Reconciler) needsLoginWhileStarting(st *ipnstate.Status) bool {
+	if !r.opt.LoginWhileStarting || r.recentLogin() {
+		return false
+	}
+	if st != nil && st.Self != nil && !st.Self.PublicKey.IsZero() {
+		return false
+	}
+	return true
+}
+
+// reconcileRoutes pushes AdvertiseRoutes when the running prefs differ.
+// Headscale still has to approve the routes; this only tells the client to
+// advertise them.
+func (r *Reconciler) reconcileRoutes(ctx context.Context, prefs *ipn.Prefs) error {
+	if len(r.opt.AdvertiseRoutes) == 0 {
+		return nil
+	}
+	if sameRoutes(prefs.AdvertiseRoutes, r.opt.AdvertiseRoutes) {
+		return nil
+	}
+	r.log.Info("updating advertised routes", "have", prefs.AdvertiseRoutes, "want", r.opt.AdvertiseRoutes)
+	_, err := r.be.EditPrefs(ctx, &ipn.MaskedPrefs{
+		Prefs:              ipn.Prefs{AdvertiseRoutes: append([]netip.Prefix(nil), r.opt.AdvertiseRoutes...)},
+		AdvertiseRoutesSet: true,
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func sameRoutes(a, b []netip.Prefix) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	aa := append([]netip.Prefix(nil), a...)
+	bb := append([]netip.Prefix(nil), b...)
+	slices.SortFunc(aa, func(x, y netip.Prefix) int { return strings.Compare(x.String(), y.String()) })
+	slices.SortFunc(bb, func(x, y netip.Prefix) int { return strings.Compare(x.String(), y.String()) })
+	return slices.Equal(aa, bb)
 }
 
 func (r *Reconciler) fail(err error) Snapshot {

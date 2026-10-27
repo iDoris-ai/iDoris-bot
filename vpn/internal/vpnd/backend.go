@@ -1,7 +1,8 @@
-// Package vpnd is the client-side daemon that keeps the official Tailscale
-// client of a machine logged into the iDoris-operated Headscale control
-// server. It never replaces or patches Tailscale; it drives tailscaled through
-// the same LocalAPI the `tailscale` CLI uses.
+// Package vpnd keeps one Tailscale node logged into the iDoris Headscale
+// control server. System mode drives the machine's official tailscaled
+// through the same LocalAPI the `tailscale` CLI uses. Embedded mode drives an
+// in-process userspace tsnet node through that same interface and does not
+// touch the system client. The package never replaces or patches Tailscale.
 package vpnd
 
 import (
