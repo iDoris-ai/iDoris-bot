@@ -98,7 +98,7 @@ chown_enroll_tree() {
     chown 65532:65532 enroll
     chmod 700 enroll
   fi
-  for f in enroll/config.json enroll/headscale.apikey enroll/minted-tokens.txt enroll/token-labels.json; do
+  for f in enroll/config.json enroll/headscale.apikey enroll/minted-tokens.txt; do
     if [[ -f "$f" && ! -L "$f" ]]; then
       chown 65532:65532 "$f"
       chmod 600 "$f"
@@ -440,6 +440,8 @@ for spec in "${wanted[@]}"; do
   if [[ "$existing_names" == *" $ename "* ]]; then
     continue
   fi
+  blabel="bootstrap-${ename}"
+  [[ "$blabel" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]] || die "label '$blabel' is not a valid credential label"
   read -r tok hash < <(mint)
   new_rows+=("${ename}|${euser}|${etags}|${erate}|${ettl}|${hash}|${erole}")
   printed+=("${ename}|${tok}")
@@ -461,7 +463,7 @@ if [[ ${#new_rows[@]} -gt 0 ]]; then
   spec_file="$(mktemp enroll/config.sync.XXXXXX)"
   printf '%s\n' "${new_rows[@]}" > "$spec_file"
   python3 - "$control_url" enroll/config.json "$spec_file" > enroll/config.json.tmp <<'PY'
-import json, os, sys
+import datetime, json, os, re, sys
 control_url, path, spec_path = sys.argv[1:4]
 if os.path.exists(path):
     with open(path) as f:
@@ -479,10 +481,18 @@ with open(spec_path) as f:
         name, user, tags, rate, ttl, digest, role = line.rstrip("\n").split("|")
         if name in have:
             continue
+        label = "bootstrap-" + name
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", label):
+            raise SystemExit("bootstrap label %r is not a valid credential label" % label)
+        created = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         entry = {
             "name": name,
             "headscale_user_id": user,
-            "token_hashes": [digest],
+            "token_hashes": [{
+                "hash": digest,
+                "label": label,
+                "created_at": created,
+            }],
             "preauth_ttl": ttl or "10m",
         }
         if role:
@@ -536,6 +546,7 @@ if [[ ${#printed[@]} -gt 0 ]]; then
   echo "Enrollment tokens minted by this run (also in enroll/minted-tokens.txt, mode 0600):"
   echo "Delete that file after the tokens are stored somewhere else."
   for row in "${printed[@]}"; do
+    echo "  ${row%%|*}: label bootstrap-${row%%|*}"
     echo "  ${row%%|*}: ${row#*|}"
   done
   cat <<EOF
