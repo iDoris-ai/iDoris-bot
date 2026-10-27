@@ -19,9 +19,9 @@ bash deploy/vpn/bootstrap.sh init --org office --admin admin
 - 明文 token 在拉起服务**之前**追加到 `enroll/minted-tokens.txt`（0600）。后面的步骤失败时，这是哈希已经写进配置之后唯一的明文副本。用完后把文件挪到别处再删。
 - 在 `headscale/policy.hujson` 的 `BEGIN/END idoris-managed` 标记之间写入该组织的规则，跑 `headscale policy check`，再对 Headscale 发 SIGHUP。标记以外的手写规则会保留。
 - 创建 Headscale 用户 `admin` 和 `office`。
-- 建注册项并打印 token：`admin`（`role: admin`，个人节点，无 tag，每分钟 5 次，TTL 5 分钟）、`office`（`role: member`，TTL 10 分钟）、`office-local-ai`（`role: local-ai`，`tag:office-local-ai`，每分钟 5 次）。带了 `--lan-cidr` 时还有 `office-gateway`（`role: gateway`）。`--tailnet-admin` 时还有 `vpn-server`（只有 `tag:vpn-server`，没有 join role；sidecar 用原始 token 和 `acl_tags`）。
+- 建注册项并打印 token：`admin`（`role: admin`，个人节点，无 tag，每分钟 5 次，TTL 5 分钟）、`office`（`role: member`，TTL 10 分钟）、`office-local-ai`（`role: local-ai`，`tag:office-local-ai`，每分钟 5 次）。带了 `--lan-cidr` 时还有 `office-gateway`（`role: gateway`）。`--tailnet-admin` 时还有 `vpn-server`（只有 `tag:vpn-server`，没有 join role；sidecar 用原始 token 和 `acl_tags`）。新凭证写成 `token_hashes` 对象，标签是 `bootstrap-<注册项名>`（例如 `bootstrap-office`）。打印先一行标签，再一行 token。
 
-`invite` 会把租户上的 `role` 写进加入码。角色为空时加入码写成 `member`。这次改动只作用于**新**写出来的注册项；已经存在的项再跑 `init` 不会补角色。给旧项补角色时，在 `enroll/config.json` 里加上 `"role"`（`admin`、`member`、`local-ai`、`gateway` 之一），再 `ctl.sh token new`。
+`invite` 会把租户上的 `role` 写进加入码。角色为空时加入码写成 `member`。这次改动只作用于**新**写出来的注册项；已经存在的项再跑 `init` 不会补角色。给旧项补角色时，在 `enroll/config.json` 里加上 `"role"`（`admin`、`member`、`local-ai`、`gateway` 之一），再 `ctl.sh token new --entry <项> --label <标签>`。已有的十六进制字符串仍然能加载；`token list` 里没有标签的显示为 `-`。
 
 再跑一次 `init` 是安全的：已有用户、API key、cookie、token 都不会换。已有注册项时日志是「enrollment entries already present; no new tokens minted」。上次铸出来的明文如果还在 `enroll/minted-tokens.txt` 里，会再打印一次。
 
@@ -34,7 +34,7 @@ Headscale v0.29 的 `policy check` 打到正在运行的服务器上的 gRPC，�
 镜像 `USER` 是 `65532:65532`。`bootstrap.sh` 的规则：
 
 - 操作员自己不是 root：`ENROLL_UID` / `ENROLL_GID` 用操作员的 uid/gid，这样 0600 的密钥文件进程读得到。
-- 操作员是 root：改成 `65532:65532`，并在启动前把 `enroll/` 和里面的 `config.json`、`headscale.apikey`、`minted-tokens.txt`、`token-labels.json` `chown` 给 `65532`。日志会写「refusing to run enroll as root」。
+- 操作员是 root：改成 `65532:65532`，并在启动前把 `enroll/` 和里面的 `config.json`、`headscale.apikey`、`minted-tokens.txt` `chown` 给 `65532`。日志会写「refusing to run enroll as root」。
 - 不会把注册容器设成 uid 0。
 
 Headplane 镜像的用户是 `0`（root），cookie 文件保持 0600，不改属主。这次在 macOS 上以非 root 操作员跑通了探针和登录证明；没有在一台以 root 执行 `bootstrap.sh` 的 Linux 上再跑一遍 chown。
@@ -92,9 +92,10 @@ bash deploy/vpn/bootstrap.sh add-tenant globex --lan-cidr 192.168.50.0/24
 | `routes list` / `routes approve` / `routes clear` | 自动批准失败时用 approve |
 | `policy check` / `policy reload` | 检查，reload 再发 SIGHUP |
 | `apikeys list` / `apikeys create [--expiration 90d]` / `apikeys expire` | `create` 打出的是登录 Headplane 的个人 key，不是注册服务那把 |
-| `token new --entry NAME --label LABEL [--enroll-url URL]` | 经 `docker compose run` 调 `invite`。标签记在 `enroll/token-labels.json`。明文先追加到 `minted-tokens.txt`，再 SIGHUP 注册服务 |
-| `token revoke --entry NAME (--label LABEL \| --hash-prefix HEX)` | 删掉这一条哈希。最后一条会拒绝，先 `token new` |
-| `offboard --entry NAME --hash-prefix HEX [--node-id N]` | **先**吊销这枚凭证。吊销失败则不动节点。给了 `--node-id` 才 `nodes expire` 再 `nodes delete` |
+| `token new --entry NAME --label LABEL [--enroll-url URL]` | 经 `docker compose run` 把 `--label` 传给 `invite`。标签写在该项的 `token_hashes` 对象上。明文先追加到 `minted-tokens.txt`，再用 `list-credentials` 核对标签，然后重启注册服务 |
+| `token list --entry NAME` | 每行是标签、12 位哈希前缀、`created_at`，制表符分开。没有标签或时间时是 `-`。不打印 token，也不打印完整哈希 |
+| `token revoke --entry NAME (--label LABEL \| --hash-prefix HEX)` | 两个选择器恰好一个，原样交给 CLI `revoke`。成功行是 `revoked <entry> <label或-> <12位前缀>`。最后一条会拒绝，先 `token new` |
+| `offboard --entry NAME (--label LABEL \| --hash-prefix HEX) [--node-id N]` | **先**吊销这枚凭证。吊销失败则不 expire、不 delete。给了 `--node-id` 才 `nodes expire` 再 `nodes delete`。单独 expire 或 delete 节点不会吊销凭证 |
 | `logs [service] [--tail N]` | 日志，secret 打码 |
 | `backup [DIR]` | 见第 6 节 |
 | `restore DIR --force` | 见第 6 节。没有 `--force` 拒绝 |
@@ -103,9 +104,9 @@ bash deploy/vpn/bootstrap.sh add-tenant globex --lan-cidr 192.168.50.0/24
 | `upgrade` | 只打印升级步骤，不拉镜像 |
 | `break-glass` | Headscale 挂了之后的 SSH 清单 |
 
-`token` 的 `--label` 是 `ctl.sh` 自己的。`idoris-vpn-enroll invite` / `revoke` 今天没有 `--label`，只有 `--hash-prefix`（4 到 64 位十六进制，必须唯一命中一条）。标签文件在 gitignore 里。
+`token new`、`token revoke` 和 `offboard` 的 `--label` 都交给 `idoris-vpn-enroll`。标签字符集是 `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}`。同一注册项上重复的标签会被拒绝，错误里有 `already exists`。`--hash-prefix` 是 4 到 64 位十六进制，必须唯一命中一条。`token_hashes` 可以是旧的十六进制字符串，也可以是 `{"hash","label","created_at"}`；两种都能读，`invite` 写出对象。
 
-注册服务的 CLI 支持 SIGHUP 重读 `config.json`（非法文件会留下上一份）。`ctl.sh` 在服务正在跑时发 SIGHUP，否则等下次启动。SIGHUP **不会**重读 API key 文件，见第 12 节。
+注册服务在 SIGHUP 时会按路径重读 `config.json`（非法文件会留下上一份），并且这次重读不更换进程里的 Headscale 客户端。compose 把 `enroll/config.json` 按**文件**绑进容器。`invite` / `revoke` 用 rename 换掉这个文件，绑定还指着旧 inode。本机 Docker 上，rename 之后容器里该路径是 ENOENT，重启才重新绑上新文件。`ctl.sh` 因此在服务正在跑时执行 `docker compose restart enroll`，否则等下次启动。只换 API key、不重启，客户端仍是旧的，见第 12 节。
 
 ## 6. 恢复包
 
@@ -126,7 +127,7 @@ bash deploy/vpn/bootstrap.sh add-tenant globex --lan-cidr 192.168.50.0/24
 bash deploy/vpn/ctl.sh restore /path/to/bundle --force
 ```
 
-恢复会写回上面全部文件，并只启动备份里记下的管理模式。noise 私钥必须和 sqlite 一起回来，否则节点要重新注册。内嵌 DERP 开着时，DERP 私钥也要一起回来；包里没有这把密钥时，恢复不会凭空造一把。不要把旧 sqlite 恢复进已经迁移过的更新 minor 版本。
+恢复会写回上面全部文件，并只启动备份里记下的管理模式。noise 私钥必须和 sqlite 一起回来，否则节点要重新注册。内嵌 DERP 开着时，DERP 私钥也要一起回来；包里没有这把密钥时，恢复不会凭空造一把。不要把旧 sqlite 恢复进已经迁移过的更新 minor 版本。新打的包不含 `state/enroll/token-labels.json`。旧包里如果还有这个文件，`restore` 打印 `ignoring obsolete`，不把它复制回去；包里没有它也照常恢复。
 
 异地副本不要把明文目录拷走。仓库里不放 age 或 gpg 的密钥。`backup` 结束时打印的 cron（每天 03:15 UTC；`\%` 是为了让 cron 不把 `%` 当成换行）：
 
@@ -136,7 +137,7 @@ bash deploy/vpn/ctl.sh restore /path/to/bundle --force
 
 把路径换成 `backup` 实际打印的那次目录。systemd timer 跑同一条命令即可。age 的身份放在另一台机器上。看 `/mnt/offhost` 上最新文件的时间，超过一天没有新文件就当备份停了。
 
-干净主机演练是 `bash deploy/vpn/test/restore-drill.sh`：在 `deploy/` 下复制一份栈（compose 的构建上下文要能找到 `vpn/`），注册一个节点，备份，`down -v`，删掉原目录，在空副本上 `restore`，检查原节点仍在列表里，并且**同一枚** token 还能再注册一个节点。2026-10-27 项目 `idorisdr184639` 退出码 0，日志以 `drill: ok` 结束。0755 目录和符号链接目标被拒绝；恢复后 `drill-member` 仍在列表里，同一枚 token 又注册了 `drill-member-2`。这一轮内嵌 DERP 是关的，包里没有 DERP 私钥。
+干净主机演练是 `bash deploy/vpn/test/restore-drill.sh`：在 `deploy/` 下复制一份栈（compose 的构建上下文要能找到 `vpn/`），注册一个节点，备份，`down -v`，删掉原目录，在空副本上 `restore`，检查原节点仍在列表里，并且**同一枚** token 还能再注册一个节点。2026-10-27 项目 `idoris-vpn-ctl-771396` 退出码 0，日志以 `drill: ok` 结束。0755 目录和符号链接目标被拒绝；恢复后 `drill-member` 仍在列表里，同一枚 token 又注册了 `drill-member-2`。`token list` 把恢复出来的旧哈希显示为 `-`，没有打出完整哈希。新包里没有 `token-labels.json`。随后把这个文件放进包里再 `restore --force`，退出码 0，输出里有 `ignoring obsolete`，目标树没有这个文件，`drill-member` 还在，`token list` 仍是那一行 `-`。同一轮用注册镜像的 `list-credentials` 读了一份混合配置：旧的十六进制字符串列成 `-`、`aaaaaaaaaaaa`、`-`，对象标签 `bootstrap-acme` 列成该标签、`bbbbbbbbbbbb` 和 `2026-10-27T00:00:00Z`。这一轮内嵌 DERP 是关的，包里没有 DERP 私钥。
 
 ## 7. Headplane 的四种访问
 
@@ -329,7 +330,7 @@ bash deploy/vpn/test/probe.sh
 
 脚本自选 compose 项目名和端口，复制一份实验室配置（`server_url` 改成 `http://headscale:8080`，关掉内嵌 DERP），拉起两个组织、管理员、一台网关和一台模拟的局域网主机，然后拆掉卷。不会改仓库里的 `server_url`。生产配置仍然拒绝明文和非 443。
 
-最近一次（2026-10-27，compose 项目 `idorisvp762375`，退出码 0）：`probe: 51 passed, 0 failed`，然后 `probe: ok`。其中 38 条是节点之间的允许/拒绝：成员只能打本组织 Local AI 的 8740/8742/443，打不到 22 和 8080，打不到另一组织，打不到管理员；Local AI 打成员的 22 和 8740 被拒绝；管理员只能打两台 Local AI 的 22。其余是路由自动批准、经 `tailscale0` 的局域网 8740 允许和 22 拒绝、另一组织没有该路由、管理员能打开 tailnet 上的 Headplane（当时是 `100.64.0.7:3000`）、两个成员不能，以及在 `tailnet-admin` 下 backup 和 restore 之后，发布出来的 Headplane 仍是停止的，主机端口（当时 `127.0.0.1:56605`）仍拒绝连接。内嵌 DERP 关着，备份跳过了容器里不存在的 `derp_server_private.key`。
+最近一次（2026-10-27，compose 项目 `idoris-vpn-ctl-245872`，退出码 0）：`probe: 52 passed, 0 failed`，然后 `probe: ok`。其中 38 条是节点之间的允许/拒绝：成员只能打本组织 Local AI 的 8740/8742/443，打不到 22 和 8080，打不到另一组织，打不到管理员；Local AI 打成员的 22 和 8740 被拒绝；管理员只能打两台 Local AI 的 22。其余是路由自动批准、经 `tailscale0` 的局域网 8740 允许和 22 拒绝、另一组织没有该路由、管理员能打开 tailnet 上的 Headplane（当时是 `100.64.0.7:3000`）、两个成员不能，在 `tailnet-admin` 下 backup 和 restore 之后发布出来的 Headplane 仍是停止的、主机端口（当时 `127.0.0.1:51614`）仍拒绝连接，以及凭证生命周期：`token new --label laptop-a` 可以注册，再铸 `laptop-b`，重复标签被拒绝，吊销 `laptop-a` 之后登记返回 401，`laptop-b` 仍可登记，`offboard --label laptop-b --node-id` 先吊销再 expire 再 delete，最后一枚凭证拒绝删除。内嵌 DERP 关着，备份跳过了容器里不存在的 `derp_server_private.key`。
 
 这是实验室明文注册，不覆盖生产上的 https:443 重拨。
 
