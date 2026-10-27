@@ -24,3 +24,11 @@ integration:
 
 clean:
 	rm -rf bin
+
+# LAN direct path, away-from-LAN DERP, and subnet-router gateway.
+# Own compose project inside the test (idoris-vpn-lan-*). See docs/15.
+integration-lan:
+	cd integration && $(GO) test -tags integration -count=1 -v -timeout 20m -run 'TestLanDirect|TestLanAwayRelay|TestGatewaySubnetRoute' ./...
+
+lint-integration:
+	golangci-lint run --build-tags integration ./...

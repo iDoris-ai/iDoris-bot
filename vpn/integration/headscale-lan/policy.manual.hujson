@@ -1,0 +1,31 @@
+// Lab policy for LAN-direct and manual subnet-route approval (Headscale v0.29).
+//
+// No autoApprovers section: a route advertised by tag:acme-gateway stays
+// unapproved until `headscale nodes approve-routes`. The lab prefix below is
+// the default; lan_test.go substitutes the runtime prefix (same string) so
+// parallel agents do not share a Docker subnet.
+//
+// ACL is default-deny once "acls" is present:
+//   acme@ -> tag:acme-local-ai:8740 only (8080 is listening and must fail)
+//   acme@ -> <lab CIDR>:8740 only (the NAS / AI box behind the gateway)
+{
+  "groups": {
+    "group:admins": ["admin@"],
+  },
+  "tagOwners": {
+    "tag:acme-local-ai": ["group:admins"],
+    "tag:acme-gateway": ["group:admins"],
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["acme@"],
+      "dst": ["tag:acme-local-ai:8740"],
+    },
+    {
+      "action": "accept",
+      "src": ["acme@"],
+      "dst": ["10.251.73.0/24:8740"],
+    },
+  ],
+}
