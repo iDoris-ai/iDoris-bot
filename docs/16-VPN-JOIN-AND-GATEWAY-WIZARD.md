@@ -248,4 +248,4 @@ macOS 需要 sudo。plist 写到 `/Library/LaunchDaemons/ai.idoris.vpnd.plist`�
 
 Windows 不引入新依赖，用系统自带的 `schtasks.exe`。任务名 `idoris-vpnd`，`ONSTART`，`/RU SYSTEM`，`/RL HIGHEST`。配置复制到 `C:\ProgramData\idoris\vpn.json`。卸载是 `schtasks /Delete /TN idoris-vpnd /F`，配置留下。参数列表由 `vpn/cmd/idoris-vpnd/testdata/idoris-vpnd.task.txt` 锁住；单测不执行 `schtasks`。
 
-本机转发和 SOCKS5 谁能连上，写在 `docs/13-VPN-CLIENT-MODES.md` 第 12 节。那一节和这里的本地页面不是同一件事：页面有自己的秘密和 CSRF；转发监听没有，除非改成 unix 套接字或给 SOCKS5 配认证。
+本机转发和 SOCKS5 谁能连上，写在 `docs/13-VPN-CLIENT-MODES.md` 第 13 节。那一节和这里的本地页面不是同一件事：页面有自己的秘密和 CSRF。回环 TCP 转发本身不认证。`unix:` 套接字是 0600。SOCKS5 默认要用户名和密码，凭据在 `socks5_auth_file`，或在 `<state_dir>/socks5.auth`（0600，创建时日志只打路径）。
