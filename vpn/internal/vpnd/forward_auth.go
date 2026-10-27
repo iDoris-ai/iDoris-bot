@@ -24,14 +24,29 @@ func resolveSOCKSAuth(opt AccessOptions) (user, pass string, anon bool, authPath
 		if opt.SOCKS5User == "" || opt.SOCKS5Password == "" {
 			return "", "", false, "", false, errors.New("vpnd: SOCKS5 username and password are both required")
 		}
+		if err = validateSOCKSCred(opt.SOCKS5User, opt.SOCKS5Password); err != nil {
+			return "", "", false, "", false, err
+		}
 		return opt.SOCKS5User, opt.SOCKS5Password, false, "", false, nil
 	case opt.SOCKS5AuthFile != "":
 		user, pass, created, err = loadOrCreateSOCKSAuth(opt.SOCKS5AuthFile, false)
-		return user, pass, false, opt.SOCKS5AuthFile, created, err
+		if err != nil {
+			return "", "", false, "", false, err
+		}
+		if err = validateSOCKSCred(user, pass); err != nil {
+			return "", "", false, "", false, err
+		}
+		return user, pass, false, opt.SOCKS5AuthFile, created, nil
 	case opt.StateDir != "":
 		authPath = filepath.Join(opt.StateDir, "socks5.auth")
 		user, pass, created, err = loadOrCreateSOCKSAuth(authPath, true)
-		return user, pass, false, authPath, created, err
+		if err != nil {
+			return "", "", false, "", false, err
+		}
+		if err = validateSOCKSCred(user, pass); err != nil {
+			return "", "", false, "", false, err
+		}
+		return user, pass, false, authPath, created, nil
 	case opt.AllowAnonymous:
 		return "", "", true, "", false, nil
 	default:
@@ -113,6 +128,19 @@ func readSOCKSAuth(path string) (string, string, error) {
 		return "", "", fmt.Errorf("vpnd: socks5 auth file %q must contain user:password", path)
 	}
 	return user, pass, nil
+}
+
+// validateSOCKSCred enforces the RFC 1929 field length. The length is bytes,
+// not runes. A value outside 1..255 is accepted by the config parser but no
+// client can send it, so the listener must not open.
+func validateSOCKSCred(user, pass string) error {
+	if n := len(user); n < 1 || n > 255 {
+		return fmt.Errorf("vpnd: SOCKS5 username must be 1 to 255 bytes")
+	}
+	if n := len(pass); n < 1 || n > 255 {
+		return fmt.Errorf("vpnd: SOCKS5 password must be 1 to 255 bytes")
+	}
+	return nil
 }
 
 // credEqual compares SOCKS5 credentials without leaking which side or which
