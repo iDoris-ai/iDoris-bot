@@ -245,39 +245,117 @@ func ParseListen(s string) (network, address string, err error) {
 	}
 }
 
-// Listen opens the status listener. Unix sockets are created 0600 and any
-// stale socket file is removed first.
+// Listen opens the status listener. A unix socket is created mode 0600.
+// Before anything is deleted, Listen takes a status-path flock under
+// os.UserCacheDir()/idoris/locks. That flock is not the backend controller
+// lock (main still takes that later, because status must be up while the
+// daemon waits for tailscaled). Only a socket that refuses connections and
+// is owned by this user is removed. Regular files and symlinks are left
+// in place and startup fails.
 func Listen(spec string) (net.Listener, error) {
 	network, addr, err := ParseListen(spec)
 	if err != nil {
 		return nil, err
 	}
+	var lk *ControllerLock
 	if network == "unix" {
-		if err := os.MkdirAll(filepath.Dir(addr), 0o700); err != nil {
+		lk, err = holdStatusLock(addr)
+		if err != nil {
 			return nil, err
 		}
-		if _, err := os.Stat(addr); err == nil {
-			// Refuse to steal a live socket from another daemon instance.
-			c, derr := net.DialTimeout("unix", addr, 500*time.Millisecond)
-			if derr == nil {
-				_ = c.Close()
-				return nil, fmt.Errorf("another idoris-vpnd is already serving %s", addr)
-			}
-			_ = os.Remove(addr)
+		if err := os.MkdirAll(filepath.Dir(addr), 0o700); err != nil {
+			_ = lk.Release()
+			return nil, err
+		}
+		if err := prepareStatusSocket(addr); err != nil {
+			_ = lk.Release()
+			return nil, err
 		}
 	}
 	ln, err := net.Listen(network, addr)
 	if err != nil {
+		if lk != nil {
+			_ = lk.Release()
+		}
 		return nil, err
 	}
 	if network == "unix" {
 		if err := os.Chmod(addr, 0o600); err != nil {
 			_ = ln.Close()
+			_ = lk.Release()
 			return nil, err
 		}
+		return &statusListener{Listener: ln, lock: lk}, nil
 	}
 	return ln, nil
 }
+
+// statusListener keeps the status-path flock until the socket is closed.
+type statusListener struct {
+	net.Listener
+	lock *ControllerLock
+}
+
+func (l *statusListener) Close() error {
+	err := l.Listener.Close()
+	if l.lock != nil {
+		if lerr := l.lock.Release(); err == nil {
+			err = lerr
+		}
+		l.lock = nil
+	}
+	return err
+}
+
+func holdStatusLock(addr string) (*ControllerLock, error) {
+	path, err := statusLockPath(addr)
+	if err != nil {
+		return nil, err
+	}
+	lk, err := acquireLock(path, "status")
+	if err != nil {
+		return nil, fmt.Errorf("status listener: %w", err)
+	}
+	return lk, nil
+}
+
+// prepareStatusSocket runs only while the status-path flock is held.
+// It refuses to delete anything that is not a dead socket owned by this user.
+func prepareStatusSocket(addr string) error {
+	st, err := os.Lstat(addr)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if st.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("status socket %s is a symlink; refusing to remove it", addr)
+	}
+	if st.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("status socket %s exists and is not a socket; refusing to remove it", addr)
+	}
+	uid, ok := statusFileOwner(st)
+	if !ok {
+		return fmt.Errorf("status socket %s owner cannot be confirmed; refusing to remove it", addr)
+	}
+	if uid != os.Getuid() {
+		return fmt.Errorf("status socket %s is owned by uid %d, not uid %d; refusing to remove it", addr, uid, os.Getuid())
+	}
+	c, dialErr := net.DialTimeout("unix", addr, 500*time.Millisecond)
+	if dialErr == nil {
+		_ = c.Close()
+		return fmt.Errorf("another idoris-vpnd is already serving %s", addr)
+	}
+	if err := os.Remove(addr); err != nil && !errors.Is(err, os.ErrNotExist) { //nolint:gosec // G703: path is the status socket, checked with Lstat above, and the status-path flock is held
+		return err
+	}
+	return nil
+}
+
+// statusFileOwner is replaced in tests. Production uses the platform lookup.
+// Windows cannot confirm a uid, so removal is refused.
+var statusFileOwner = platformStatusFileOwner
 
 // ServeStatus runs the HTTP server until ctx is done.
 func ServeStatus(ctx context.Context, ln net.Listener, h http.Handler) error {
