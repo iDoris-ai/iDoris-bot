@@ -30,8 +30,9 @@ func usage() {
 Usage:
   idoris-vpn-enroll serve  --config FILE [--listen 127.0.0.1:8787]
   idoris-vpn-enroll token  new                        print a new token and its hash
-  idoris-vpn-enroll invite --config FILE --entry NAME --enroll-url URL [--hostname-hint H] [--allow-insecure]
-  idoris-vpn-enroll revoke --config FILE --entry NAME --hash-prefix HEX
+  idoris-vpn-enroll invite --config FILE --entry NAME --enroll-url URL [--label L] [--hostname-hint H] [--allow-insecure]
+  idoris-vpn-enroll revoke --config FILE --entry NAME (--label L | --hash-prefix HEX)
+  idoris-vpn-enroll list-credentials --config FILE --entry NAME
   idoris-vpn-enroll tenant ensure --config FILE --name NAME   create the Headscale user, print its id
   idoris-vpn-enroll check  --config FILE              verify config and Headscale reachability
   idoris-vpn-enroll version
@@ -39,6 +40,11 @@ Usage:
 serve reloads the config on SIGHUP. An invalid file keeps the previous config.
 invite prints one join code to stdout and nothing else. The code contains the
 token; it is not written to the config file or the log.
+list-credentials prints the label, a hash prefix, and created_at. It never
+prints the token or the full hash.
+Expiring or deleting a Headscale node does not revoke enrollment: the daemon
+can ask for another pre-auth key. Revoke the credential first, then expire
+or delete the node.
 
 The Headscale API key is read from HEADSCALE_API_KEY or headscale_api_key_file.
 `, version.Version)
@@ -59,6 +65,8 @@ func main() {
 		err = inviteCmd(os.Args[2:], os.Stdout)
 	case "revoke":
 		err = revokeCmd(os.Args[2:], os.Stdout)
+	case "list-credentials":
+		err = listCredentialsCmd(os.Args[2:], os.Stdout)
 	case "tenant":
 		err = tenantCmd(os.Args[2:])
 	case "check":
@@ -117,6 +125,18 @@ func apiKey(cfg *enroll.Config) (string, error) {
 	return "", errors.New("no Headscale API key: set HEADSCALE_API_KEY or headscale_api_key_file")
 }
 
+// controlProber adapts the Headscale client to enroll.ControlProber.
+// The two packages cannot share the interface: enroll already imports headscale.
+type controlProber struct{ c *headscale.Client }
+
+func (p controlProber) ProbeControl(ctx context.Context) (enroll.ControlProbe, error) {
+	st, err := p.c.ProbeControl(ctx)
+	if err != nil {
+		return enroll.ControlProbe{}, err
+	}
+	return enroll.ControlProbe{ExpiresAt: st.ExpiresAt, Known: st.Known}, nil
+}
+
 func hsClient(cfg *enroll.Config) (*headscale.Client, error) {
 	k, err := apiKey(cfg)
 	if err != nil {
@@ -145,6 +165,7 @@ func serveCmd(args []string) error {
 	if err != nil {
 		return err
 	}
+	srv.SetControlProber(controlProber{hs})
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		return err
@@ -192,6 +213,7 @@ func inviteCmd(args []string, stdout io.Writer) error {
 	configPath := fs.String("config", "", "JSON config")
 	entry := fs.String("entry", "", "tenant entry name")
 	hint := fs.String("hostname-hint", "", "optional hostname stored in the join code")
+	label := fs.String("label", "", "credential label (default: hostname hint, else cred-<hash prefix>)")
 	enrollURL := fs.String("enroll-url", "", "enrollment service URL stored in the join code")
 	allow := fs.Bool("allow-insecure", false, "allow an http:// enroll URL (labs only)")
 	if err := fs.Parse(args); err != nil {
@@ -200,7 +222,7 @@ func inviteCmd(args []string, stdout io.Writer) error {
 	if *entry == "" || *enrollURL == "" {
 		return errors.New("--entry and --enroll-url are required")
 	}
-	code, err := enroll.Invite(*configPath, *entry, *hint, *enrollURL, *allow)
+	code, err := enroll.Invite(*configPath, *entry, *hint, *enrollURL, *label, *allow)
 	if err != nil {
 		return err
 	}
@@ -212,18 +234,45 @@ func revokeCmd(args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("revoke", flag.ContinueOnError)
 	configPath := fs.String("config", "", "JSON config")
 	entry := fs.String("entry", "", "tenant entry name")
+	label := fs.String("label", "", "credential label to remove")
 	prefix := fs.String("hash-prefix", "", "hex prefix of the token hash to remove")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *entry == "" || *prefix == "" {
-		return errors.New("--entry and --hash-prefix are required")
+	if *entry == "" {
+		return errors.New("--entry is required")
 	}
-	removed, err := enroll.Revoke(*configPath, *entry, *prefix)
+	if (*label == "") == (*prefix == "") {
+		return errors.New("provide exactly one of --label or --hash-prefix")
+	}
+	removed, err := enroll.RemoveCredential(*configPath, *entry, enroll.CredentialMatch{Label: *label, HashPrefix: *prefix})
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(stdout, "revoked %s %s\n", *entry, removed)
+	shown := removed.Label
+	if shown == "" {
+		shown = "-"
+	}
+	// HashPrefix only. The full hash and the token stay out of the terminal.
+	_, err = fmt.Fprintf(stdout, "revoked %s %s %s\n", *entry, shown, enroll.HashPrefix(removed.Hash))
+	return err
+}
+
+func listCredentialsCmd(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("list-credentials", flag.ContinueOnError)
+	configPath := fs.String("config", "", "JSON config")
+	entry := fs.String("entry", "", "tenant entry name")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *entry == "" {
+		return errors.New("--entry is required")
+	}
+	creds, err := enroll.ListCredentials(*configPath, *entry)
+	if err != nil {
+		return err
+	}
+	_, err = io.WriteString(stdout, enroll.FormatCredentialList(creds))
 	return err
 }
 
