@@ -152,7 +152,11 @@ func FormatStatus(st map[string]any) string {
 		}
 	}
 	if s5, ok := st["socks5"].(map[string]any); ok && s5["listen"] != "" {
-		fmt.Fprintf(&b, "%-13s %v (%v)\n", "socks5:", s5["listen"], s5["state"])
+		fmt.Fprintf(&b, "%-13s %v (%v)", "socks5:", s5["listen"], s5["state"])
+		if auth, _ := s5["auth_file"].(string); auth != "" {
+			fmt.Fprintf(&b, " auth=%s", auth)
+		}
+		fmt.Fprintln(&b)
 	}
 	if routes, ok := st["routes"].([]any); ok {
 		for _, item := range routes {
