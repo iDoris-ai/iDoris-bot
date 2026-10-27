@@ -144,8 +144,13 @@ func TestSOCKS5AuthFileModeAndStateDirReuse(t *testing.T) {
 	if err := os.WriteFile(loose, []byte("alice:s3cret\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := StartAccess(&net.Dialer{}, nil, "127.0.0.1:0", AccessOptions{SOCKS5AuthFile: loose}, nil); err == nil {
-		t.Fatal("mode 0644 was accepted")
+	_, looseErr := StartAccess(&net.Dialer{}, nil, "127.0.0.1:0", AccessOptions{SOCKS5AuthFile: loose}, nil)
+	if socksChecksUnixMode {
+		if looseErr == nil {
+			t.Fatal("mode 0644 was accepted")
+		}
+	} else if looseErr != nil {
+		t.Fatalf("windows mode bits are not a 0600 check: %v", looseErr)
 	}
 	tight := filepath.Join(dir, "tight")
 	if err := os.WriteFile(tight, []byte("alice:s3cret\n"), 0o600); err != nil {
@@ -169,7 +174,7 @@ func TestSOCKS5AuthFileModeAndStateDirReuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Mode().Perm() != 0o600 {
+	if socksChecksUnixMode && st.Mode().Perm() != 0o600 {
 		t.Fatalf("mode %o", st.Mode().Perm())
 	}
 	body, err := os.ReadFile(authPath)
