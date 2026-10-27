@@ -19,11 +19,13 @@ type Notice struct {
 
 // Iface is one interface in a snapshot. Addrs are CIDR strings
 // ("192.168.1.20/24") as net.Interface.Addrs returns them.
+// PointToPoint is set from the interface flags when the OS provides them.
 type Iface struct {
-	Name     string
-	Up       bool
-	Loopback bool
-	Addrs    []string
+	Name         string
+	Up           bool
+	Loopback     bool
+	PointToPoint bool
+	Addrs        []string
 }
 
 // DefaultRoute is the IPv4 default route, when the OS has one.
@@ -56,6 +58,10 @@ type Candidate struct {
 	Gateway  string   `json:"gateway,omitempty"`
 	Default  bool     `json:"default"`
 	Warnings []Notice `json:"warnings,omitempty"`
+	// Uncertain is true when the interface was not classified as a LAN or a
+	// tunnel. Whole-subnet mode must not advertise it; the operator passes
+	// device addresses instead.
+	Uncertain bool `json:"uncertain,omitempty"`
 }
 
 // Check is one prerequisite for advertising a LAN.
@@ -105,13 +111,21 @@ func Detect(snap Snapshot) Report {
 	}
 	var candidates []Candidate
 	for _, ifi := range snap.Ifaces {
-		if !ifi.Up || ifi.Loopback || virtualIface(ifi.Name) {
+		if !ifi.Up || ifi.Loopback || excludedIface(ifi) {
 			continue
 		}
+		uncertain := !lanIface(ifi.Name)
 		for _, raw := range ifi.Addrs {
 			c, ok := candidateFrom(ifi.Name, raw, snap.Default)
 			if !ok {
 				continue
+			}
+			if uncertain {
+				c.Uncertain = true
+				c.Warnings = append(c.Warnings, Notice{
+					Code: "uncertain-iface",
+					Text: "Interface " + ifi.Name + " is not a known LAN or tunnel device. Pass device addresses explicitly; whole-subnet will not advertise it.",
+				})
 			}
 			candidates = append(candidates, c)
 		}
@@ -122,10 +136,17 @@ func Detect(snap Snapshot) Report {
 		cp := rec
 		rep.Recommended = &cp
 	} else if len(candidates) > 0 {
-		rep.Warnings = append(rep.Warnings, Notice{
-			Code: "no-default-route",
-			Text: "No default route matches a private LAN address, so there is no recommended interface.",
-		})
+		if uncertainDefault(candidates) {
+			rep.Warnings = append(rep.Warnings, Notice{
+				Code: "uncertain-iface",
+				Text: "The default route is on an interface that was not classified as a LAN. Pass device addresses explicitly.",
+			})
+		} else {
+			rep.Warnings = append(rep.Warnings, Notice{
+				Code: "no-default-route",
+				Text: "No default route matches a private LAN address, so there is no recommended interface.",
+			})
+		}
 	}
 	if !rep.GatewaySupported {
 		rep.Warnings = append(rep.Warnings, Notice{
@@ -143,10 +164,12 @@ func candidateFrom(iface, raw string, def *DefaultRoute) (Candidate, bool) {
 		return Candidate{}, false
 	}
 	addr := p.Addr()
-	if !addr.Is4() || !addr.IsValid() || !isRFC1918(addr) || cgnat.Contains(addr) {
+	network := p.Masked()
+	// The address and the whole prefix both have to sit inside RFC1918.
+	// 10.1.2.3/1 masks to 0.0.0.0/1, which an address-only check would accept.
+	if !AddrInsidePrivateLAN(addr) || !PrefixInsidePrivateLAN(network) {
 		return Candidate{}, false
 	}
-	network := p.Masked()
 	c := Candidate{
 		Name:    iface,
 		Addr:    addr.String(),
@@ -177,13 +200,88 @@ func isRFC1918(addr netip.Addr) bool {
 	return false
 }
 
+// AddrInsidePrivateLAN reports whether a is an IPv4 address inside RFC1918
+// and outside the tailnet CGNAT range and the usual reserved ranges.
+func AddrInsidePrivateLAN(addr netip.Addr) bool {
+	if !addr.Is4() || !addr.IsValid() {
+		return false
+	}
+	if addr.IsUnspecified() || addr.IsLoopback() || addr.IsMulticast() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() {
+		return false
+	}
+	if cgnat.Contains(addr) {
+		return false
+	}
+	return isRFC1918(addr)
+}
+
+// PrefixInsidePrivateLAN reports whether p lies entirely inside one RFC1918
+// block. A prefix wider than that block (10.0.0.0/7, 0.0.0.0/1) is rejected
+// even when its network address is private. The tailnet range 100.64.0.0/10
+// and reserved ranges are outside those blocks.
+func PrefixInsidePrivateLAN(p netip.Prefix) bool {
+	if !p.IsValid() || !p.Addr().Is4() {
+		return false
+	}
+	p = p.Masked()
+	for _, block := range rfc1918 {
+		if p.Bits() < block.Bits() {
+			continue
+		}
+		if block.Contains(p.Addr()) {
+			return true
+		}
+	}
+	return false
+}
+
+// excludedIface reports tunnel, virtual, and point-to-point interfaces that
+// must not be offered as an office LAN.
+func excludedIface(ifi Iface) bool {
+	if ifi.PointToPoint || virtualIface(ifi.Name) || tunnelIface(ifi.Name) {
+		return true
+	}
+	return false
+}
+
+func tunnelIface(name string) bool {
+	n := strings.ToLower(name)
+	for _, p := range []string{"tailscale", "utun", "tun", "wg", "ppp", "ipsec"} {
+		if strings.HasPrefix(n, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// lanIface is a name we treat as a physical or bond LAN device. Anything else
+// that was not excluded as a tunnel is uncertain and needs an explicit device.
+func lanIface(name string) bool {
+	n := strings.ToLower(name)
+	for _, p := range []string{"eth", "ens", "enp", "eno", "enx", "em", "wlan", "wifi", "wl", "bond", "ib", "lan", "en"} {
+		if strings.HasPrefix(n, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func uncertainDefault(cs []Candidate) bool {
+	for _, c := range cs {
+		if c.Default && c.Uncertain {
+			return true
+		}
+	}
+	return false
+}
+
 func virtualIface(name string) bool {
 	n := strings.ToLower(name)
 	switch n {
 	case "docker0", "lo", "lo0":
 		return true
 	}
-	for _, p := range []string{"tailscale", "utun", "br-", "veth", "virbr", "vmnet", "cni", "flannel"} {
+	for _, p := range []string{"tailscale", "utun", "tun", "wg", "ppp", "ipsec", "br-", "veth", "virbr", "vmnet", "cni", "flannel"} {
 		if strings.HasPrefix(n, p) {
 			return true
 		}
@@ -216,7 +314,7 @@ func recommend(cs []Candidate) (Candidate, bool) {
 	var best Candidate
 	found := false
 	for _, c := range cs {
-		if !c.Default {
+		if !c.Default || c.Uncertain {
 			continue
 		}
 		if !found || c.Bits > best.Bits {
