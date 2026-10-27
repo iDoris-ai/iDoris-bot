@@ -241,7 +241,7 @@ func runCmd(args []string) error {
 		return err
 	}
 	log := newLogger(cfg.LogLevel)
-	keys, controlURL, ident, binding, err := prepareKeys(cfg, log)
+	keys, controlURL, ident, binding, enrollReachable, err := prepareKeys(cfg, log)
 	if err != nil {
 		return err
 	}
@@ -272,14 +272,19 @@ func runCmd(args []string) error {
 	node, err := openNode(ctx, cfg, controlURL, log, func(d vpnd.ModeDecision) {
 		msg := vpnd.WaitingTailscaledMessage(cfg.Role)
 		log.Warn(msg, "role", cfg.Role)
+		warnings := []string{msg}
+		if !enrollReachable {
+			warnings = append(warnings, vpnd.EnrollUnreachableWarning)
+		}
 		holder.Store(vpnd.FixedSnapshot(vpnd.Snapshot{
-			Phase:      vpnd.PhaseWaitingTailscaled,
-			Role:       cfg.Role,
-			Mode:       d.Mode,
-			ModeReason: d.Reason,
-			ControlURL: controlURL,
-			LastError:  msg,
-			Warnings:   []string{msg},
+			Phase:           vpnd.PhaseWaitingTailscaled,
+			Role:            cfg.Role,
+			Mode:            d.Mode,
+			ModeReason:      d.Reason,
+			ControlURL:      controlURL,
+			LastError:       msg,
+			Warnings:        warnings,
+			EnrollReachable: enrollReachable,
 		}))
 	})
 	if err != nil {
@@ -315,6 +320,7 @@ func runCmd(args []string) error {
 		Role:               cfg.Role,
 		Identity:           ident,
 		State:              binding,
+		EnrollUnreachable:  !enrollReachable,
 		Interval:           cfg.IntervalDuration(),
 	}, log)
 	if err != nil {
@@ -342,34 +348,40 @@ func runCmd(args []string) error {
 	}
 }
 
-func prepareKeys(cfg *vpnd.Config, log *slog.Logger) (vpnd.KeySource, string, vpnd.Identity, *vpnd.StateFile, error) {
+func prepareKeys(cfg *vpnd.Config, log *slog.Logger) (vpnd.KeySource, string, vpnd.Identity, *vpnd.StateFile, bool, error) {
 	controlURL := cfg.ControlURL
 	var ident vpnd.Identity
+	binding, err := openBinding(cfg)
+	if err != nil {
+		return nil, "", ident, nil, false, err
+	}
 	if cfg.EnrollURL == "" {
-		binding, err := openBinding(cfg)
-		if err != nil {
-			return nil, "", ident, nil, err
-		}
-		if controlURL != "" && binding != nil {
+		if controlURL != "" {
 			if err := binding.RememberControl(controlURL); err != nil {
-				return nil, "", ident, nil, err
+				return nil, "", ident, nil, false, err
 			}
 		}
-		return vpnd.StaticKey(cfg.AuthKey), controlURL, ident, binding, nil
+		return vpnd.StaticKey(cfg.AuthKey), controlURL, ident, binding, true, nil
 	}
 	ec := &enroll.Client{URL: cfg.EnrollURL, Token: cfg.EnrollToken, AllowInsecure: cfg.EnrollAllowInsecure}
 	// Discover does not mint a key. It is the source of truth for tenant and role.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	d, err := ec.Discover(ctx)
+	d, derr := ec.Discover(ctx)
 	cancel()
-	if err != nil {
-		return nil, "", ident, nil, fmt.Errorf("discover control url via enrollment service: %w", err)
+	saved := binding.Get().ControlURL
+	if derr != nil {
+		url, degraded, rerr := vpnd.ResolveStartupControl(cfg.ControlURL, "", saved, false)
+		if rerr != nil {
+			return nil, "", ident, nil, false, fmt.Errorf("%w (discovery: %v)", rerr, derr)
+		}
+		cfg.Role = vpnd.RoleWhileEnrollDown(cfg.Role, binding.Get().Role)
+		log.Warn("enrollment discovery failed; resuming the saved control URL", "err", derr, "control_url", url, "role", cfg.Role)
+		// The URL was not confirmed this start, so the binding is left as it was.
+		return &enrollKeys{c: ec, cfg: cfg, log: log}, url, ident, binding, !degraded, nil
 	}
-	if controlURL != "" && !vpnd.SameControlURL(controlURL, d.ControlURL) {
-		return nil, "", ident, nil, fmt.Errorf("enrollment service points at %s but config pins %s; refusing", d.ControlURL, controlURL)
-	}
-	if controlURL == "" {
-		controlURL = d.ControlURL
+	url, _, rerr := vpnd.ResolveStartupControl(cfg.ControlURL, d.ControlURL, saved, true)
+	if rerr != nil {
+		return nil, "", ident, nil, false, rerr
 	}
 	role := strings.TrimSpace(d.Role)
 	if role == "" {
@@ -384,15 +396,11 @@ func prepareKeys(cfg *vpnd.Config, log *slog.Logger) (vpnd.KeySource, string, vp
 		TokenFingerprint: vpnd.TokenFingerprint(cfg.EnrollToken),
 		Known:            true,
 	}
-	log.Info("control url discovered", "tenant", d.Tenant, "role", role, "control_url", controlURL)
-	binding, err := openBinding(cfg)
-	if err != nil {
-		return nil, "", ident, nil, err
+	log.Info("control url discovered", "tenant", d.Tenant, "role", role, "control_url", url)
+	if err := binding.RememberControl(url); err != nil {
+		return nil, "", ident, nil, false, err
 	}
-	if err := binding.RememberControl(controlURL); err != nil {
-		return nil, "", ident, nil, err
-	}
-	return &enrollKeys{c: ec, cfg: cfg, log: log}, controlURL, ident, binding, nil
+	return &enrollKeys{c: ec, cfg: cfg, log: log}, url, ident, binding, true, nil
 }
 
 func openBinding(cfg *vpnd.Config) (*vpnd.StateFile, error) {

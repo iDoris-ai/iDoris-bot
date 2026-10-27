@@ -100,6 +100,10 @@ type Options struct {
 	Identity Identity
 	// State is the binding file. Nil in tests that do not care about identity.
 	State *StateFile
+	// EnrollUnreachable is set when startup discovery failed and the daemon
+	// resumed from a saved or pinned control URL. A later successful AuthKey
+	// clears it. The zero value means enrollment is reachable (or unused).
+	EnrollUnreachable bool
 	// Interval between reconcile passes while healthy. Default 5s.
 	Interval time.Duration
 	// MaxBackoff caps the retry delay after failures. Default 2m.
@@ -134,6 +138,10 @@ type Snapshot struct {
 	// Warnings are operator-facing notices that do not by themselves change
 	// phase. Missing tags uses both a phase and a warning.
 	Warnings []string `json:"warnings,omitempty"`
+	// EnrollReachable is false while the enrollment service could not be
+	// contacted at startup and the daemon is using a saved control URL.
+	// A static auth key (no enrollment URL) stays true.
+	EnrollReachable bool `json:"enroll_reachable"`
 }
 
 // Reconciler converges tailscaled onto the configured control server.
@@ -205,8 +213,11 @@ func New(be Backend, keys KeySource, opt Options, log *slog.Logger) (*Reconciler
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Reconciler{be: be, keys: keys, opt: opt, log: log, now: time.Now,
-		snap: Snapshot{Phase: PhaseUnknown, ControlURL: opt.ControlURL}}, nil
+	snap := Snapshot{Phase: PhaseUnknown, ControlURL: opt.ControlURL, EnrollReachable: !opt.EnrollUnreachable}
+	if opt.EnrollUnreachable {
+		snap.Warnings = []string{EnrollUnreachableWarning}
+	}
+	return &Reconciler{be: be, keys: keys, opt: opt, log: log, now: time.Now, snap: snap}, nil
 }
 
 // Snapshot returns the latest observed state.
@@ -221,6 +232,10 @@ func (r *Reconciler) set(mutate func(s *Snapshot)) Snapshot {
 	defer r.mu.Unlock()
 	r.snap.Warnings = nil
 	mutate(&r.snap)
+	if r.opt.EnrollUnreachable {
+		r.snap.Warnings = appendWarning(r.snap.Warnings, EnrollUnreachableWarning)
+	}
+	r.snap.EnrollReachable = !r.opt.EnrollUnreachable
 	r.snap.ControlURL = r.opt.ControlURL
 	r.snap.Role = r.opt.Role
 	r.snap.Attempts = r.attempts
@@ -441,6 +456,9 @@ func (r *Reconciler) login(ctx context.Context, reason string, base *ipn.Prefs) 
 	if err != nil {
 		return r.fail(fmt.Errorf("obtain auth key: %w", err)), err
 	}
+	// A key was issued, so the enrollment service answered. Drop the startup
+	// degraded flag. Static keys never set it.
+	r.opt.EnrollUnreachable = false
 	prefs := r.managedPrefs(base)
 	if len(r.opt.AdvertiseTags) > 0 {
 		r.log.Info("not sending advertise tags; the pre-auth key's acl tags are applied by Headscale")

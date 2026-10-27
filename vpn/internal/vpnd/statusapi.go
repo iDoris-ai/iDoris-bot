@@ -173,6 +173,9 @@ func FormatStatus(st map[string]any) string {
 	if v, _ := st["role"].(string); v != "" {
 		line("role", v)
 	}
+	if reachable, ok := st["enroll_reachable"].(bool); ok && !reachable {
+		line("enroll", "unreachable")
+	}
 	if warnings, ok := st["warnings"].([]any); ok {
 		for _, w := range warnings {
 			fmt.Fprintf(&b, "%-13s %v\n", "warning:", w)
