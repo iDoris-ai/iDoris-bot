@@ -72,7 +72,10 @@ func loadOrCreateSOCKSAuth(path string, create bool) (user, pass string, created
 	if st.Mode()&os.ModeSymlink != 0 {
 		return "", "", false, fmt.Errorf("vpnd: socks5 auth file %q: refusing a symlink", path)
 	}
-	if st.Mode().Perm() != 0o600 {
+	// Windows reports ordinary files as 0666, so a 0600 comparison rejects the
+	// credential this process generated on the previous start. That OS uses
+	// the file's ACL instead of the Unix mode bits.
+	if socksRejectsLooseMode(st.Mode()) {
 		return "", "", false, fmt.Errorf("vpnd: socks5 auth file %q must be mode 0600", path)
 	}
 	user, pass, err = readSOCKSAuth(path)
@@ -105,6 +108,14 @@ func writeSOCKSAuth(path string) (string, string, error) {
 		return "", "", err
 	}
 	if err := f.Chmod(0o600); err != nil {
+		return "", "", err
+	}
+	// Close before the Windows ACL edit. On Unix protectGeneratedSecret is a
+	// no-op and the 0600 mode above is the control. Failure removes the file.
+	if err := f.Close(); err != nil {
+		return "", "", err
+	}
+	if err := protectGeneratedSecret(path); err != nil {
 		return "", "", err
 	}
 	ok = true
