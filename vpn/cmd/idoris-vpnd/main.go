@@ -112,11 +112,13 @@ func loadConfig(args []string, fs *flag.FlagSet) (*vpnd.Config, error) {
 	var takeover bool
 	var noTakeover bool
 	var routes string
+	var sshFlag string
 	var forwards forwardList
 	bindCommon(fs, &flagCfg, &configPath)
 	fs.BoolVar(&takeover, "takeover", false, "switch the system Tailscale off a foreign tailnet")
 	fs.BoolVar(&noTakeover, "no-takeover", false, "never switch the system Tailscale off a foreign tailnet")
 	fs.StringVar(&routes, "advertise-routes", "", "comma-separated CIDRs to advertise (system mode only)")
+	fs.StringVar(&sshFlag, "ssh", "", "true or false Tailscale SSH; omit to leave RunSSH unmanaged")
 	fs.Var(&forwards, "forward", "loopback forward listen=target (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -165,6 +167,13 @@ func loadConfig(args []string, fs *flag.FlagSet) (*vpnd.Config, error) {
 	}
 	if set["advertise-routes"] {
 		cfg.AdvertiseRoutes = splitCSV(routes)
+	}
+	if set["ssh"] {
+		b, err := vpnd.ParseBool(sshFlag)
+		if err != nil {
+			return nil, fmt.Errorf("--ssh: %w", err)
+		}
+		cfg.SSH = &b
 	}
 	if set["forward"] {
 		cfg.Forwards = []vpnd.Forward(forwards)
@@ -266,6 +275,7 @@ func runCmd(args []string) error {
 		AcceptDNS:          cfg.AcceptDNSValue(),
 		AdvertiseTags:      cfg.AdvertiseTags,
 		AdvertiseRoutes:    routes,
+		RunSSH:             cfg.SSH,
 		Takeover:           cfg.TakeoverValue(),
 		LoginWhileStarting: node.LoginWhileStarting,
 		Role:               cfg.Role,
