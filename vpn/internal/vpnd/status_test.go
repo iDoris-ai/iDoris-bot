@@ -2,6 +2,7 @@ package vpnd
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -72,6 +73,44 @@ func TestStatusViewAddsModeAndForwards(t *testing.T) {
 	b, _ := io.ReadAll(health.Body)
 	if health.Code != http.StatusOK || string(b) != "ok\n" {
 		t.Fatalf("health %d %q", health.Code, b)
+	}
+}
+
+func TestFormatStatusPrintsFailedListener(t *testing.T) {
+	access, err := StartAccess(&net.Dialer{}, []Forward{{Listen: "127.0.0.1:0", Target: "peer:9"}}, "127.0.0.1:0", AccessOptions{
+		AllowAnonymous: true,
+		listenHook: func(ln net.Listener) net.Listener {
+			return &scriptedListener{Listener: ln, errs: []error{errors.New("listener exploded")}}
+		},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = access.Close() })
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		fw := access.ForwardStatus()
+		socks := access.SOCKS5Status()
+		if len(fw) == 1 && fw[0].State == "failed" && socks != nil && socks.State == "failed" {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	src := View{Source: stubStatus{snap: Snapshot{Phase: PhaseConnected}}, Mode: ModeEmbedded, Access: access}
+	rr := httptest.NewRecorder()
+	StatusHandler(src, "v-test").ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/v1/status", nil))
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	text := FormatStatus(body)
+	for _, want := range []string{"forward:", "socks5:", "failed", "error=listener exploded"} {
+		if strings.Count(text, want) < 1 {
+			t.Fatalf("text missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Count(text, "error=listener exploded") != 2 {
+		t.Fatalf("want both listener errors:\n%s", text)
 	}
 }
 
