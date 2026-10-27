@@ -319,8 +319,8 @@ func TestHardAAwaitTailscaled(t *testing.T) {
 		"--control-url", "https://headscale.example",
 		"--tailscale-socket", "/tmp/missing.sock",
 		"--listen", "tcp:127.0.0.1:7845",
-		"--state-dir", "/tmp/hardA-embedded",
-		"--state-file", "/tmp/hardA-state.json",
+		"--state-dir", "/var/lib/idoris/hardA-embedded",
+		"--state-file", "/var/lib/idoris/hardA-state.json",
 		"--interval", "2s",
 		"--log-level", "info",
 	)
@@ -533,7 +533,7 @@ func hardAForeignStays(t *testing.T, ctx context.Context, h hardA, our, foreign 
 	selected := hardASelected(profiles)
 	t.Logf("profiles=%d selected=%s foreign id=%s control=%s urls=%v", len(profiles), selected, before.SelfID, before.ControlURL, urls)
 
-	const script = `/opt/idoris-vpnd run --mode system --control-url https://headscale --auth-key hardA-unused-key --listen tcp:127.0.0.1:7845 --state-file /tmp/hardA-a-state.json --tailscale-socket /var/run/tailscale/tailscaled.sock --interval 2s --log-level info`
+	const script = `/opt/idoris-vpnd run --mode system --control-url https://headscale --auth-key hardA-unused-key --listen tcp:127.0.0.1:7845 --state-file /var/lib/idoris/hardA-a-state.json --tailscale-socket /var/run/tailscale/tailscaled.sock --interval 2s --log-level info`
 	h.startDaemon(t, "member", script, "/tmp/vpnd-a.log")
 
 	var got map[string]any
