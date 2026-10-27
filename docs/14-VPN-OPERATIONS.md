@@ -286,7 +286,7 @@ macOS 的 `service install` 写的是 launchd 用户代理。Windows 今天会�
 ```bash
 bash deploy/vpn/ctl.sh apikeys create --expiration 8760h
 # 把打印出来的 hskey-api-... 写进 enroll/headscale.apikey，模式 0600
-docker compose restart enroll
+docker compose kill -s HUP enroll
 bash deploy/vpn/ctl.sh apikeys expire --prefix <旧前缀>
 ```
 
