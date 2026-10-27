@@ -9,4 +9,4 @@ SYSTEM
 HIGHEST
 /F
 /TR
-"C:\Program Files\iDoris\idoris-vpnd.exe" run --config C:\ProgramData\idoris\vpn.json
+cmd /c set STATE_DIRECTORY=C:\ProgramData\idoris&& "C:\Program Files\iDoris\idoris-vpnd.exe" run --config C:\ProgramData\idoris\vpn.json

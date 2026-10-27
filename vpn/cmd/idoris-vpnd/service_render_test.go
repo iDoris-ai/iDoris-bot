@@ -31,7 +31,10 @@ func TestRenderServiceDefinitions(t *testing.T) {
 	}
 	assertGolden(t, "testdata/idoris-vpnd.system.service", unit)
 	assertGolden(t, "testdata/idoris-vpnd.user.service", renderSystemdUserUnit(userExe, cfgPath))
-	assertGolden(t, "testdata/ai.idoris.vpnd.daemon.plist", renderLaunchdPlist(systemExe, cfgPath, "/var/log/idoris"))
+	assertGolden(t, "testdata/ai.idoris.vpnd.daemon.plist", renderSystemLaunchdPlist(systemExe, cfgPath, "/var/log/idoris"))
+	if strings.Contains(renderLaunchdPlist(userExe, cfgPath, "/var/log/idoris"), "STATE_DIRECTORY") {
+		t.Fatal("user LaunchAgent must not set STATE_DIRECTORY")
+	}
 	assertGolden(t, "testdata/idoris-vpnd.task.txt", strings.Join(renderSchtasksCreate(winExe, windowsConfigPath), "\n")+"\n")
 	if systemExe != "/usr/local/lib/idoris/idoris-vpnd" || winExe != `C:\Program Files\iDoris\idoris-vpnd.exe` {
 		t.Fatalf("protected paths linux %s windows %s", systemExe, winExe)
@@ -45,7 +48,7 @@ func TestRenderServiceDefinitions(t *testing.T) {
 		t.Fatalf("quoting:\n%s", quoted)
 	}
 	task := renderSchtasksCreate(`C:\Program Files\idoris-vpnd.exe`, `C:\ProgramData\idoris\vpn.json`)
-	if task[len(task)-1] != `"C:\Program Files\idoris-vpnd.exe" run --config C:\ProgramData\idoris\vpn.json` {
+	if task[len(task)-1] != `cmd /c set STATE_DIRECTORY=C:\ProgramData\idoris&& "C:\Program Files\idoris-vpnd.exe" run --config C:\ProgramData\idoris\vpn.json` {
 		t.Fatalf("task %q", task)
 	}
 	del := renderSchtasksDelete()
