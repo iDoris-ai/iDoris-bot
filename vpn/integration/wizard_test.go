@@ -72,7 +72,7 @@ func wizProjectName() (string, error) {
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", err
 	}
-	return "idoris-vpn-wizard-" + hex.EncodeToString(b[:]), nil
+	return "idoris-vpn-r3w2-wizard-" + hex.EncodeToString(b[:]), nil
 }
 
 type wizEnv struct {
