@@ -288,15 +288,19 @@ func Invite(path, entry, hostnameHint, enrollURL, label string, allowInsecure bo
 	return code, nil
 }
 
-// CredentialMatch selects one credential. Exactly one field must be set.
+// CredentialMatch selects one credential. Exactly one of Label or
+// HashPrefix must be set. AllowEmpty permits removing the last credential
+// so the entry stays in the file and matches no token.
 type CredentialMatch struct {
 	Label      string
 	HashPrefix string
+	AllowEmpty bool
 }
 
 // RemoveCredential deletes one credential from entry and returns it.
-// The plaintext token is not recoverable. Refuses to remove the last
-// credential, because the file must stay loadable.
+// The plaintext token is not recoverable. Without AllowEmpty it refuses
+// to remove the last credential. With AllowEmpty the entry is left with
+// zero credentials and still loads.
 func RemoveCredential(path, entry string, m CredentialMatch) (Credential, error) {
 	byLabel := strings.TrimSpace(m.Label) != ""
 	byPrefix := strings.TrimSpace(m.HashPrefix) != ""
@@ -344,7 +348,7 @@ func RemoveCredential(path, entry string, m CredentialMatch) (Credential, error)
 				return fmt.Errorf("enroll: hash prefix %s matches no token in %q", prefix, entry)
 			}
 		}
-		if len(creds) == 1 {
+		if len(creds) == 1 && !m.AllowEmpty {
 			return errors.New("enroll: refusing to remove the last token hash")
 		}
 		removed = creds[match]
@@ -383,7 +387,8 @@ func ListCredentials(path, entry string) ([]Credential, error) {
 
 // Revoke removes the single token hash in entry that starts with prefix.
 // prefix is hex, at least 4 digits. It is an error to match zero or several
-// hashes, and to remove the last hash of an entry (the file must stay loadable).
+// hashes, and to remove the last hash of an entry unless the caller uses
+// RemoveCredential with AllowEmpty.
 func Revoke(path, entry, prefix string) (string, error) {
 	removed, err := RemoveCredential(path, entry, CredentialMatch{HashPrefix: prefix})
 	if err != nil {
