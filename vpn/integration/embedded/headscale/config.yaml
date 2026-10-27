@@ -1,0 +1,59 @@
+# HTTPS on 443 inside the compose network. tailscaled forces TLS on port 443
+# after a noise dial, so the fixture cannot be plain HTTP.
+# The cert is generated at test time (gitignored) and covers DNS "headscale".
+server_url: https://headscale
+listen_addr: 0.0.0.0:443
+tls_cert_path: /etc/headscale/tls.crt
+tls_key_path: /etc/headscale/tls.key
+metrics_listen_addr: 127.0.0.1:9090
+grpc_listen_addr: 127.0.0.1:50443
+grpc_allow_insecure: false
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+# Embedded DERP+STUN so userspace tsnet and the kernel-TUN peer can exchange
+# traffic. No public IPv4 is set: the DERP map advertises hostname "headscale",
+# which resolves on the compose network. STUN stays inside that network.
+derp:
+  server:
+    enabled: true
+    region_id: 999
+    region_code: headscale
+    region_name: "Headscale Embedded DERP"
+    verify_clients: true
+    stun_listen_addr: "0.0.0.0:3478"
+    private_key_path: /var/lib/headscale/derp_server_private.key
+    automatically_add_embedded_derp_region: true
+  urls: []
+  paths: []
+  auto_update_enabled: false
+  update_frequency: 24h
+disable_check_updates: true
+node:
+  expiry: 0
+  ephemeral:
+    inactivity_timeout: 30m
+database:
+  type: sqlite
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+log:
+  format: text
+  level: info
+policy:
+  mode: file
+  path: /etc/headscale/policy.hujson
+dns:
+  magic_dns: true
+  base_domain: it.idoris.internal
+  override_local_dns: false
+  nameservers:
+    global: []
+  search_domains: []
+unix_socket: /var/run/headscale/headscale.sock
+unix_socket_permission: "0770"
+logtail:
+  enabled: false
