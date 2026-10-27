@@ -210,6 +210,16 @@ type Server struct {
 	authScans int
 	// prober is optional. /readyz answers 503 until SetControlProber is called.
 	prober ControlProber
+
+	// /readyz keeps one cached probe. readyFlight is closed when the probe
+	// that is in progress finishes. Waiters share that result.
+	readyMu      sync.Mutex
+	readyBody    readyBody
+	readyCode    int
+	readyExp     time.Time
+	readyHave    bool
+	readyFlight  chan struct{}
+	readyWaiters int
 }
 
 type bucket struct {
