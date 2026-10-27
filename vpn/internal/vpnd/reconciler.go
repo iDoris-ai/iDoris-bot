@@ -85,13 +85,20 @@ type Options struct {
 	// default is false.
 	Takeover bool
 	// LoginWhileStarting treats a Starting backend that does not yet have a
-	// node identity as needing an auth-key login. tsnet.Server.Start on a
-	// fresh state directory calls StartLoginInteractive with no key and, on
-	// a reachable control server, can sit in Starting. The system client
-	// leaves this false. An embedded node sets it only when its state file
-	// did not exist yet, so a restart that is briefly Starting does not mint
-	// a new key.
+	// node identity as needing an auth-key login immediately. tsnet sits in
+	// Starting after a keyless StartLoginInteractive on a brand-new state
+	// directory. Set only when EmbeddedLoginMode reports loginNow.
 	LoginWhileStarting bool
+	// RecoverUnregistered is the interrupted case: tsnet already wrote
+	// tailscaled.state, but the registration marker was never written. A
+	// Starting backend with no identity waits persistedLoginSettle and then
+	// mints once. HaveNodeKey or a public key suppresses that mint and
+	// writes the marker instead, so an upgrade of an already enrolled
+	// directory does not burn a key.
+	RecoverUnregistered bool
+	// MarkRegistered records that this state directory has reached a node
+	// identity. Nil for system mode and for tests that do not persist it.
+	MarkRegistered func() error
 	// Role is member, local-ai, gateway, or admin. Empty is treated as member
 	// for tag checks. Discovery is the source of truth when it ran.
 	Role string
@@ -170,6 +177,12 @@ type Reconciler struct {
 	// NeedsLogin/NoState. tsnet reports that state briefly while it resumes
 	// the stored key; minting immediately cancels that resume.
 	needsLoginSince time.Time
+	// recoverSince is a separate clock for RecoverUnregistered. It must not
+	// share needsLoginSince, or time spent Starting would shorten the
+	// NeedsLogin settle window.
+	recoverSince time.Time
+	// registered is true after MarkRegistered has succeeded in this process.
+	registered bool
 	// awaitingIdentity is set when the bound tenant or role disagrees with
 	// the configured credential. identityLoginOK becomes true only after
 	// Start and StartLoginInteractive both return, so a failed attempt cannot
@@ -339,6 +352,8 @@ func (r *Reconciler) Step(ctx context.Context) (Snapshot, error) {
 
 	switch state {
 	case ipn.Running.String():
+		r.markRegistered()
+		r.recoverSince = time.Time{}
 		if snap, err, handled := r.settleIdentity(ctx, prefs); handled {
 			return snap, err
 		}
@@ -358,7 +373,12 @@ func (r *Reconciler) Step(ctx context.Context) (Snapshot, error) {
 			}
 		}), nil
 	case ipn.Starting.String():
-		if r.needsLoginWhileStarting(st) {
+		if hasNodeIdentity(st) || persistedIdentity(st, prefs) {
+			r.markRegistered()
+			r.recoverSince = time.Time{}
+			return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil
+		}
+		if r.needsLoginWhileStarting(st, prefs) {
 			return r.login(ctx, "starting-without-node", prefs)
 		}
 		return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil
@@ -374,6 +394,7 @@ func (r *Reconciler) Step(ctx context.Context) (Snapshot, error) {
 			return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil
 		}
 		if persistedIdentity(st, prefs) && !r.persistedLoginDue() {
+			r.markRegistered()
 			return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil
 		}
 		return r.login(ctx, "needs-login", prefs)
@@ -623,16 +644,54 @@ func (r *Reconciler) persistedLoginDue() bool {
 }
 
 // needsLoginWhileStarting reports whether a Starting backend is the keyless
-// login tsnet performs on a fresh node, rather than a login this reconciler
-// already issued or a restart of a node that already has an identity.
-func (r *Reconciler) needsLoginWhileStarting(st *ipnstate.Status) bool {
-	if !r.opt.LoginWhileStarting || r.recentLogin() {
+// login tsnet performs before the node is registered, rather than a login
+// this reconciler already issued or a restart of a node that already has an
+// identity.
+func (r *Reconciler) needsLoginWhileStarting(st *ipnstate.Status, prefs *ipn.Prefs) bool {
+	if r.recentLogin() || hasNodeIdentity(st) || persistedIdentity(st, prefs) {
 		return false
 	}
-	if st != nil && st.Self != nil && !st.Self.PublicKey.IsZero() {
+	if r.opt.LoginWhileStarting {
+		return true
+	}
+	if r.opt.RecoverUnregistered {
+		return r.recoverDue()
+	}
+	return false
+}
+
+// hasNodeIdentity is true when LocalAPI shows a node key or a self public
+// key. Either one means registration finished, even if the registration
+// marker has not been written yet.
+func hasNodeIdentity(st *ipnstate.Status) bool {
+	if st == nil {
 		return false
 	}
-	return true
+	if st.HaveNodeKey {
+		return true
+	}
+	return st.Self != nil && !st.Self.PublicKey.IsZero()
+}
+
+// recoverDue starts a clock the first time an unregistered state file is
+// seen Starting, and reports true once persistedLoginSettle has elapsed.
+func (r *Reconciler) recoverDue() bool {
+	if r.recoverSince.IsZero() {
+		r.recoverSince = r.now()
+		return false
+	}
+	return !r.now().Before(r.recoverSince.Add(persistedLoginSettle))
+}
+
+func (r *Reconciler) markRegistered() {
+	if r.registered || r.opt.MarkRegistered == nil {
+		return
+	}
+	if err := r.opt.MarkRegistered(); err != nil {
+		r.log.Warn("could not record that registration completed", "err", err)
+		return
+	}
+	r.registered = true
 }
 
 // managedPrefs starts from the profile's current prefs and overwrites only
