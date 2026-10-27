@@ -8,7 +8,9 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -32,8 +34,8 @@ type Config struct {
 	AuthKeyFile string `json:"auth_key_file,omitempty"`
 
 	Hostname     string `json:"hostname,omitempty"`
-	AcceptRoutes bool `json:"accept_routes,omitempty"`
-	AcceptDNS    *bool `json:"accept_dns,omitempty"`
+	AcceptRoutes bool   `json:"accept_routes,omitempty"`
+	AcceptDNS    *bool  `json:"accept_dns,omitempty"`
 	// SSH is Tailscale SSH (RunSSH). Nil means the daemon does not touch it.
 	// An ACL that allows tcp/22 does not turn this on.
 	SSH *bool `json:"ssh,omitempty"`
@@ -125,69 +127,117 @@ func LoadConfig(path string) (*Config, error) {
 		if err := dec.Decode(cfg); err != nil {
 			return nil, fmt.Errorf("config %s: %w", path, err)
 		}
-	}
-	env := func(k string, dst *string) {
-		if v, ok := os.LookupEnv("IDORIS_VPN_" + k); ok {
-			*dst = v
+		if cfg.EnrollToken != "" || cfg.AuthKey != "" {
+			if err := CheckSecretFile(path); err != nil {
+				return nil, fmt.Errorf("config %s holds an inline secret: %w", path, err)
+			}
 		}
 	}
-	env("CONTROL_URL", &cfg.ControlURL)
-	env("ENROLL_URL", &cfg.EnrollURL)
-	env("ENROLL_TOKEN", &cfg.EnrollToken)
-	env("ENROLL_TOKEN_FILE", &cfg.EnrollTokenFile)
-	env("AUTH_KEY", &cfg.AuthKey)
-	env("AUTH_KEY_FILE", &cfg.AuthKeyFile)
-	env("HOSTNAME", &cfg.Hostname)
-	env("TAILSCALE_SOCKET", &cfg.TailscaleSocket)
-	env("LISTEN", &cfg.Listen)
-	env("LOG_LEVEL", &cfg.LogLevel)
-	env("MODE", &cfg.Mode)
-	env("ROLE", &cfg.Role)
-	env("STATE_DIR", &cfg.StateDir)
-	env("STATE_FILE", &cfg.StateFile)
-	env("SOCKS5_LISTEN", &cfg.SOCKS5Listen)
-	if v, ok := os.LookupEnv("IDORIS_VPN_ENROLL_ALLOW_INSECURE"); ok {
-		cfg.EnrollAllowInsecure = v == "1" || strings.EqualFold(v, "true")
-	}
-	if v, ok := os.LookupEnv("IDORIS_VPN_TAKEOVER"); ok {
-		b, err := ParseBool(v)
-		if err != nil {
-			return nil, fmt.Errorf("IDORIS_VPN_TAKEOVER: %w", err)
-		}
-		cfg.Takeover = &b
-	}
-	if v, ok := os.LookupEnv("IDORIS_VPN_ACCEPT_ROUTES"); ok {
-		b, err := ParseBool(v)
-		if err != nil {
-			return nil, fmt.Errorf("IDORIS_VPN_ACCEPT_ROUTES: %w", err)
-		}
-		cfg.AcceptRoutes = b
-	}
-	if v, ok := os.LookupEnv("IDORIS_VPN_ACCEPT_DNS"); ok {
-		b, err := ParseBool(v)
-		if err != nil {
-			return nil, fmt.Errorf("IDORIS_VPN_ACCEPT_DNS: %w", err)
-		}
-		cfg.AcceptDNS = &b
-	}
-	if v, ok := os.LookupEnv("IDORIS_VPN_SSH"); ok {
-		b, err := ParseBool(v)
-		if err != nil {
-			return nil, fmt.Errorf("IDORIS_VPN_SSH: %w", err)
-		}
-		cfg.SSH = &b
-	}
-	if v, ok := os.LookupEnv("IDORIS_VPN_ADVERTISE_ROUTES"); ok {
-		cfg.AdvertiseRoutes = splitList(v)
-	}
-	if v, ok := os.LookupEnv("IDORIS_VPN_FORWARDS"); ok {
-		if strings.TrimSpace(v) == "" {
-			cfg.Forwards = nil
-		} else if err := json.Unmarshal([]byte(v), &cfg.Forwards); err != nil {
-			return nil, fmt.Errorf("IDORIS_VPN_FORWARDS: %w", err)
-		}
+	if err := applyEnv(cfg); err != nil {
+		return nil, err
 	}
 	return cfg, nil
+}
+
+// EnvName is IDORIS_VPN_ plus the JSON key in upper snake case.
+func EnvName(jsonKey string) string {
+	return "IDORIS_VPN_" + strings.ToUpper(jsonKey)
+}
+
+// applyEnv sets every Config field from IDORIS_VPN_<JSON KEY>. A variable
+// with that prefix that does not match a field is an error, so a typo is
+// not silently ignored.
+func applyEnv(cfg *Config) error {
+	known := map[string]struct{}{}
+	present := map[string]string{}
+	for _, entry := range os.Environ() {
+		key, val, ok := strings.Cut(entry, "=")
+		if !ok || !strings.HasPrefix(key, "IDORIS_VPN_") {
+			continue
+		}
+		present[key] = val
+	}
+	v := reflect.ValueOf(cfg).Elem()
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		name := jsonFieldName(t.Field(i))
+		if name == "" {
+			continue
+		}
+		envKey := EnvName(name)
+		known[envKey] = struct{}{}
+		raw, ok := present[envKey]
+		if !ok {
+			continue
+		}
+		if err := assignEnv(v.Field(i), raw); err != nil {
+			return fmt.Errorf("%s: %w", envKey, err)
+		}
+	}
+	var unknown []string
+	for key := range present {
+		if _, ok := known[key]; !ok {
+			unknown = append(unknown, key)
+		}
+	}
+	if len(unknown) > 0 {
+		sort.Strings(unknown)
+		return fmt.Errorf("unknown environment variable %s", strings.Join(unknown, ", "))
+	}
+	return nil
+}
+
+func jsonFieldName(f reflect.StructField) string {
+	tag := f.Tag.Get("json")
+	if tag == "" || tag == "-" {
+		return ""
+	}
+	return strings.Split(tag, ",")[0]
+}
+
+func assignEnv(dst reflect.Value, raw string) error {
+	switch dst.Kind() {
+	case reflect.String:
+		dst.SetString(raw)
+		return nil
+	case reflect.Bool:
+		b, err := ParseBool(raw)
+		if err != nil {
+			return err
+		}
+		dst.SetBool(b)
+		return nil
+	case reflect.Pointer:
+		if dst.Type().Elem().Kind() != reflect.Bool {
+			return fmt.Errorf("unsupported type %s", dst.Type())
+		}
+		b, err := ParseBool(raw)
+		if err != nil {
+			return err
+		}
+		dst.Set(reflect.ValueOf(&b))
+		return nil
+	case reflect.Slice:
+		if dst.Type().Elem().Kind() == reflect.String {
+			dst.Set(reflect.ValueOf(splitList(raw)))
+			return nil
+		}
+		if dst.Type() == reflect.TypeOf([]Forward(nil)) {
+			if strings.TrimSpace(raw) == "" {
+				dst.Set(reflect.Zero(dst.Type()))
+				return nil
+			}
+			var fw []Forward
+			if err := json.Unmarshal([]byte(raw), &fw); err != nil {
+				return err
+			}
+			dst.Set(reflect.ValueOf(fw))
+			return nil
+		}
+		return fmt.Errorf("unsupported type %s", dst.Type())
+	default:
+		return fmt.Errorf("unsupported type %s", dst.Type())
+	}
 }
 
 func splitList(s string) []string {
@@ -206,7 +256,10 @@ func splitList(s string) []string {
 }
 
 func readSecretFile(path string) (string, error) {
-	b, err := os.ReadFile(path) //nolint:gosec // secret file path comes from the operator config
+	if err := CheckSecretFile(path); err != nil {
+		return "", err
+	}
+	b, err := os.ReadFile(path) //nolint:gosec // secret file path comes from the operator config and passed CheckSecretFile
 	if err != nil {
 		return "", err
 	}

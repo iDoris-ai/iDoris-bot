@@ -115,12 +115,16 @@ func loadConfig(args []string, fs *flag.FlagSet) (*vpnd.Config, error) {
 	var noTakeover bool
 	var routes string
 	var sshFlag string
+	var dnsFlag string
+	var tags string
 	var forwards forwardList
 	bindCommon(fs, &flagCfg, &configPath)
 	fs.BoolVar(&takeover, "takeover", false, "switch the system Tailscale off a foreign tailnet")
 	fs.BoolVar(&noTakeover, "no-takeover", false, "never switch the system Tailscale off a foreign tailnet")
 	fs.StringVar(&routes, "advertise-routes", "", "comma-separated CIDRs to advertise (system mode only)")
 	fs.StringVar(&sshFlag, "ssh", "", "true or false Tailscale SSH; omit to leave RunSSH unmanaged")
+	fs.StringVar(&dnsFlag, "accept-dns", "", "true or false; omit to accept DNS (the default)")
+	fs.StringVar(&tags, "advertise-tags", "", "comma-separated tags to record; not sent at login (Headscale tags the pre-auth key)")
 	fs.Var(&forwards, "forward", "loopback forward listen=target (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -176,6 +180,16 @@ func loadConfig(args []string, fs *flag.FlagSet) (*vpnd.Config, error) {
 			return nil, fmt.Errorf("--ssh: %w", err)
 		}
 		cfg.SSH = &b
+	}
+	if set["accept-dns"] {
+		b, err := vpnd.ParseBool(dnsFlag)
+		if err != nil {
+			return nil, fmt.Errorf("--accept-dns: %w", err)
+		}
+		cfg.AcceptDNS = &b
+	}
+	if set["advertise-tags"] {
+		cfg.AdvertiseTags = splitCSV(tags)
 	}
 	if set["forward"] {
 		cfg.Forwards = []vpnd.Forward(forwards)
