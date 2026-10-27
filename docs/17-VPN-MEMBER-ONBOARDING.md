@@ -156,7 +156,7 @@ Local AI 主机在 system 模式的 idoris-vpnd 配置里写 `"ssh": true`。策
 docker compose exec headscale headscale auth approve --auth-id <id>
 ```
 
-id 在 SSH 横幅和 `<server_url>/auth/<id>` 上。这次没有对真实主机会话执行这两条。
+id 在 SSH 横幅和 `<server_url>/auth/<id>` 上。这条没有对真实主机会话执行过。
 
 ## 8. 网关主人
 
