@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -629,6 +630,60 @@ func TestEnrollDownMintsOnlyWhenLoginIsRequired(t *testing.T) {
 	if got := st.Get(); got.Role != "local-ai" || got.Tenant != "acme" {
 		t.Fatalf("binding rewritten without a confirmed identity: %+v", got)
 	}
+}
+
+func TestSnapshotCopiesSlices(t *testing.T) {
+	be := &fakeBackend{state: ipn.Running, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true, CorpDNS: true}}
+	r := newR(t, be, &countingKeys{}, func(o *Options) {
+		o.EnrollUnreachable = true
+		o.AdvertiseRoutes = []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")}
+		o.Hostname = "mbp"
+	})
+	if _, err := r.Step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	snap := r.Snapshot()
+	if len(snap.TailnetIPs) == 0 || len(snap.Warnings) == 0 || len(snap.Routes) == 0 {
+		t.Fatalf("expected copied fields: %+v", snap)
+	}
+	snap.TailnetIPs[0] = "mutated"
+	snap.Warnings[0] = "mutated"
+	snap.Routes[0].CIDR = "mutated"
+	again := r.Snapshot()
+	if again.TailnetIPs[0] == "mutated" || again.Warnings[0] == "mutated" || again.Routes[0].CIDR == "mutated" {
+		t.Fatalf("snapshot shares backing arrays: %+v", again)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			if _, err := r.Step(ctx); err != nil {
+				t.Errorf("step: %v", err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			got := r.Snapshot()
+			if len(got.TailnetIPs) > 0 {
+				got.TailnetIPs[0] = "race"
+			}
+			if len(got.Warnings) > 0 {
+				got.Warnings[0] = "race"
+			}
+			if len(got.Routes) > 0 {
+				got.Routes[0].CIDR = "race"
+			}
+			_ = got.Forwards
+		}
+	}()
+	wg.Wait()
 }
 
 func TestUnreachableDaemonAndKeyFailure(t *testing.T) {
