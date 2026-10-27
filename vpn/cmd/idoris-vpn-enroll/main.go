@@ -31,7 +31,7 @@ Usage:
   idoris-vpn-enroll serve  --config FILE [--listen 127.0.0.1:8787]
   idoris-vpn-enroll token  new                        print a new token and its hash
   idoris-vpn-enroll invite --config FILE --entry NAME --enroll-url URL [--label L] [--hostname-hint H] [--allow-insecure]
-  idoris-vpn-enroll revoke --config FILE --entry NAME (--label L | --hash-prefix HEX)
+  idoris-vpn-enroll revoke --config FILE --entry NAME (--label L | --hash-prefix HEX) [--allow-empty]
   idoris-vpn-enroll list-credentials --config FILE --entry NAME
   idoris-vpn-enroll tenant ensure --config FILE --name NAME   create the Headscale user, print its id
   idoris-vpn-enroll check  --config FILE              verify config and Headscale reachability
@@ -45,7 +45,9 @@ list-credentials prints the label, a hash prefix, and created_at. It never
 prints the token or the full hash.
 Expiring or deleting a Headscale node does not revoke enrollment: the daemon
 can ask for another pre-auth key. Revoke the credential first, then expire
-or delete the node.
+or delete the node. revoke refuses to remove the last credential unless
+--allow-empty is set. That leaves the entry with no credentials; it still
+loads, and every token is rejected.
 
 The Headscale API key is read from HEADSCALE_API_KEY or headscale_api_key_file.
 `, version.Version)
@@ -283,6 +285,7 @@ func revokeCmd(args []string, stdout io.Writer) error {
 	entry := fs.String("entry", "", "tenant entry name")
 	label := fs.String("label", "", "credential label to remove")
 	prefix := fs.String("hash-prefix", "", "hex prefix of the token hash to remove")
+	allowEmpty := fs.Bool("allow-empty", false, "remove the last credential and leave the entry with none")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -292,7 +295,7 @@ func revokeCmd(args []string, stdout io.Writer) error {
 	if (*label == "") == (*prefix == "") {
 		return errors.New("provide exactly one of --label or --hash-prefix")
 	}
-	removed, err := enroll.RemoveCredential(*configPath, *entry, enroll.CredentialMatch{Label: *label, HashPrefix: *prefix})
+	removed, err := enroll.RemoveCredential(*configPath, *entry, enroll.CredentialMatch{Label: *label, HashPrefix: *prefix, AllowEmpty: *allowEmpty})
 	if err != nil {
 		return err
 	}
