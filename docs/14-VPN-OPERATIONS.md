@@ -251,7 +251,21 @@ sudo tailscale set --advertise-routes=192.168.1.0/24
 
 `idoris-vpnd service install` 不带 `--system` 时只写**用户**服务：Linux 是 `systemctl --user`，单元在 `~/.config/systemd/user/idoris-vpnd.service`，`WantedBy=default.target`，`NoNewPrivileges=yes`。它不会执行 `loginctl enable-linger`。用户单元在这个用户登录之前不会启动。
 
-网关和 Local AI 这种必须在有人登录前就在线的主机，用 `sudo idoris-vpnd service install --system --config FILE`：Linux 写 systemd 系统单元，macOS 写 LaunchDaemon，Windows 用开机以 SYSTEM 运行的计划任务。细节、权限和卸载见 docs/16 第 12 节。Linux 单元只做过 `systemd-analyze verify` 和 golden 文件对比，没有在真机上以 root 装过。
+网关和 Local AI 这种必须在有人登录前就在线的主机，用 `sudo idoris-vpnd service install --system --config FILE`：Linux 写 systemd 系统单元，macOS 写 LaunchDaemon，Windows 用开机以 SYSTEM 运行的计划任务。细节、权限和卸载见 docs/16 第 12 节。
+
+系统服务进程没有 `$HOME`。Linux 单元的 `StateDirectory=idoris` 让 systemd 导出 `STATE_DIRECTORY=/var/lib/idoris`（多个 `StateDirectory=` 时是冒号分隔列表，守护进程用第一段，必须是绝对路径）。身份文件是 `$STATE_DIRECTORY/vpnd-state.json`，嵌入式节点目录是 `$STATE_DIRECTORY/node`，控制器锁和状态套接字锁都在 `$STATE_DIRECTORY/locks`。单元还有 `Environment=XDG_RUNTIME_DIR=/run/idoris`，所以没写 `listen` 时状态套接字是 `/run/idoris/vpnd.sock`。2026-10-28 在上面那个 systemd 容器里把 `HOME` 去掉、只留 `XDG_RUNTIME_DIR=/run/idoris`，`idoris-vpnd status` 去连的就是 `unix:/run/idoris/vpnd.sock`，不读主目录。两个都没设置时，状态命令仍会落到临时目录；机器服务的单元不会走那条。
+
+macOS 的 LaunchDaemon 在 plist 里写 `EnvironmentVariables`，`STATE_DIRECTORY` 为 `/var/lib/idoris`。安装程序创建 `/var/lib/idoris` 和 plist 要写的 `/var/log/idoris`，模式 `0700`，属主 root。用户级 LaunchAgent 不设 `STATE_DIRECTORY`。没设 `XDG_RUNTIME_DIR` 时，状态套接字落在 `$STATE_DIRECTORY/vpnd.sock`。Windows 上 SYSTEM 的 `os.UserConfigDir()` 在系统配置文件目录里，不该拿来放机器状态。计划任务的启动命令是 `cmd /c set STATE_DIRECTORY=C:\ProgramData\idoris&& ...`，状态、节点目录和锁都在安装程序已经用 icacls 收紧的 `C:\ProgramData\idoris`。这两边只核对了 golden 渲染，以及 `GOOS=windows go build ./...` 和 `GOOS=windows go vet ./...`。没有在 macOS 或 Windows 上把机器服务跑起来。
+
+2026-10-28 在 OrbStack 上用 Debian bookworm 的 systemd 252.39 做 PID 1（`docker run --privileged --cgroupns=host`，挂载 `/sys/fs/cgroup`，`--tmpfs /run` 和 `/run/lock`）。镜像是 `debian:bookworm` 加上 `systemd systemd-sysv procps iproute2 ca-certificates`。先用修复前的 linux/arm64 二进制复现：`/etc/idoris/vpn.json`（0600）内容为 `{"control_url":"https://vpn.example.org","auth_key":"hskey-lab","mode":"system"}`，`/tmp/idoris-vpnd service install --system --config /etc/idoris/vpn.json`，然后 `systemctl daemon-reload` 和 `systemctl start idoris-vpnd`。`systemctl is-active` 停在 `activating`，`NRestarts` 一直增加。journal 原文：
+
+```text
+idoris-vpnd: state file: home directory: $HOME is not defined
+```
+
+然后用修复后的 linux/arm64 二进制再装一次（不是 sleep 桩，也不是刚才那个修复前的二进制）。`systemctl is-system-running` 为 `running`。服务到达 `active` 后空等 30 秒，`NRestarts=0`。进程环境里有 `STATE_DIRECTORY=/var/lib/idoris` 和 `XDG_RUNTIME_DIR=/run/idoris`，没有 `HOME`。容器里没有 tailscaled。守护进程保持运行并重试，不退出。`XDG_RUNTIME_DIR=/run/idoris`、`HOME` 为空时，`idoris-vpnd status --json` 能读到带 `phase` 的状态。`/var/lib/idoris` 模式 0750（单元的 `StateDirectoryMode`），`vpnd-state.json` 0600，内容有 `https://vpn.example.org`，没有 auth key。`/var/lib/idoris/locks` 0700，锁文件 0600。`/run/idoris` 0750，`/run/idoris/vpnd.sock` 0600。`systemctl restart` 之后仍是 `active`，`NRestarts` 仍是 0。再用 root、同一份配置、`STATE_DIRECTORY=/var/lib/idoris`、另一个 `--listen unix:/tmp/r3svc-second.sock` 手工起第二个进程，立刻失败，错误含 `another idoris-vpnd` 和 `system backend`。第一个服务仍是 `active`。容器和镜像随后删除。
+
+这套检查写在 `vpn/integration/r3svc_systemd_test.go`（`//go:build integration`），`make integration` 会跑到它。2026-10-28 在这台机器上 `make integration` 全绿，`go test` 315s，其中 `TestR3svcSystemdMachineService` 34.55s PASS。宿主不能起带 `--privileged` / cgroup 的 systemd 容器时，测试跳过并写明原因，而不是失败。下面那段手工单元配方仍然没有按文档里的原文在 Linux 上安装过。
 
 没法用 `--system` 时，下面两种手工做法仍然可用。
 

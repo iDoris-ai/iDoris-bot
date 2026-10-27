@@ -90,3 +90,38 @@ func TestR2GSystemdPathsProvisioned(t *testing.T) {
 		}
 	}
 }
+
+func TestR3svcLaunchDaemonDirs(t *testing.T) {
+	root := t.TempDir()
+	prev := chownSystemRoot
+	var owned []string
+	chownSystemRoot = func(p string) error {
+		owned = append(owned, p)
+		return nil
+	}
+	t.Cleanup(func() { chownSystemRoot = prev })
+
+	if err := provisionLaunchDaemonDirs(root); err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range []string{"var/lib/idoris", "var/log/idoris"} {
+		dest := filepath.Join(root, rel)
+		st, err := os.Stat(dest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !st.IsDir() || st.Mode().Perm() != 0o700 {
+			t.Fatalf("%s mode %o", rel, st.Mode().Perm())
+		}
+		if !containsPath(owned, dest) {
+			t.Fatalf("chown missing for %s in %v", dest, owned)
+		}
+	}
+	plist := renderSystemLaunchdPlist("/usr/local/lib/idoris/idoris-vpnd", "/etc/idoris/vpn.json", "/var/log/idoris")
+	if !strings.Contains(plist, "<key>STATE_DIRECTORY</key><string>/var/lib/idoris</string>") {
+		t.Fatalf("plist %s", plist)
+	}
+	if !strings.Contains(plist, "<key>StandardOutPath</key><string>/var/log/idoris/vpnd.log</string>") {
+		t.Fatalf("plist log %s", plist)
+	}
+}

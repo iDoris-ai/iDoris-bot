@@ -243,7 +243,7 @@ iOS / Android 同时只允许一个活动 VPN。这次没有在手机上验证�
 
 第一次 `/v1/discover` 成功之后，把可信的 control URL 记到状态文件。发现结果里的 `tenant` 和 `role` 是身份的依据（发现若没给 role，用配置里的 role）。文件里还有令牌指纹：注册令牌 SHA-256 的前 8 字节，十六进制，共 16 个字符。文件里没有令牌、加入码或 auth key。
 
-路径：`state_file`，flag `--state-file`，环境变量 `IDORIS_VPN_STATE_FILE`。缺省时 Windows 用 `%AppData%\idoris\vpnd-state.json`，否则 `$XDG_STATE_HOME/idoris/vpnd-state.json`，再否则 `~/.idoris/vpnd-state.json`。模式 0600。这与嵌入式节点的 `state_dir` 不是同一个文件。
+路径：`state_file`，flag `--state-file`，环境变量 `IDORIS_VPN_STATE_FILE`。这三者先于任何缺省。都空时，若 `STATE_DIRECTORY` 已设置，用 `$STATE_DIRECTORY/vpnd-state.json`。systemd 的 `StateDirectory=idoris` 会把这个变量设成 `/var/lib/idoris`；多个目录时值是冒号分隔的列表，取第一段，而且必须是绝对路径。Windows 路径不按冒号切开，因为盘符里就有冒号。`STATE_DIRECTORY` 设了但不是绝对路径，报错，错误文本里有 `STATE_DIRECTORY`，不会悄悄退回主目录。都没设置时，Windows 用 `%AppData%\idoris\vpnd-state.json`，否则 `$XDG_STATE_HOME/idoris/vpnd-state.json`，再否则 `~/.idoris/vpnd-state.json`。`STATE_DIRECTORY` 和 `HOME` 都没有时，错误同样点名 `STATE_DIRECTORY`，而不是只说 `$HOME is not defined`。模式 0600。这与嵌入式节点的 `state_dir` 不是同一个文件。嵌入式目录的顺序相同：显式 `state_dir` / `--state-dir` / `IDORIS_VPN_STATE_DIR`，然后 `$STATE_DIRECTORY/node`，然后 `~/.idoris/vpn-state`。
 
 已绑定的 tenant 或 role 与这次凭证不一致时（换了租户、换了角色、管理员机器拿到成员令牌、成员 profile 拿到 Local AI 令牌），不把现有 profile 报成 `connected`。日志写下绑定值与期望值（不写下令牌），然后向正确身份重新 enroll。这次登录用的是我们自己的 profile，所以允许切换。同一条 control URL、不同的 tenant 或 role，同样重新 enroll。只有指纹变了、tenant 和 role 没变，不重新 enroll，只更新指纹。
 
@@ -304,9 +304,9 @@ Windows 上 Go 把普通文件的权限报成 0666。SOCKS 凭据的加载不再
 
 改某个后端之前先拿操作系统的排他锁。system：套接字路径的 SHA-256，锁文件放在默认状态文件所在目录；套接字为空时键名是 `default`。embedded：`<state_dir>/controller.lock`。Unix 用 `flock`（`LOCK_EX|LOCK_NB`），进程活着就持有，`Close` 时释放。第二个守护进程立刻失败，错误含有 `another idoris-vpnd`。`local-ai` / `gateway` 在等待 tailscaled 之前就拿 system 锁，所以第二个进程不用等到 tailscaled 起来才失败。`member` 的 `auto` 只锁最终选中的那个后端：选了 embedded 就不会锁系统套接字。Windows 上是尽力创建锁文件，不保证互斥。
 
-2026-10-28 起，system 锁的位置如下。空套接字先换成 `paths.DefaultTailscaledSocket()`，再做 `Clean`；相对路径先 `Abs`；`EvalSymlinks` 解析已经存在的部分，最后一级还不存在就把缺失的尾巴拼回去。Windows 管道（前缀 `\\` 或 `//./pipe/`）不解析符号链接。锁文件是 `os.UserCacheDir()/idoris/locks/<sha256>.lock`。目录经 `fsutil.EnsurePrivateDir`。文件模式 0600。打开时拒绝符号链接：Unix 用 `O_NOFOLLOW`，Windows 用 `FILE_FLAG_OPEN_REPARSE_POINT` 并检查 reparse 属性。显式写出的默认套接字和留空是同一把锁。embedded 仍是规范路径下的 `controller.lock`，符号链接目录和真实目录共用一把。
+2026-10-28 起，system 锁的位置如下。空套接字先换成 `paths.DefaultTailscaledSocket()`，再做 `Clean`；相对路径先 `Abs`；`EvalSymlinks` 解析已经存在的部分，最后一级还不存在就把缺失的尾巴拼回去。Windows 管道（前缀 `\\` 或 `//./pipe/`）不解析符号链接。`STATE_DIRECTORY` 已设置时，锁文件是 `$STATE_DIRECTORY/locks/<sha256>.lock`。否则锁文件在 `os.UserCacheDir()/idoris/locks/<sha256>.lock`。`XDG_STATE_HOME` 不改变锁目录。目录经 `fsutil.EnsurePrivateDir`。文件模式 0600。打开时拒绝符号链接：Unix 用 `O_NOFOLLOW`，Windows 用 `FILE_FLAG_OPEN_REPARSE_POINT` 并检查 reparse 属性。显式写出的默认套接字和留空是同一把锁。embedded 仍是规范路径下的 `controller.lock`，符号链接目录和真实目录共用一把。状态套接字的 flock 在同一个锁目录里，键和控制器锁不同，所以它不是那把控制器锁。
 
-本机用重新执行的测试进程核实了两件：两个进程 `XDG_STATE_HOME` 不同、LocalAPI 套接字相同，第二个失败，错误含 `another idoris-vpnd`；一个进程锁空套接字，另一个用显式的默认套接字路径，同样失败。darwin 上 `UserCacheDir` 是 `$HOME/Library/Caches`。root 系统服务和普通用户的 HOME 不同，缓存目录就不同。套接字路径相同也不会把两把锁放进同一个目录。互斥只在同一个用户之内。这一点对照 Go 的 `os.UserCacheDir` 核对过，没有用 sudo 跑。
+本机用重新执行的测试进程核实了两件：两个进程 `XDG_STATE_HOME` 不同、LocalAPI 套接字相同，第二个失败，错误含 `another idoris-vpnd`；一个进程锁空套接字，另一个用显式的默认套接字路径，同样失败。darwin 上 `UserCacheDir` 是 `$HOME/Library/Caches`。`STATE_DIRECTORY` 没设置时，root 和普通用户的缓存目录不同，套接字路径相同也不会把两把锁放进同一个目录。互斥只在解析到同一个目录的进程之间。机器服务和手工再起的 root 进程要互相挡住，两边都得看到同一个 `STATE_DIRECTORY`（systemd 会设，手工起要自己设）。这一点对照 Go 的 `os.UserCacheDir` 核对过。真机 systemd 上的第二实例见 docs/14 第 11 节。
 
 Windows 用 `LockFileEx`（`LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY`，`golang.org/x/sys/windows`）。第二个持有者失败，错误同样含 `another idoris-vpnd`。这套代码没有在 Windows 上执行。`GOOS=windows go build` 和 `go vet` 通过。
 

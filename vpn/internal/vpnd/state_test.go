@@ -152,6 +152,7 @@ func TestDefaultStateFileHonoursXDG(t *testing.T) {
 		t.Skip("xdg")
 	}
 	dir := t.TempDir()
+	t.Setenv("STATE_DIRECTORY", "")
 	t.Setenv("XDG_STATE_HOME", dir)
 	got, err := DefaultStateFile()
 	if err != nil {
