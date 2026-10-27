@@ -183,9 +183,7 @@ func serveCmd(args []string) error {
 		for range hup {
 			if err := reloadFromDisk(srv, *configPath, log); err != nil {
 				log.Error("config reload rejected; keeping the previous config", "err", err)
-				continue
 			}
-			log.Info("config reloaded")
 		}
 	}()
 	go func() {
@@ -216,7 +214,31 @@ func reloadFromDisk(srv *enroll.Server, path string, log *slog.Logger) error {
 		return err
 	}
 	reloadHeadscaleKey(srv, cfg, log)
+	logConfigReload(log, path, cfg)
 	return nil
+}
+
+// logConfigReload records the file identity and how many credentials the
+// reload actually installed. Size and mtime show whether a bind-mounted
+// single file was the new one. The token values are not logged.
+func logConfigReload(log *slog.Logger, path string, cfg *enroll.Config) {
+	if log == nil || cfg == nil {
+		return
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		log.Info("config reloaded", "err", err)
+		return
+	}
+	n := 0
+	for _, tenant := range cfg.Tenants {
+		n += len(tenant.TokenHashes)
+	}
+	log.Info("config reloaded",
+		"size", st.Size(),
+		"mtime", st.ModTime().UTC().Format(time.RFC3339Nano),
+		"credentials", n,
+	)
 }
 
 func reloadHeadscaleKey(srv *enroll.Server, cfg *enroll.Config, log *slog.Logger) {
