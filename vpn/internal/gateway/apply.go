@@ -431,7 +431,7 @@ func validateConfigBytes(data []byte) error {
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 	path := filepath.Join(dir, "vpn.json")
 	if err := os.WriteFile(path, projected, 0o600); err != nil { //nolint:gosec // G703: path is under MkdirTemp
 		return err

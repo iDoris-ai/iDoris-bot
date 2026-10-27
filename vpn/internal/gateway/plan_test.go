@@ -468,14 +468,15 @@ func TestR3W2MemberAndAdminSOCKS(t *testing.T) {
 		t.Helper()
 		var p Plan
 		var err error
-		if role == join.RoleLocalAI {
+		switch role {
+		case join.RoleLocalAI:
 			p, err = BuildPlan(Request{ThisMachineIsLocalAI: true, Tenant: "acme", Hostname: "ai-box"})
-		} else if role == join.RoleGateway {
+		case join.RoleGateway:
 			p, err = BuildPlan(Request{
 				DeviceIPs: []string{"10.251.73.10"}, Detection: officeReport(),
 				Approved: []string{"10.251.73.10/32"}, Tenant: "acme", Hostname: "office-gw",
 			})
-		} else {
+		default:
 			p, err = SimplePlan(role, "acme", "laptop")
 		}
 		if err != nil {
