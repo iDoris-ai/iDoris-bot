@@ -21,6 +21,10 @@ const (
 	defaultTenantRate         = 30
 	// authLogInterval is the minimum gap between failed-auth warnings.
 	authLogInterval = 10 * time.Second
+	// maxSourceBuckets is the most per-source pre-auth buckets kept in memory.
+	maxSourceBuckets = 4096
+	// sourceBucketIdle is how long an unused per-source bucket stays.
+	sourceBucketIdle = 10 * time.Minute
 )
 
 func tenantRate(t Tenant) float64 {
@@ -49,21 +53,114 @@ func parseTrusted(in []string) ([]netip.Prefix, error) {
 	return out, nil
 }
 
-// admit spends one global token and one per-IP token. It runs before the
-// bearer token is hashed. A closed bucket writes 429 and returns ok=false.
+// admit spends one global token and one per-source token, or neither.
+// A source that has used its own allowance must not burn the shared budget.
+// It runs before the bearer token is hashed. A closed bucket writes 429 and
+// returns ok=false. The per-source map drops idle entries and stays at
+// maxSourceBuckets.
 func (s *Server) admit(w http.ResponseWriter, r *http.Request) (string, bool) {
 	remote := s.clientIP(r)
-	if !s.allowKeyed("pre:global", s.rate(func(c Config) int { return c.GlobalRatePerMinute }, defaultGlobalRatePerMinute)) {
+	key := "pre:ip:" + sourceKey(remote)
+	globalRate := s.rate(func(c Config) int { return c.GlobalRatePerMinute }, defaultGlobalRatePerMinute)
+	sourceRate := s.rate(func(c Config) int { return c.PerIPRatePerMinute }, defaultPerIPRatePerMinute)
+	s.mu.Lock()
+	now := s.now()
+	s.evictIdleSources(now)
+	global := s.refillBucket("pre:global", globalRate, now)
+	if global.tokens < 1 {
+		s.mu.Unlock()
 		s.sampleWarn("rate limited", "scope", "global", "path", r.URL.Path, "remote", remote)
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limited"})
 		return remote, false
 	}
-	if !s.allowKeyed("pre:ip:"+remote, s.rate(func(c Config) int { return c.PerIPRatePerMinute }, defaultPerIPRatePerMinute)) {
+	source := s.sourceBucket(key, sourceRate, now)
+	if source.tokens < 1 {
+		s.mu.Unlock()
 		s.sampleWarn("rate limited", "scope", "ip", "path", r.URL.Path, "remote", remote)
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limited"})
 		return remote, false
 	}
+	global.tokens--
+	source.tokens--
+	s.mu.Unlock()
 	return remote, true
+}
+
+// sourceKey aggregates IPv6 clients to /64. IPv4 stays one address. Unparsed
+// values are kept whole so two different garbage strings do not share a bucket.
+func sourceKey(remote string) string {
+	ip, err := netip.ParseAddr(remote)
+	if err != nil {
+		return remote
+	}
+	ip = ip.Unmap()
+	if !ip.Is6() {
+		return ip.String()
+	}
+	p, err := ip.Prefix(64)
+	if err != nil {
+		return ip.String()
+	}
+	return p.String()
+}
+
+// refillBucket updates a token bucket and creates it full when missing.
+// Caller holds s.mu.
+func (s *Server) refillBucket(key string, rate float64, now time.Time) *bucket {
+	if rate <= 0 {
+		rate = defaultTenantRate
+	}
+	b := s.buckets[key]
+	if b == nil {
+		b = &bucket{tokens: rate, last: now}
+		s.buckets[key] = b
+		return b
+	}
+	elapsed := now.Sub(b.last).Minutes() * rate
+	b.tokens += elapsed
+	if b.tokens > rate {
+		b.tokens = rate
+	}
+	b.last = now
+	return b
+}
+
+// sourceBucket returns the per-source bucket, creating it when absent.
+// A new key evicts the least recently used source first so the map cannot
+// grow past maxSourceBuckets. Caller holds s.mu. Idle entries are already gone.
+func (s *Server) sourceBucket(key string, rate float64, now time.Time) *bucket {
+	if b := s.buckets[key]; b != nil {
+		return s.refillBucket(key, rate, now)
+	}
+	s.evictOldestSource()
+	return s.refillBucket(key, rate, now)
+}
+
+func (s *Server) evictIdleSources(now time.Time) {
+	for key, b := range s.buckets {
+		if strings.HasPrefix(key, "pre:ip:") && now.Sub(b.last) >= sourceBucketIdle {
+			delete(s.buckets, key)
+		}
+	}
+}
+
+func (s *Server) evictOldestSource() {
+	n := 0
+	oldestKey := ""
+	var oldest time.Time
+	for key, b := range s.buckets {
+		if !strings.HasPrefix(key, "pre:ip:") {
+			continue
+		}
+		n++
+		if oldestKey == "" || b.last.Before(oldest) {
+			oldestKey = key
+			oldest = b.last
+		}
+	}
+	if n >= maxSourceBuckets && oldestKey != "" {
+		delete(s.buckets, oldestKey)
+	}
 }
 
 func (s *Server) rate(pick func(Config) int, fallback int) float64 {
@@ -82,18 +179,7 @@ func (s *Server) allowKeyed(key string, rate float64) bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := s.now()
-	b := s.buckets[key]
-	if b == nil {
-		b = &bucket{tokens: rate, last: now}
-		s.buckets[key] = b
-	}
-	elapsed := now.Sub(b.last).Minutes() * rate
-	b.tokens += elapsed
-	if b.tokens > rate {
-		b.tokens = rate
-	}
-	b.last = now
+	b := s.refillBucket(key, rate, s.now())
 	if b.tokens < 1 {
 		return false
 	}
