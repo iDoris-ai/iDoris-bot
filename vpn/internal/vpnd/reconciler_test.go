@@ -350,6 +350,60 @@ func TestForeignTailnetBlockedWithoutTakeover(t *testing.T) {
 	}
 }
 
+func TestForeignStatesBlockedBeforeProfileMutation(t *testing.T) {
+	foreign := "https://controlplane.tailscale.com"
+	cases := []struct {
+		name    string
+		state   ipn.State
+		control string
+		blocked bool
+	}{
+		{name: "running", state: ipn.Running, control: foreign, blocked: true},
+		{name: "starting", state: ipn.Starting, control: foreign, blocked: true},
+		{name: "stopped", state: ipn.Stopped, control: foreign, blocked: true},
+		{name: "needs login with foreign url", state: ipn.NeedsLogin, control: foreign, blocked: true},
+		{name: "running empty url", state: ipn.Running, control: "", blocked: true},
+		{name: "needs login empty url may use saved profile", state: ipn.NeedsLogin, control: "", blocked: false},
+		{name: "no state empty url", state: ipn.NoState, control: "", blocked: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			be := &fakeBackend{
+				state: tc.state,
+				prefs: ipn.Prefs{ControlURL: tc.control, WantRunning: true, RunSSH: true},
+				current: ipn.LoginProfile{ID: "p-foreign", ControlURL: tc.control},
+				profiles: []ipn.LoginProfile{
+					{ID: "p-foreign", ControlURL: tc.control},
+					{ID: "p-idoris", ControlURL: ours + "/"},
+				},
+			}
+			keys := &countingKeys{}
+			r := newR(t, be, keys, func(o *Options) { o.Takeover = false })
+			snap, err := r.Step(context.Background())
+			if tc.blocked {
+				if err != nil || snap.Phase != PhaseBlocked || keys.n != 0 {
+					t.Fatalf("blocked: %+v err=%v keys=%d", snap, err, keys.n)
+				}
+				for _, c := range be.calls {
+					if c == "ProfileStatus" || strings.HasPrefix(c, "Switch") || c == "Start" || c == "CheckPrefs" || c == "StartLoginInteractive" {
+						t.Fatalf("mutated or inspected profiles before the takeover refusal: %v", be.calls)
+					}
+				}
+				if be.prefs.ControlURL != tc.control || !be.prefs.RunSSH || be.current.ID != "p-foreign" {
+					t.Fatalf("foreign profile changed: prefs=%+v current=%+v", be.prefs, be.current)
+				}
+				return
+			}
+			if err != nil || snap.Phase == PhaseBlocked || keys.n != 0 {
+				t.Fatalf("fresh profile should switch to the saved iDoris profile without a key: %+v err=%v keys=%d calls=%v", snap, err, keys.n, be.calls)
+			}
+			if be.current.ID != "p-idoris" {
+				t.Fatalf("current profile %q calls %v", be.current.ID, be.calls)
+			}
+		})
+	}
+}
+
 func TestExistingProfileIsSwitchedNotReenrolled(t *testing.T) {
 	be := &fakeBackend{
 		state:   ipn.Running,
