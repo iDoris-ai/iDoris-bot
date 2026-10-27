@@ -363,7 +363,7 @@ func TestLocalAIPlanHasNoRoute(t *testing.T) {
 	base := srv.url()
 	cap, _ := r3w1Bootstrap(t, srv, client)
 	code, err := join.Encode(join.Payload{
-		V: 1, EnrollURL: "https://enroll.example.org", Token: uiToken, Role: join.RoleMember, Tenant: "acme",
+		V: 1, EnrollURL: "https://enroll.example.org", Token: uiToken, Role: join.RoleLocalAI, Tenant: "acme",
 	}, join.Options{})
 	if err != nil {
 		t.Fatal(err)

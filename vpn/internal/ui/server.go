@@ -710,6 +710,12 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// The join code is bound to one role. Refuse before Discover, and leave
+	// the plan cleared: this request was a re-plan that cannot be built.
+	if err := gateway.ValidateRoleChoice(held.Role, body.ThisMachineIsLocalAI); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	discoverWarning := s.discoverInto(r.Context(), held)
 	var plan gateway.Plan
 	var err error
@@ -718,7 +724,6 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 			ThisMachineIsLocalAI: true, Tenant: held.Tenant, Hostname: held.Hostname,
 		})
 	} else {
-		// "No" means this machine is the gateway, whatever role the code carried.
 		if rep == nil {
 			writeErr(w, http.StatusBadRequest, "detect the network first")
 			return
