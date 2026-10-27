@@ -10,8 +10,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
+
+// EmbeddedNoPathWarning is added to the status warnings when an embedded
+// member has neither a loopback forward nor a SOCKS5 listener. Other
+// applications on the machine then have no path into the tailnet.
+const EmbeddedNoPathWarning = "embedded mode does not install tailnet routes for other applications on this machine; add forwards or socks5_listen, or switch to system mode"
 
 // StatusSource is anything that can report a Snapshot (the Reconciler).
 type StatusSource interface {
@@ -41,8 +47,79 @@ func (v View) Snapshot() Snapshot {
 		snap.Forwards = v.Access.ForwardStatus()
 		snap.SOCKS5 = v.Access.SOCKS5Status()
 	}
+	if embeddedMemberWithoutPath(snap) {
+		snap.Warnings = appendWarning(snap.Warnings, EmbeddedNoPathWarning)
+	}
 	return snap
 }
+
+func embeddedMemberWithoutPath(snap Snapshot) bool {
+	if snap.Mode != ModeEmbedded {
+		return false
+	}
+	role := strings.ToLower(strings.TrimSpace(snap.Role))
+	if role != "" && role != "member" {
+		return false
+	}
+	if len(snap.Forwards) > 0 {
+		return false
+	}
+	if snap.SOCKS5 != nil && strings.TrimSpace(snap.SOCKS5.Listen) != "" {
+		return false
+	}
+	return true
+}
+
+func appendWarning(in []string, extra string) []string {
+	for _, w := range in {
+		if w == extra {
+			out := make([]string, len(in))
+			copy(out, in)
+			return out
+		}
+	}
+	out := make([]string, 0, len(in)+1)
+	out = append(out, in...)
+	return append(out, extra)
+}
+
+// StatusSwap lets the status server publish a snapshot before the reconciler
+// exists (waiting for tailscaled) and then switch to the live view.
+type StatusSwap struct {
+	mu  sync.RWMutex
+	src StatusSource
+}
+
+// Store replaces the source. Snapshot copies through whatever is current.
+func (s *StatusSwap) Store(src StatusSource) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.src = src
+	s.mu.Unlock()
+}
+
+// Snapshot implements StatusSource.
+func (s *StatusSwap) Snapshot() Snapshot {
+	if s == nil {
+		return Snapshot{Phase: PhaseUnknown}
+	}
+	s.mu.RLock()
+	src := s.src
+	s.mu.RUnlock()
+	if src == nil {
+		return Snapshot{Phase: PhaseUnknown}
+	}
+	return src.Snapshot()
+}
+
+type staticSnapshot struct{ snap Snapshot }
+
+func (s staticSnapshot) Snapshot() Snapshot { return s.snap }
+
+// FixedSnapshot is a StatusSource that always returns s.
+func FixedSnapshot(s Snapshot) StatusSource { return staticSnapshot{snap: s} }
 
 // FormatStatus renders /v1/status for `idoris-vpnd status`.
 func FormatStatus(st map[string]any) string {
@@ -92,6 +169,17 @@ func FormatStatus(st map[string]any) string {
 	}
 	if v, _ := st["admin_hint"].(string); v != "" {
 		line("admin_hint", v)
+	}
+	if v, _ := st["role"].(string); v != "" {
+		line("role", v)
+	}
+	if reachable, ok := st["enroll_reachable"].(bool); ok && !reachable {
+		line("enroll", "unreachable")
+	}
+	if warnings, ok := st["warnings"].([]any); ok {
+		for _, w := range warnings {
+			fmt.Fprintf(&b, "%-13s %v\n", "warning:", w)
+		}
 	}
 	if v, _ := st["last_error"].(string); v != "" {
 		line("last_error", v)

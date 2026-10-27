@@ -42,7 +42,9 @@ Usage:
 
 Config keys may also be given as IDORIS_VPN_* environment variables.
 --mode auto (default) leaves a foreign system Tailscale alone and uses an
-in-process node. --takeover switches that system Tailscale; the default is not to.
+in-process node. local-ai and gateway never use that fallback: they wait until
+the official tailscaled is reachable. --takeover switches the system Tailscale;
+the default is not to.
 
 join accepts one code. A gateway code asks whether this machine is the Local AI
 host. --yes skips prompts: a gateway then needs --device or --whole-subnet.
@@ -99,7 +101,9 @@ func bindCommon(fs *flag.FlagSet, cfg *vpnd.Config, configPath *string) {
 	fs.StringVar(&cfg.Interval, "interval", "", "healthy reconcile interval (default 5s)")
 	fs.StringVar(&cfg.LogLevel, "log-level", "", "debug|info|warn|error")
 	fs.StringVar(&cfg.Mode, "mode", "", "auto|system|embedded (default auto)")
+	fs.StringVar(&cfg.Role, "role", "", "member|local-ai|gateway|admin (default member; discovery wins when it returns a role)")
 	fs.StringVar(&cfg.StateDir, "state-dir", "", "embedded node state directory (default ~/.idoris/vpn-state)")
+	fs.StringVar(&cfg.StateFile, "state-file", "", "identity binding file (default ~/.idoris/vpnd-state.json)")
 	fs.StringVar(&cfg.SOCKS5Listen, "socks5-listen", "", "loopback SOCKS5 address into the tailnet")
 }
 
@@ -110,11 +114,17 @@ func loadConfig(args []string, fs *flag.FlagSet) (*vpnd.Config, error) {
 	var takeover bool
 	var noTakeover bool
 	var routes string
+	var sshFlag string
+	var dnsFlag string
+	var tags string
 	var forwards forwardList
 	bindCommon(fs, &flagCfg, &configPath)
 	fs.BoolVar(&takeover, "takeover", false, "switch the system Tailscale off a foreign tailnet")
 	fs.BoolVar(&noTakeover, "no-takeover", false, "never switch the system Tailscale off a foreign tailnet")
 	fs.StringVar(&routes, "advertise-routes", "", "comma-separated CIDRs to advertise (system mode only)")
+	fs.StringVar(&sshFlag, "ssh", "", "true or false Tailscale SSH; omit to leave RunSSH unmanaged")
+	fs.StringVar(&dnsFlag, "accept-dns", "", "true or false; omit to accept DNS (the default)")
+	fs.StringVar(&tags, "advertise-tags", "", "comma-separated tags to record; not sent at login (Headscale tags the pre-auth key)")
 	fs.Var(&forwards, "forward", "loopback forward listen=target (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -144,7 +154,9 @@ func loadConfig(args []string, fs *flag.FlagSet) (*vpnd.Config, error) {
 	override("interval", &cfg.Interval, flagCfg.Interval)
 	override("log-level", &cfg.LogLevel, flagCfg.LogLevel)
 	override("mode", &cfg.Mode, flagCfg.Mode)
+	override("role", &cfg.Role, flagCfg.Role)
 	override("state-dir", &cfg.StateDir, flagCfg.StateDir)
+	override("state-file", &cfg.StateFile, flagCfg.StateFile)
 	override("socks5-listen", &cfg.SOCKS5Listen, flagCfg.SOCKS5Listen)
 	if set["enroll-allow-insecure"] {
 		cfg.EnrollAllowInsecure = flagCfg.EnrollAllowInsecure
@@ -161,6 +173,23 @@ func loadConfig(args []string, fs *flag.FlagSet) (*vpnd.Config, error) {
 	}
 	if set["advertise-routes"] {
 		cfg.AdvertiseRoutes = splitCSV(routes)
+	}
+	if set["ssh"] {
+		b, err := vpnd.ParseBool(sshFlag)
+		if err != nil {
+			return nil, fmt.Errorf("--ssh: %w", err)
+		}
+		cfg.SSH = &b
+	}
+	if set["accept-dns"] {
+		b, err := vpnd.ParseBool(dnsFlag)
+		if err != nil {
+			return nil, fmt.Errorf("--accept-dns: %w", err)
+		}
+		cfg.AcceptDNS = &b
+	}
+	if set["advertise-tags"] {
+		cfg.AdvertiseTags = splitCSV(tags)
 	}
 	if set["forward"] {
 		cfg.Forwards = []vpnd.Forward(forwards)
@@ -226,17 +255,57 @@ func runCmd(args []string) error {
 		return err
 	}
 	log := newLogger(cfg.LogLevel)
-	keys, controlURL, err := prepareKeys(cfg, log)
+	keys, controlURL, ident, binding, enrollReachable, err := prepareKeys(cfg, log)
 	if err != nil {
 		return err
 	}
 	cfg.ControlURL = controlURL
+	if ident.Role != "" {
+		role := strings.ToLower(strings.TrimSpace(ident.Role))
+		if !vpnd.ValidRole(role) {
+			return fmt.Errorf("enrollment discovery role %q: want member, local-ai, gateway, or admin", ident.Role)
+		}
+		cfg.Role = role
+	}
+	if err := cfg.RejectEmbeddedRole(); err != nil {
+		return err
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	node, err := openNode(ctx, cfg, controlURL, log)
+	ln, err := vpnd.Listen(cfg.Listen)
 	if err != nil {
+		return err
+	}
+	defer func() { _ = ln.Close() }()
+	holder := &vpnd.StatusSwap{}
+	errc := make(chan error, 2)
+	go func() { errc <- vpnd.ServeStatus(ctx, ln, vpnd.StatusHandler(holder, version.Version)) }()
+
+	node, err := openNode(ctx, cfg, controlURL, log, func(d vpnd.ModeDecision) {
+		msg := vpnd.WaitingTailscaledMessage(cfg.Role)
+		log.Warn(msg, "role", cfg.Role)
+		warnings := []string{msg}
+		if !enrollReachable {
+			warnings = append(warnings, vpnd.EnrollUnreachableWarning)
+		}
+		holder.Store(vpnd.FixedSnapshot(vpnd.Snapshot{
+			Phase:           vpnd.PhaseWaitingTailscaled,
+			Role:            cfg.Role,
+			Mode:            d.Mode,
+			ModeReason:      d.Reason,
+			ControlURL:      controlURL,
+			LastError:       msg,
+			Warnings:        warnings,
+			EnrollReachable: enrollReachable,
+		}))
+	})
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			log.Info("idoris-vpnd stopping")
+			return nil
+		}
 		return err
 	}
 	defer func() { _ = node.Close() }()
@@ -253,15 +322,22 @@ func runCmd(args []string) error {
 		hostname = node.Hostname
 	}
 	rec, err := vpnd.New(node.Backend, keys, vpnd.Options{
-		ControlURL:         controlURL,
-		Hostname:           hostname,
-		AcceptRoutes:       cfg.AcceptRoutes,
-		AcceptDNS:          cfg.AcceptDNSValue(),
-		AdvertiseTags:      cfg.AdvertiseTags,
-		AdvertiseRoutes:    routes,
-		Takeover:           cfg.TakeoverValue(),
-		LoginWhileStarting: node.LoginWhileStarting,
-		Interval:           cfg.IntervalDuration(),
+		ControlURL:          controlURL,
+		Hostname:            hostname,
+		AcceptRoutes:        cfg.AcceptRoutes,
+		AcceptDNS:           cfg.AcceptDNSValue(),
+		AdvertiseTags:       cfg.AdvertiseTags,
+		AdvertiseRoutes:     routes,
+		RunSSH:              cfg.SSH,
+		Takeover:            cfg.TakeoverValue(),
+		LoginWhileStarting:  node.LoginWhileStarting,
+		RecoverUnregistered: node.RecoverUnregistered,
+		MarkRegistered:      node.markRegistered,
+		Role:                cfg.Role,
+		Identity:            ident,
+		State:               binding,
+		EnrollUnreachable:   !enrollReachable,
+		Interval:            cfg.IntervalDuration(),
 	}, log)
 	if err != nil {
 		return err
@@ -273,17 +349,8 @@ func runCmd(args []string) error {
 	}
 	defer func() { _ = access.Close() }()
 
-	ln, err := vpnd.Listen(cfg.Listen)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = ln.Close() }()
-
-	log.Info("idoris-vpnd starting", "version", version.Version, "mode", node.Mode, "mode_reason", node.Reason, "control_url", controlURL, "status_api", cfg.Listen, "os", runtime.GOOS)
-	src := vpnd.View{Source: rec, Mode: node.Mode, ModeReason: node.Reason, Access: access}
-
-	errc := make(chan error, 2)
-	go func() { errc <- vpnd.ServeStatus(ctx, ln, vpnd.StatusHandler(src, version.Version)) }()
+	log.Info("idoris-vpnd starting", "version", version.Version, "mode", node.Mode, "mode_reason", node.Reason, "role", cfg.Role, "control_url", controlURL, "status_api", cfg.Listen, "os", runtime.GOOS)
+	holder.Store(vpnd.View{Source: rec, Mode: node.Mode, ModeReason: node.Reason, Access: access})
 	go func() { errc <- rec.Run(ctx) }()
 	select {
 	case <-ctx.Done():
@@ -297,24 +364,71 @@ func runCmd(args []string) error {
 	}
 }
 
-func prepareKeys(cfg *vpnd.Config, log *slog.Logger) (vpnd.KeySource, string, error) {
+func prepareKeys(cfg *vpnd.Config, log *slog.Logger) (vpnd.KeySource, string, vpnd.Identity, *vpnd.StateFile, bool, error) {
 	controlURL := cfg.ControlURL
+	var ident vpnd.Identity
+	binding, err := openBinding(cfg)
+	if err != nil {
+		return nil, "", ident, nil, false, err
+	}
 	if cfg.EnrollURL == "" {
-		return vpnd.StaticKey(cfg.AuthKey), controlURL, nil
+		if controlURL != "" {
+			if err := binding.RememberControl(controlURL); err != nil {
+				return nil, "", ident, nil, false, err
+			}
+		}
+		return vpnd.StaticKey(cfg.AuthKey), controlURL, ident, binding, true, nil
 	}
 	ec := &enroll.Client{URL: cfg.EnrollURL, Token: cfg.EnrollToken, AllowInsecure: cfg.EnrollAllowInsecure}
-	if controlURL == "" {
-		// Discover does not mint a key, so restarting an enrolled daemon is free.
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		d, err := ec.Discover(ctx)
-		cancel()
-		if err != nil {
-			return nil, "", fmt.Errorf("discover control url via enrollment service: %w", err)
+	// Discover does not mint a key. It is the source of truth for tenant and role.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	d, derr := ec.Discover(ctx)
+	cancel()
+	saved := binding.Get().ControlURL
+	if derr != nil {
+		url, degraded, rerr := vpnd.ResolveStartupControl(cfg.ControlURL, "", saved, false)
+		if rerr != nil {
+			return nil, "", ident, nil, false, fmt.Errorf("%w (discovery: %w)", rerr, derr)
 		}
-		controlURL = d.ControlURL
-		log.Info("control url discovered", "tenant", d.Tenant, "control_url", controlURL)
+		cfg.Role = vpnd.RoleWhileEnrollDown(cfg.Role, binding.Get().Role)
+		log.Warn("enrollment discovery failed; resuming the saved control URL", "err", derr, "control_url", url, "role", cfg.Role)
+		// The URL was not confirmed this start, so the binding is left as it was.
+		return &enrollKeys{c: ec, cfg: cfg, log: log}, url, ident, binding, !degraded, nil
 	}
-	return &enrollKeys{c: ec, cfg: cfg, log: log}, controlURL, nil
+	url, _, rerr := vpnd.ResolveStartupControl(cfg.ControlURL, d.ControlURL, saved, true)
+	if rerr != nil {
+		return nil, "", ident, nil, false, rerr
+	}
+	role := strings.TrimSpace(d.Role)
+	if role == "" {
+		role = strings.TrimSpace(cfg.Role)
+	}
+	if cfg.Role != "" && d.Role != "" && cfg.Role != d.Role {
+		log.Warn("config role differs from enrollment discovery; using discovery", "config_role", cfg.Role, "discovery_role", d.Role)
+	}
+	ident = vpnd.Identity{
+		Tenant:           d.Tenant,
+		Role:             role,
+		TokenFingerprint: vpnd.TokenFingerprint(cfg.EnrollToken),
+		Known:            true,
+	}
+	log.Info("control url discovered", "tenant", d.Tenant, "role", role, "control_url", url)
+	if err := binding.RememberControl(url); err != nil {
+		return nil, "", ident, nil, false, err
+	}
+	return &enrollKeys{c: ec, cfg: cfg, log: log}, url, ident, binding, true, nil
+}
+
+func openBinding(cfg *vpnd.Config) (*vpnd.StateFile, error) {
+	path := cfg.StateFile
+	if path == "" {
+		var err error
+		path, err = vpnd.DefaultStateFile()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return vpnd.OpenState(path)
 }
 
 func statusCmd(args []string) error {
@@ -387,41 +501,81 @@ func (f *forwardList) Set(s string) error {
 // local forwards use. System mode dials with the kernel; embedded mode dials
 // through tsnet so MagicDNS names resolve without a TUN device.
 type runningNode struct {
-	Mode               string
-	Reason             string
-	Backend            vpnd.Backend
-	Dialer             vpnd.Dialer
-	Hostname           string
-	LoginWhileStarting bool
-	close              func() error
+	Mode                string
+	Reason              string
+	Backend             vpnd.Backend
+	Dialer              vpnd.Dialer
+	Hostname            string
+	LoginWhileStarting  bool
+	RecoverUnregistered bool
+	markRegistered      func() error
+	lock                *vpnd.ControllerLock
+	close               func() error
 }
 
 func (n *runningNode) Close() error {
-	if n == nil || n.close == nil {
+	if n == nil {
 		return nil
 	}
-	return n.close()
+	var err error
+	if n.close != nil {
+		err = n.close()
+	}
+	if n.lock != nil {
+		err = errors.Join(err, n.lock.Release())
+	}
+	return err
 }
 
-// openNode decides system vs embedded once, then opens that backend.
-// The probe is read-only and only runs for auto. advertise_routes is rejected
-// again after auto resolves, before an embedded node is started.
-func openNode(ctx context.Context, cfg *vpnd.Config, controlURL string, log *slog.Logger) (*runningNode, error) {
+// openNode decides system vs embedded, then opens that backend.
+// The probe is read-only. auto always probes. local-ai and gateway also
+// probe when mode is system, and retry while tailscaled is down instead of
+// starting an embedded node. advertise_routes is rejected again after auto
+// resolves, before an embedded node is started.
+func openNode(ctx context.Context, cfg *vpnd.Config, controlURL string, log *slog.Logger, onWait func(vpnd.ModeDecision)) (*runningNode, error) {
 	req := cfg.Mode
 	if req == "" {
 		req = vpnd.ModeAuto
 	}
-	var view vpnd.SystemView
-	if req == vpnd.ModeAuto {
-		probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		view = vpnd.ProbeSystem(probeCtx, vpnd.NewLocalBackend(cfg.TailscaleSocket), controlURL)
-		cancel()
+	// local-ai and gateway already know they will drive the system backend.
+	// Take that lock before the retry loop so a second daemon fails while the
+	// first is still waiting for tailscaled. The probe itself only reads.
+	var ctrl *vpnd.ControllerLock
+	keepLock := false
+	defer func() {
+		if !keepLock && ctrl != nil {
+			_ = ctrl.Release()
+		}
+	}()
+	if vpnd.RequiresSystem(cfg.Role) {
+		var lerr error
+		ctrl, lerr = vpnd.LockSystem(cfg.TailscaleSocket)
+		if lerr != nil {
+			return nil, lerr
+		}
 	}
-	d, err := vpnd.DecideMode(req, cfg.TakeoverValue(), view, controlURL)
+	d, err := vpnd.ProbeUntilReady(ctx, req, cfg.Role, cfg.TakeoverValue(), controlURL,
+		func(pctx context.Context) vpnd.SystemView {
+			probeCtx, cancel := context.WithTimeout(pctx, 3*time.Second)
+			defer cancel()
+			return vpnd.ProbeSystem(probeCtx, vpnd.NewLocalBackend(cfg.TailscaleSocket), controlURL)
+		},
+		onWait,
+		func(sctx context.Context, d time.Duration) error {
+			t := time.NewTimer(d)
+			defer t.Stop()
+			select {
+			case <-sctx.Done():
+				return sctx.Err()
+			case <-t.C:
+				return nil
+			}
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
-	log.Info("vpn mode", "mode", d.Mode, "reason", d.Reason)
+	log.Info("vpn mode", "mode", d.Mode, "reason", d.Reason, "role", cfg.Role)
 	if err := cfg.RejectEmbeddedRoutes(d.Mode); err != nil {
 		return nil, err
 	}
@@ -433,6 +587,18 @@ func openNode(ctx context.Context, cfg *vpnd.Config, controlURL string, log *slo
 				return nil, err
 			}
 		}
+		loginNow, recover, merr := vpnd.EmbeddedLoginMode(dir)
+		if merr != nil {
+			return nil, merr
+		}
+		if ctrl != nil {
+			_ = ctrl.Release()
+			ctrl = nil
+		}
+		ctrl, err = vpnd.LockEmbedded(dir)
+		if err != nil {
+			return nil, err
+		}
 		emb, err := vpnd.StartEmbedded(vpnd.EmbeddedOptions{
 			StateDir:      dir,
 			Hostname:      cfg.Hostname,
@@ -442,22 +608,34 @@ func openNode(ctx context.Context, cfg *vpnd.Config, controlURL string, log *slo
 		if err != nil {
 			return nil, err
 		}
+		keepLock = true
 		return &runningNode{
-			Mode:               d.Mode,
-			Reason:             d.Reason,
-			Backend:            emb.Backend(),
-			Dialer:             emb,
-			Hostname:           emb.Hostname(),
-			LoginWhileStarting: emb.Fresh(),
-			close:              emb.Close,
+			Mode:                d.Mode,
+			Reason:              d.Reason,
+			Backend:             emb.Backend(),
+			Dialer:              emb,
+			Hostname:            emb.Hostname(),
+			LoginWhileStarting:  loginNow,
+			RecoverUnregistered: recover,
+			markRegistered:      func() error { return vpnd.MarkRegistrationComplete(dir) },
+			lock:                ctrl,
+			close:               emb.Close,
 		}, nil
 	}
+	if ctrl == nil {
+		ctrl, err = vpnd.LockSystem(cfg.TailscaleSocket)
+		if err != nil {
+			return nil, err
+		}
+	}
+	keepLock = true
 	return &runningNode{
 		Mode:     vpnd.ModeSystem,
 		Reason:   d.Reason,
 		Backend:  vpnd.NewLocalBackend(cfg.TailscaleSocket),
 		Dialer:   &net.Dialer{},
 		Hostname: cfg.Hostname,
+		lock:     ctrl,
 		close:    func() error { return nil },
 	}, nil
 }

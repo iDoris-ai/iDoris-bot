@@ -1,8 +1,10 @@
 package vpnd
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -112,6 +114,135 @@ func TestForwardsRejectNonLoopback(t *testing.T) {
 	c.AdvertiseRoutes = []string{"not-a-cidr"}
 	if err := c.Resolve(); err == nil {
 		t.Fatal("invalid CIDR must fail")
+	}
+}
+
+func TestRoleDefaultsAndRejectsEmbeddedService(t *testing.T) {
+	c := &Config{AuthKey: "k", ControlURL: "https://x"}
+	if err := c.Resolve(); err != nil || c.Role != "member" {
+		t.Fatalf("default role: %v %+v", err, c.Role)
+	}
+	c = &Config{AuthKey: "k", ControlURL: "https://x", Role: "nope"}
+	if err := c.Resolve(); err == nil || !strings.Contains(err.Error(), "role") {
+		t.Fatalf("bad role: %v", err)
+	}
+	for _, role := range []string{"local-ai", "gateway", "Local-AI"} {
+		c = &Config{AuthKey: "k", ControlURL: "https://x", Mode: ModeEmbedded, Role: role}
+		if err := c.Resolve(); err == nil || !strings.Contains(err.Error(), "embedded") {
+			t.Fatalf("role %s: %v", role, err)
+		}
+	}
+	c = &Config{AuthKey: "k", ControlURL: "https://x", Mode: ModeSystem, Role: "local-ai"}
+	if err := c.Resolve(); err != nil || c.Role != "local-ai" {
+		t.Fatalf("system local-ai: %v %s", err, c.Role)
+	}
+	c = &Config{AuthKey: "k", ControlURL: "https://x", Mode: ModeAuto, Role: "gateway"}
+	if err := c.Resolve(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEnvCoversEveryJSONField(t *testing.T) {
+	typ := reflect.TypeOf(Config{})
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		name := jsonFieldName(field)
+		if name == "" {
+			t.Fatalf("%s has no json name, so it has no IDORIS_VPN_ variable", field.Name)
+		}
+		sample, err := envSample(field.Type)
+		if err != nil {
+			t.Fatalf("%s (%s): %v", field.Name, name, err)
+		}
+		t.Setenv(EnvName(name), sample)
+	}
+	cfg, err := LoadConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := reflect.ValueOf(cfg).Elem()
+	for i := 0; i < typ.NumField(); i++ {
+		if got.Field(i).IsZero() {
+			t.Fatalf("%s was not set via %s", typ.Field(i).Name, EnvName(jsonFieldName(typ.Field(i))))
+		}
+	}
+	if cfg.Forwards[0].Listen != "127.0.0.1:1" || len(cfg.AdvertiseRoutes) != 2 || !cfg.EnrollAllowInsecure || !cfg.AcceptRoutes {
+		t.Fatalf("%+v", cfg)
+	}
+}
+
+func envSample(t reflect.Type) (string, error) {
+	switch t {
+	case reflect.TypeOf(""):
+		return "value", nil
+	case reflect.TypeOf(false):
+		return "true", nil
+	case reflect.TypeOf((*bool)(nil)):
+		return "true", nil
+	case reflect.TypeOf([]string(nil)):
+		return "a,b", nil
+	case reflect.TypeOf([]Forward(nil)):
+		return `[{"listen":"127.0.0.1:1","target":"h:2"}]`, nil
+	default:
+		return "", fmt.Errorf("no env sample for %s; assignEnv must learn this kind", t)
+	}
+}
+
+func TestUnknownVPNEnvIsRejected(t *testing.T) {
+	t.Setenv("IDORIS_VPN_NOT_A_REAL_KEY", "1")
+	_, err := LoadConfig("")
+	if err == nil || !strings.Contains(err.Error(), "IDORIS_VPN_NOT_A_REAL_KEY") {
+		t.Fatalf("%v", err)
+	}
+}
+
+func TestInlineSecretAndTokenFileMustBeOwnerOnly(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "vpnd.json")
+	body := []byte(`{"enroll_url":"https://enroll.example","enroll_token":"idv1_inline"}`)
+	if err := os.WriteFile(cfgPath, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(cfgPath); err == nil || !strings.Contains(err.Error(), "chmod 600") {
+		t.Fatalf("inline secret: %v", err)
+	}
+	if err := os.Chmod(cfgPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(cfgPath); err != nil {
+		t.Fatal(err)
+	}
+
+	loose := []byte(`{"enroll_url":"https://enroll.example","enroll_token_file":"` + filepath.Join(dir, "token") + `"}`)
+	loosePath := filepath.Join(dir, "loose.json")
+	if err := os.WriteFile(loosePath, loose, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tok := filepath.Join(dir, "token")
+	if err := os.WriteFile(tok, []byte("idv1_file\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadConfig(loosePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Resolve(); err == nil || !strings.Contains(err.Error(), "chmod 600") {
+		t.Fatalf("token file: %v", err)
+	}
+	if err := os.Chmod(tok, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Resolve(); err != nil || c.EnrollToken != "idv1_file" {
+		t.Fatalf("resolve: %v token=%q", err, c.EnrollToken)
+	}
+
+	key := filepath.Join(dir, "authkey")
+	if err := os.WriteFile(key, []byte("hskey\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	auth := &Config{ControlURL: "https://vpn.example", AuthKeyFile: key}
+	if err := auth.Resolve(); err == nil || !strings.Contains(err.Error(), "chmod 600") {
+		t.Fatalf("auth key file: %v", err)
 	}
 }
 

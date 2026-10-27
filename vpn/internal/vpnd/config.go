@@ -8,7 +8,9 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +36,9 @@ type Config struct {
 	Hostname     string `json:"hostname,omitempty"`
 	AcceptRoutes bool   `json:"accept_routes,omitempty"`
 	AcceptDNS    *bool  `json:"accept_dns,omitempty"`
+	// SSH is Tailscale SSH (RunSSH). Nil means the daemon does not touch it.
+	// An ACL that allows tcp/22 does not turn this on.
+	SSH *bool `json:"ssh,omitempty"`
 	// AdvertiseTags is the tag the operator expects on this node. The daemon
 	// does not send it at login: Headscale v0.29.6 rejects a pre-auth-key
 	// registration that also requests tags. Put the same tag in the
@@ -47,12 +52,16 @@ type Config struct {
 
 	// Mode is auto (default), system, or embedded.
 	Mode string `json:"mode,omitempty"`
-	// Role is the join role this config was written for: member, local-ai,
-	// gateway, or admin. The daemon does not enforce it; the wizard does.
+	// Role is member (default), local-ai, gateway, or admin. local-ai and
+	// gateway cannot use embedded mode. Discovery overwrites this when it
+	// returns a role.
 	Role string `json:"role,omitempty"`
 	// StateDir is the embedded node's private state directory (0700). Empty
 	// uses ~/.idoris/vpn-state.
 	StateDir string `json:"state_dir,omitempty"`
+	// StateFile is the identity binding (control URL, tenant, role, token
+	// fingerprint). Empty uses DefaultStateFile. Never stores the token.
+	StateFile string `json:"state_file,omitempty"`
 	// Forwards are loopback TCP listeners dialed through the tailnet. In
 	// embedded mode that is the only way other processes on the machine can
 	// reach tailnet addresses.
@@ -118,43 +127,117 @@ func LoadConfig(path string) (*Config, error) {
 		if err := dec.Decode(cfg); err != nil {
 			return nil, fmt.Errorf("config %s: %w", path, err)
 		}
-	}
-	env := func(k string, dst *string) {
-		if v, ok := os.LookupEnv("IDORIS_VPN_" + k); ok {
-			*dst = v
+		if cfg.EnrollToken != "" || cfg.AuthKey != "" {
+			if err := CheckSecretFile(path); err != nil {
+				return nil, fmt.Errorf("config %s holds an inline secret: %w", path, err)
+			}
 		}
 	}
-	env("CONTROL_URL", &cfg.ControlURL)
-	env("ENROLL_URL", &cfg.EnrollURL)
-	env("ENROLL_TOKEN", &cfg.EnrollToken)
-	env("ENROLL_TOKEN_FILE", &cfg.EnrollTokenFile)
-	env("AUTH_KEY", &cfg.AuthKey)
-	env("AUTH_KEY_FILE", &cfg.AuthKeyFile)
-	env("HOSTNAME", &cfg.Hostname)
-	env("TAILSCALE_SOCKET", &cfg.TailscaleSocket)
-	env("LISTEN", &cfg.Listen)
-	env("LOG_LEVEL", &cfg.LogLevel)
-	env("MODE", &cfg.Mode)
-	env("STATE_DIR", &cfg.StateDir)
-	env("SOCKS5_LISTEN", &cfg.SOCKS5Listen)
-	if v, ok := os.LookupEnv("IDORIS_VPN_ENROLL_ALLOW_INSECURE"); ok {
-		cfg.EnrollAllowInsecure = v == "1" || strings.EqualFold(v, "true")
-	}
-	if v, ok := os.LookupEnv("IDORIS_VPN_TAKEOVER"); ok {
-		b := v == "1" || strings.EqualFold(v, "true")
-		cfg.Takeover = &b
-	}
-	if v, ok := os.LookupEnv("IDORIS_VPN_ADVERTISE_ROUTES"); ok {
-		cfg.AdvertiseRoutes = splitList(v)
-	}
-	if v, ok := os.LookupEnv("IDORIS_VPN_FORWARDS"); ok {
-		if strings.TrimSpace(v) == "" {
-			cfg.Forwards = nil
-		} else if err := json.Unmarshal([]byte(v), &cfg.Forwards); err != nil {
-			return nil, fmt.Errorf("IDORIS_VPN_FORWARDS: %w", err)
-		}
+	if err := applyEnv(cfg); err != nil {
+		return nil, err
 	}
 	return cfg, nil
+}
+
+// EnvName is IDORIS_VPN_ plus the JSON key in upper snake case.
+func EnvName(jsonKey string) string {
+	return "IDORIS_VPN_" + strings.ToUpper(jsonKey)
+}
+
+// applyEnv sets every Config field from IDORIS_VPN_<JSON KEY>. A variable
+// with that prefix that does not match a field is an error, so a typo is
+// not silently ignored.
+func applyEnv(cfg *Config) error {
+	known := map[string]struct{}{}
+	present := map[string]string{}
+	for _, entry := range os.Environ() {
+		key, val, ok := strings.Cut(entry, "=")
+		if !ok || !strings.HasPrefix(key, "IDORIS_VPN_") {
+			continue
+		}
+		present[key] = val
+	}
+	v := reflect.ValueOf(cfg).Elem()
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		name := jsonFieldName(t.Field(i))
+		if name == "" {
+			continue
+		}
+		envKey := EnvName(name)
+		known[envKey] = struct{}{}
+		raw, ok := present[envKey]
+		if !ok {
+			continue
+		}
+		if err := assignEnv(v.Field(i), raw); err != nil {
+			return fmt.Errorf("%s: %w", envKey, err)
+		}
+	}
+	var unknown []string
+	for key := range present {
+		if _, ok := known[key]; !ok {
+			unknown = append(unknown, key)
+		}
+	}
+	if len(unknown) > 0 {
+		sort.Strings(unknown)
+		return fmt.Errorf("unknown environment variable %s", strings.Join(unknown, ", "))
+	}
+	return nil
+}
+
+func jsonFieldName(f reflect.StructField) string {
+	tag := f.Tag.Get("json")
+	if tag == "" || tag == "-" {
+		return ""
+	}
+	return strings.Split(tag, ",")[0]
+}
+
+func assignEnv(dst reflect.Value, raw string) error {
+	switch dst.Kind() {
+	case reflect.String:
+		dst.SetString(raw)
+		return nil
+	case reflect.Bool:
+		b, err := ParseBool(raw)
+		if err != nil {
+			return err
+		}
+		dst.SetBool(b)
+		return nil
+	case reflect.Pointer:
+		if dst.Type().Elem().Kind() != reflect.Bool {
+			return fmt.Errorf("unsupported type %s", dst.Type())
+		}
+		b, err := ParseBool(raw)
+		if err != nil {
+			return err
+		}
+		dst.Set(reflect.ValueOf(&b))
+		return nil
+	case reflect.Slice:
+		if dst.Type().Elem().Kind() == reflect.String {
+			dst.Set(reflect.ValueOf(splitList(raw)))
+			return nil
+		}
+		if dst.Type() == reflect.TypeOf([]Forward(nil)) {
+			if strings.TrimSpace(raw) == "" {
+				dst.Set(reflect.Zero(dst.Type()))
+				return nil
+			}
+			var fw []Forward
+			if err := json.Unmarshal([]byte(raw), &fw); err != nil {
+				return err
+			}
+			dst.Set(reflect.ValueOf(fw))
+			return nil
+		}
+		return fmt.Errorf("unsupported type %s", dst.Type())
+	default:
+		return fmt.Errorf("unsupported type %s", dst.Type())
+	}
 }
 
 func splitList(s string) []string {
@@ -173,7 +256,10 @@ func splitList(s string) []string {
 }
 
 func readSecretFile(path string) (string, error) {
-	b, err := os.ReadFile(path) //nolint:gosec // secret file path comes from the operator config
+	if err := CheckSecretFile(path); err != nil {
+		return "", err
+	}
+	b, err := os.ReadFile(path) //nolint:gosec // secret file path comes from the operator config and passed CheckSecretFile
 	if err != nil {
 		return "", err
 	}
@@ -225,6 +311,16 @@ func (c *Config) Resolve() error {
 	case ModeAuto, ModeSystem, ModeEmbedded:
 	default:
 		return fmt.Errorf("mode %q: want auto, system, or embedded", c.Mode)
+	}
+	c.Role = strings.ToLower(strings.TrimSpace(c.Role))
+	if c.Role == "" {
+		c.Role = "member"
+	}
+	if !ValidRole(c.Role) {
+		return fmt.Errorf("role %q: want member, local-ai, gateway, or admin", c.Role)
+	}
+	if err := c.RejectEmbeddedRole(); err != nil {
+		return err
 	}
 	if err := c.validateForwards(); err != nil {
 		return err
@@ -283,6 +379,26 @@ func (c *Config) RoutePrefixes() ([]netip.Prefix, error) {
 	return out, nil
 }
 
+// ValidRole reports whether role is one the daemon knows.
+func ValidRole(role string) bool {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "member", "local-ai", "gateway", "admin":
+		return true
+	default:
+		return false
+	}
+}
+
+// RejectEmbeddedRole reports an error when a role that serves inbound traffic
+// is pinned to embedded mode. auto is allowed: startup waits for tailscaled
+// instead of falling back to embedded.
+func (c *Config) RejectEmbeddedRole() error {
+	if c.Mode == ModeEmbedded && RequiresSystem(c.Role) {
+		return fmt.Errorf("role %s cannot use embedded mode: embedded mode is outbound-only and cannot serve inbound traffic; set mode to system or auto and run the official tailscaled", c.Role)
+	}
+	return nil
+}
+
 // RejectEmbeddedRoutes reports an error when mode is embedded and the config
 // asks this node to advertise subnet routes. Embedded mode has no TUN, so it
 // cannot route a LAN. mode "auto" is not rejected here; the daemon checks
@@ -318,6 +434,19 @@ func (c *Config) IntervalDuration() time.Duration {
 
 // AcceptDNSValue defaults to true (MagicDNS is how members find the Local AI host).
 func (c *Config) AcceptDNSValue() bool { return c.AcceptDNS == nil || *c.AcceptDNS }
+
+// ParseBool accepts 1/0, true/false, yes/no. Empty is an error so an unset
+// variable (which is not looked up) stays distinct from an explicit value.
+func ParseBool(s string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes", "y":
+		return true, nil
+	case "0", "false", "no", "n":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid boolean %q", s)
+	}
+}
 
 // TakeoverValue is true only when the operator explicitly enabled takeover.
 // The default is false: never switch a system tailscaled that is logged into

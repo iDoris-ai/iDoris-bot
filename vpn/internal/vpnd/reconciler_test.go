@@ -5,7 +5,10 @@ import (
 	"errors"
 	"log/slog"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,7 +29,12 @@ type fakeBackend struct {
 	current   ipn.LoginProfile
 	statusErr error
 
-	calls []string
+	calls         []string
+	checkPrefsErr error
+	startErr      error
+	loginErr      error
+	// onCheck runs at the start of CheckPrefs, before the error return.
+	onCheck func()
 	// starts records auth keys passed to Start.
 	starts []string
 	// pendingKey is the auth key handed to Start, consumed by StartLoginInteractive.
@@ -69,10 +77,28 @@ func (f *fakeBackend) EditPrefs(_ context.Context, mp *ipn.MaskedPrefs) (*ipn.Pr
 	if mp.AdvertiseRoutesSet {
 		f.prefs.AdvertiseRoutes = append([]netip.Prefix(nil), mp.AdvertiseRoutes...)
 	}
+	if mp.RouteAllSet {
+		f.prefs.RouteAll = mp.RouteAll
+	}
+	if mp.CorpDNSSet {
+		f.prefs.CorpDNS = mp.CorpDNS
+	}
+	if mp.HostnameSet {
+		f.prefs.Hostname = mp.Hostname
+	}
+	if mp.RunSSHSet {
+		f.prefs.RunSSH = mp.RunSSH
+	}
 	p := f.prefs
 	return &p, nil
 }
-func (f *fakeBackend) CheckPrefs(context.Context, *ipn.Prefs) error { f.rec("CheckPrefs"); return nil }
+func (f *fakeBackend) CheckPrefs(context.Context, *ipn.Prefs) error {
+	f.rec("CheckPrefs")
+	if f.onCheck != nil {
+		f.onCheck()
+	}
+	return f.checkPrefsErr
+}
 func (f *fakeBackend) ProfileStatus(context.Context) (ipn.LoginProfile, []ipn.LoginProfile, error) {
 	f.rec("ProfileStatus")
 	return f.current, f.profiles, nil
@@ -98,6 +124,9 @@ func (f *fakeBackend) SwitchToEmptyProfile(context.Context) error {
 }
 func (f *fakeBackend) Start(_ context.Context, o ipn.Options) error {
 	f.rec("Start")
+	if f.startErr != nil {
+		return f.startErr
+	}
 	f.starts = append(f.starts, o.AuthKey)
 	f.prefs = *o.UpdatePrefs
 	f.pendingKey = o.AuthKey
@@ -108,6 +137,9 @@ func (f *fakeBackend) Start(_ context.Context, o ipn.Options) error {
 }
 func (f *fakeBackend) StartLoginInteractive(context.Context) error {
 	f.rec("StartLoginInteractive")
+	if f.loginErr != nil {
+		return f.loginErr
+	}
 	if f.pendingKey != "" {
 		f.state = ipn.Starting
 		f.pendingKey = ""
@@ -290,6 +322,76 @@ func TestLoginGraceResetsOnceRunning(t *testing.T) {
 	}
 }
 
+func TestLocalFailureDoesNotMintTwiceWithinGrace(t *testing.T) {
+	now := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+
+	be := &fakeBackend{state: ipn.NeedsLogin, checkPrefsErr: errors.New("prefs rejected")}
+	keys := &countingKeys{}
+	be.onCheck = func() {
+		if keys.n != 0 {
+			t.Fatalf("CheckPrefs ran after a key was minted: %d", keys.n)
+		}
+	}
+	r := newR(t, be, keys, nil)
+	r.now = func() time.Time { return now }
+	if _, err := r.Step(ctx); err == nil || keys.n != 0 || len(be.starts) != 0 {
+		t.Fatalf("check prefs must fail closed with no key: keys=%d err=%v", keys.n, err)
+	}
+	now = now.Add(5 * time.Second)
+	if _, err := r.Step(ctx); err != nil || keys.n != 0 {
+		t.Fatalf("grace after CheckPrefs must not mint: keys=%d err=%v", keys.n, err)
+	}
+
+	be2 := &fakeBackend{state: ipn.NeedsLogin, startErr: errors.New("local api refused")}
+	keys2 := &countingKeys{}
+	be2.onCheck = func() {
+		if keys2.n != 0 && keys2.n != 1 {
+			t.Fatalf("unexpected mint count at CheckPrefs: %d", keys2.n)
+		}
+	}
+	r2 := newR(t, be2, keys2, nil)
+	r2.now = func() time.Time { return now }
+	if _, err := r2.Step(ctx); err == nil || keys2.n != 1 || len(be2.starts) != 0 {
+		t.Fatalf("start failure still mints once: keys=%d starts=%v err=%v", keys2.n, be2.starts, err)
+	}
+	starts := 0
+	for _, c := range be2.calls {
+		if c == "Start" {
+			starts++
+		}
+	}
+	if starts != 1 {
+		t.Fatalf("calls %v", be2.calls)
+	}
+	now = now.Add(5 * time.Second)
+	if _, err := r2.Step(ctx); err != nil || keys2.n != 1 {
+		t.Fatalf("grace after Start must not mint again: keys=%d err=%v", keys2.n, err)
+	}
+	now = now.Add(20 * time.Second)
+	before := keys2.n
+	be2.onCheck = func() {
+		if keys2.n != before {
+			t.Fatalf("second attempt minted before CheckPrefs: %d", keys2.n)
+		}
+	}
+	if _, err := r2.Step(ctx); err == nil || keys2.n != 2 {
+		t.Fatalf("after grace a new key is allowed: keys=%d err=%v", keys2.n, err)
+	}
+
+	be3 := &fakeBackend{state: ipn.NeedsLogin, loginErr: errors.New("login interactive failed")}
+	keys3 := &countingKeys{}
+	r3 := newR(t, be3, keys3, nil)
+	r3.now = func() time.Time { return now }
+	if _, err := r3.Step(ctx); err == nil || keys3.n != 1 {
+		t.Fatalf("login interactive failure: keys=%d err=%v", keys3.n, err)
+	}
+	now = now.Add(5 * time.Second)
+	if _, err := r3.Step(ctx); err != nil || keys3.n != 1 {
+		t.Fatalf("grace after login interactive must not mint: keys=%d err=%v", keys3.n, err)
+	}
+}
+
 func TestGraceForIsCapped(t *testing.T) {
 	r := newR(t, &fakeBackend{}, StaticKey("k"), nil)
 	for n, want := range map[int]time.Duration{
@@ -350,6 +452,184 @@ func TestForeignTailnetBlockedWithoutTakeover(t *testing.T) {
 	}
 }
 
+func TestServiceRoleForeignBlockDoesNotSuggestEmbedded(t *testing.T) {
+	be := &fakeBackend{
+		state: ipn.Running,
+		prefs: ipn.Prefs{ControlURL: "https://controlplane.tailscale.com", WantRunning: true},
+	}
+	r := newR(t, be, &countingKeys{}, func(o *Options) {
+		o.Takeover = false
+		o.Role = "local-ai"
+	})
+	snap, err := r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseBlocked || snap.Role != "local-ai" {
+		t.Fatalf("%+v err=%v", snap, err)
+	}
+	if strings.Contains(snap.LastError, "Set mode: embedded") {
+		t.Fatalf("must not suggest embedded: %s", snap.LastError)
+	}
+	if !strings.Contains(snap.LastError, "takeover: true") || !strings.Contains(snap.LastError, "local-ai") {
+		t.Fatalf("message: %s", snap.LastError)
+	}
+	for _, c := range be.calls {
+		if c == "ProfileStatus" || strings.HasPrefix(c, "Switch") || c == "Start" {
+			t.Fatalf("mutated profile: %v", be.calls)
+		}
+	}
+}
+
+func TestServiceRoleUnreachableWaits(t *testing.T) {
+	be := &fakeBackend{statusErr: errors.New("dial unix: no such file")}
+	r := newR(t, be, &countingKeys{}, func(o *Options) { o.Role = "gateway" })
+	snap, err := r.Step(context.Background())
+	if err == nil || snap.Phase != PhaseWaitingTailscaled || len(snap.Warnings) == 0 {
+		t.Fatalf("%+v err=%v", snap, err)
+	}
+	if !strings.Contains(snap.LastError, "gateway") || strings.Contains(snap.LastError, "mode: embedded") {
+		t.Fatalf("message: %s", snap.LastError)
+	}
+}
+
+func TestForeignStatesBlockedBeforeProfileMutation(t *testing.T) {
+	foreign := "https://controlplane.tailscale.com"
+	cases := []struct {
+		name    string
+		state   ipn.State
+		control string
+		blocked bool
+	}{
+		{name: "running", state: ipn.Running, control: foreign, blocked: true},
+		{name: "starting", state: ipn.Starting, control: foreign, blocked: true},
+		{name: "stopped", state: ipn.Stopped, control: foreign, blocked: true},
+		{name: "needs login with foreign url", state: ipn.NeedsLogin, control: foreign, blocked: true},
+		{name: "running empty url", state: ipn.Running, control: "", blocked: true},
+		{name: "needs login empty url may use saved profile", state: ipn.NeedsLogin, control: "", blocked: false},
+		{name: "no state empty url", state: ipn.NoState, control: "", blocked: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			be := &fakeBackend{
+				state:   tc.state,
+				prefs:   ipn.Prefs{ControlURL: tc.control, WantRunning: true, RunSSH: true},
+				current: ipn.LoginProfile{ID: "p-foreign", ControlURL: tc.control},
+				profiles: []ipn.LoginProfile{
+					{ID: "p-foreign", ControlURL: tc.control},
+					{ID: "p-idoris", ControlURL: ours + "/"},
+				},
+			}
+			keys := &countingKeys{}
+			r := newR(t, be, keys, func(o *Options) { o.Takeover = false })
+			snap, err := r.Step(context.Background())
+			if tc.blocked {
+				if err != nil || snap.Phase != PhaseBlocked || keys.n != 0 {
+					t.Fatalf("blocked: %+v err=%v keys=%d", snap, err, keys.n)
+				}
+				for _, c := range be.calls {
+					if c == "ProfileStatus" || strings.HasPrefix(c, "Switch") || c == "Start" || c == "CheckPrefs" || c == "StartLoginInteractive" {
+						t.Fatalf("mutated or inspected profiles before the takeover refusal: %v", be.calls)
+					}
+				}
+				if be.prefs.ControlURL != tc.control || !be.prefs.RunSSH || be.current.ID != "p-foreign" {
+					t.Fatalf("foreign profile changed: prefs=%+v current=%+v", be.prefs, be.current)
+				}
+				return
+			}
+			if err != nil || snap.Phase == PhaseBlocked || keys.n != 0 {
+				t.Fatalf("fresh profile should switch to the saved iDoris profile without a key: %+v err=%v keys=%d calls=%v", snap, err, keys.n, be.calls)
+			}
+			if be.current.ID != "p-idoris" {
+				t.Fatalf("current profile %q calls %v", be.current.ID, be.calls)
+			}
+		})
+	}
+}
+
+func TestIdentityMismatchReenrollsOnSameControlURL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vpnd-state.json")
+	st, err := OpenState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetIdentity(ours, "acme", "admin", "old"); err != nil {
+		t.Fatal(err)
+	}
+	be := &fakeBackend{state: ipn.Running, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true, CorpDNS: true}}
+	keys := &countingKeys{}
+	r := newR(t, be, keys, func(o *Options) {
+		o.State = st
+		o.Role = "member"
+		o.Identity = Identity{Tenant: "acme", Role: "member", TokenFingerprint: "new", Known: true}
+	})
+	snap, err := r.Step(context.Background())
+	if err != nil || snap.Phase == PhaseConnected || keys.n != 1 {
+		t.Fatalf("admin binding with a member token must re-enroll: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+	if st.Get().Role != "admin" {
+		t.Fatalf("binding rewritten before login completed: %+v", st.Get())
+	}
+	be.state = ipn.Running
+	be.prefs.ControlURL = ours
+	snap, err = r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseConnected || keys.n != 1 {
+		t.Fatalf("after re-enroll: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+	got := st.Get()
+	if got.Tenant != "acme" || got.Role != "member" || got.TokenFingerprint != "new" {
+		t.Fatalf("binding %+v", got)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "idv1_") {
+		t.Fatalf("token leaked into %s", path)
+	}
+}
+
+func TestSameControlDifferentTenantReenrolls(t *testing.T) {
+	st, err := OpenState(filepath.Join(t.TempDir(), "vpnd-state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetIdentity(ours, "acme", "local-ai", "fp"); err != nil {
+		t.Fatal(err)
+	}
+	be := &fakeBackend{state: ipn.Running, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true, CorpDNS: true}}
+	keys := &countingKeys{}
+	r := newR(t, be, keys, func(o *Options) {
+		o.State = st
+		o.Role = "local-ai"
+		o.Identity = Identity{Tenant: "other", Role: "local-ai", TokenFingerprint: "fp2", Known: true}
+	})
+	if _, err := r.Step(context.Background()); err != nil || keys.n != 1 {
+		t.Fatalf("keys=%d err=%v", keys.n, err)
+	}
+	tags := views.SliceOf([]string{"tag:other-local-ai"})
+	be.state = ipn.Running
+	be.prefs.ControlURL = ours
+	be.self = &ipnstate.PeerStatus{Tags: &tags}
+	snap, err := r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseConnected || st.Get().Tenant != "other" {
+		t.Fatalf("snap %+v binding %+v err=%v", snap, st.Get(), err)
+	}
+}
+
+func TestTaggedRoleWithoutTagsIsNotConnected(t *testing.T) {
+	be := &fakeBackend{state: ipn.Running, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true, CorpDNS: true}}
+	keys := &countingKeys{}
+	r := newR(t, be, keys, func(o *Options) { o.Role = "local-ai" })
+	snap, err := r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseMissingTags || keys.n != 0 || len(snap.Warnings) == 0 {
+		t.Fatalf("untagged local-ai must not look connected: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+	tags := views.SliceOf([]string{"tag:acme-local-ai"})
+	be.self = &ipnstate.PeerStatus{Tags: &tags}
+	snap, err = r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseConnected || keys.n != 0 {
+		t.Fatalf("tagged: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+}
+
 func TestExistingProfileIsSwitchedNotReenrolled(t *testing.T) {
 	be := &fakeBackend{
 		state:   ipn.Running,
@@ -382,6 +662,115 @@ func TestStoppedIsResumed(t *testing.T) {
 	if snap.Phase != PhaseStarting || be.calls[0] != "EditPrefs" || !be.prefs.WantRunning {
 		t.Fatalf("resume: %+v calls=%v", snap, be.calls)
 	}
+}
+
+func TestEnrollDownResumesSavedIdentityWithoutMinting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vpnd-state.json")
+	st, err := OpenState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetIdentity(ours, "acme", "member", "fp"); err != nil {
+		t.Fatal(err)
+	}
+	be := &fakeBackend{state: ipn.Running, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true, CorpDNS: true}}
+	keys := &countingKeys{}
+	r := newR(t, be, keys, func(o *Options) {
+		o.State = st
+		o.Role = "member"
+		o.EnrollUnreachable = true
+		o.Identity = Identity{Known: false}
+	})
+	snap, err := r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseConnected || keys.n != 0 || snap.EnrollReachable {
+		t.Fatalf("resume: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+	if len(snap.Warnings) != 1 || snap.Warnings[0] != EnrollUnreachableWarning {
+		t.Fatalf("warnings %+v", snap.Warnings)
+	}
+	if got := st.Get(); got.Tenant != "acme" || got.Role != "member" || got.TokenFingerprint != "fp" {
+		t.Fatalf("binding changed: %+v", got)
+	}
+}
+
+func TestEnrollDownMintsOnlyWhenLoginIsRequired(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vpnd-state.json")
+	st, err := OpenState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetIdentity(ours, "acme", "local-ai", "fp"); err != nil {
+		t.Fatal(err)
+	}
+	be := &fakeBackend{state: ipn.NeedsLogin, prefs: ipn.Prefs{ControlURL: ours}}
+	keys := &countingKeys{}
+	r := newR(t, be, keys, func(o *Options) {
+		o.State = st
+		o.Role = "local-ai"
+		o.EnrollUnreachable = true
+		o.Identity = Identity{Known: false}
+	})
+	snap, err := r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseStarting || keys.n != 1 || !snap.EnrollReachable {
+		t.Fatalf("login required: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+	if got := st.Get(); got.Role != "local-ai" || got.Tenant != "acme" {
+		t.Fatalf("binding rewritten without a confirmed identity: %+v", got)
+	}
+}
+
+func TestSnapshotCopiesSlices(t *testing.T) {
+	be := &fakeBackend{state: ipn.Running, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true, CorpDNS: true}}
+	r := newR(t, be, &countingKeys{}, func(o *Options) {
+		o.EnrollUnreachable = true
+		o.AdvertiseRoutes = []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")}
+		o.Hostname = "mbp"
+	})
+	if _, err := r.Step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	snap := r.Snapshot()
+	if len(snap.TailnetIPs) == 0 || len(snap.Warnings) == 0 || len(snap.Routes) == 0 {
+		t.Fatalf("expected copied fields: %+v", snap)
+	}
+	snap.TailnetIPs[0] = "mutated"
+	snap.Warnings[0] = "mutated"
+	snap.Routes[0].CIDR = "mutated"
+	again := r.Snapshot()
+	if again.TailnetIPs[0] == "mutated" || again.Warnings[0] == "mutated" || again.Routes[0].CIDR == "mutated" {
+		t.Fatalf("snapshot shares backing arrays: %+v", again)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			if _, err := r.Step(ctx); err != nil {
+				t.Errorf("step: %v", err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			got := r.Snapshot()
+			if len(got.TailnetIPs) > 0 {
+				got.TailnetIPs[0] = "race"
+			}
+			if len(got.Warnings) > 0 {
+				got.Warnings[0] = "race"
+			}
+			if len(got.Routes) > 0 {
+				got.Routes[0].CIDR = "race"
+			}
+			_ = got.Forwards
+		}
+	}()
+	wg.Wait()
 }
 
 func TestUnreachableDaemonAndKeyFailure(t *testing.T) {
@@ -424,6 +813,59 @@ func TestLoginDoesNotSendAdvertiseTags(t *testing.T) {
 	}
 	if !sameRoutes(be.prefs.AdvertiseRoutes, want) {
 		t.Fatalf("routes %+v", be.prefs.AdvertiseRoutes)
+	}
+}
+
+func TestReenrollPreservesUnmanagedSSHAndRoutes(t *testing.T) {
+	manual := []netip.Prefix{netip.MustParsePrefix("192.168.50.0/24")}
+	be := &fakeBackend{
+		state: ipn.NeedsLogin,
+		prefs: ipn.Prefs{
+			ControlURL:      ours,
+			WantRunning:     true,
+			CorpDNS:         true,
+			RunSSH:          true,
+			Hostname:        "manual-host",
+			AdvertiseRoutes: append([]netip.Prefix(nil), manual...),
+		},
+	}
+	keys := &countingKeys{}
+	r := newR(t, be, keys, nil)
+	if _, err := r.Step(context.Background()); err != nil || keys.n != 1 {
+		t.Fatalf("keys=%d err=%v", keys.n, err)
+	}
+	if !be.prefs.RunSSH || be.prefs.Hostname != "manual-host" || !sameRoutes(be.prefs.AdvertiseRoutes, manual) {
+		t.Fatalf("unmanaged prefs lost: %+v", be.prefs)
+	}
+	if len(be.prefs.AdvertiseTags) != 0 || be.prefs.ControlURL != ours || !be.prefs.WantRunning || !be.prefs.CorpDNS {
+		t.Fatalf("managed prefs: %+v", be.prefs)
+	}
+}
+
+func TestManagedDriftAppliesWithoutReenroll(t *testing.T) {
+	ssh := true
+	be := &fakeBackend{state: ipn.Running, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true, CorpDNS: true}}
+	keys := &countingKeys{}
+	r := newR(t, be, keys, func(o *Options) {
+		o.AcceptRoutes = true
+		o.RunSSH = &ssh
+		o.Hostname = "office-gw"
+	})
+	snap, err := r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseConnected || keys.n != 0 {
+		t.Fatalf("drift must not mint: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+	if !be.prefs.RouteAll || !be.prefs.RunSSH || be.prefs.Hostname != "office-gw" {
+		t.Fatalf("managed fields not applied: %+v", be.prefs)
+	}
+	be.calls = nil
+	if _, err := r.Step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range be.calls {
+		if c == "EditPrefs" || c == "Start" {
+			t.Fatalf("second pass mutated: %v", be.calls)
+		}
 	}
 }
 
@@ -524,6 +966,69 @@ func TestPersistedNodeKeyWaitsOutBriefNeedsLogin(t *testing.T) {
 	snap, err = r.Step(context.Background())
 	if err != nil || keys.n != 1 || snap.Phase != PhaseStarting {
 		t.Fatalf("NeedsLogin that outlasts the settle window must mint: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+}
+
+func TestInterruptedRegistrationWaitsThenMintsOnce(t *testing.T) {
+	be := &fakeBackend{state: ipn.Starting, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true}}
+	keys := &countingKeys{}
+	var marked int
+	r := newR(t, be, keys, func(o *Options) {
+		o.RecoverUnregistered = true
+		o.MarkRegistered = func() error {
+			marked++
+			return nil
+		}
+	})
+	now := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	r.now = func() time.Time { return now }
+	ctx := context.Background()
+
+	if _, err := r.Step(ctx); err != nil || keys.n != 0 || marked != 0 {
+		t.Fatalf("first look must only start the clock: keys=%d marked=%d err=%v", keys.n, marked, err)
+	}
+	now = now.Add(persistedLoginSettle - time.Second)
+	if _, err := r.Step(ctx); err != nil || keys.n != 0 {
+		t.Fatalf("inside the recover window: keys=%d err=%v", keys.n, err)
+	}
+	now = now.Add(time.Second)
+	if _, err := r.Step(ctx); err != nil || keys.n != 1 {
+		t.Fatalf("after the window one mint: keys=%d err=%v", keys.n, err)
+	}
+	now = now.Add(5 * time.Second)
+	if _, err := r.Step(ctx); err != nil || keys.n != 1 {
+		t.Fatalf("grace holds the second mint: keys=%d err=%v", keys.n, err)
+	}
+
+	be.state = ipn.Running
+	be.prefs.ControlURL = ours
+	be.prefs.CorpDNS = true
+	if snap, err := r.Step(ctx); err != nil || snap.Phase != PhaseConnected || marked != 1 || keys.n != 1 {
+		t.Fatalf("running writes the marker once: %+v marked=%d keys=%d err=%v", snap, marked, keys.n, err)
+	}
+}
+
+func TestExistingIdentityDoesNotMintJustBecauseMarkerIsMissing(t *testing.T) {
+	be := &fakeBackend{
+		state:       ipn.Starting,
+		haveNodeKey: true,
+		prefs:       ipn.Prefs{ControlURL: ours, WantRunning: true},
+	}
+	keys := &countingKeys{}
+	var marked int
+	r := newR(t, be, keys, func(o *Options) {
+		o.RecoverUnregistered = true
+		o.MarkRegistered = func() error {
+			marked++
+			return nil
+		}
+	})
+	snap, err := r.Step(context.Background())
+	if err != nil || keys.n != 0 || marked != 1 || snap.Phase != PhaseStarting {
+		t.Fatalf("have node key must mark and not mint: %+v keys=%d marked=%d err=%v", snap, keys.n, marked, err)
+	}
+	if _, err := r.Step(context.Background()); err != nil || keys.n != 0 || marked != 1 {
+		t.Fatalf("marker is once: keys=%d marked=%d err=%v", keys.n, marked, err)
 	}
 }
 
