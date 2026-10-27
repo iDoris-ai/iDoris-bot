@@ -1,0 +1,74 @@
+# hardA fixture. Read-only reuse of the embedded Headscale configs. Own PKI
+# directory and compose project so it does not collide with other agents.
+# Host ports are ephemeral (127.0.0.1::443).
+services:
+  headscale:
+    image: headscale/headscale:v0.29.6
+    command: serve
+    volumes:
+      - ../embedded/headscale/config.yaml:/etc/headscale/config.yaml:ro
+      - ../embedded/headscale/policy.hujson:/etc/headscale/policy.hujson:ro
+      - ../.pki-hardA/tls.crt:/etc/headscale/tls.crt:ro
+      - ../.pki-hardA/tls.key:/etc/headscale/tls.key:ro
+    ports:
+      - "127.0.0.1::443"
+    healthcheck:
+      test: ["CMD", "headscale", "health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  headscale-foreign:
+    image: headscale/headscale:v0.29.6
+    command: serve
+    volumes:
+      - ../embedded/foreign/config.yaml:/etc/headscale/config.yaml:ro
+      - ../embedded/foreign/derp.yaml:/etc/headscale/derp.yaml:ro
+      - ../.pki-hardA/tls.crt:/etc/headscale/tls.crt:ro
+      - ../.pki-hardA/tls.key:/etc/headscale/tls.key:ro
+    ports:
+      - "127.0.0.1::443"
+    healthcheck:
+      test: ["CMD", "headscale", "health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  member:
+    image: tailscale/tailscale:v1.104.2
+    depends_on:
+      headscale:
+        condition: service_healthy
+      headscale-foreign:
+        condition: service_healthy
+    entrypoint: ["/usr/local/bin/tailscaled"]
+    command: ["--state=/var/lib/tailscale/tailscaled.state", "--socket=/var/run/tailscale/tailscaled.sock", "--tun=userspace-networking", "--port=41641"]
+    hostname: harda-member
+    environment:
+      SSL_CERT_FILE: /etc/it-pki/ca.pem
+    volumes:
+      - ../../bin/idoris-vpnd-linux:/opt/idoris-vpnd:ro
+      - ../.pki-hardA/ca.pem:/etc/it-pki/ca.pem:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  node:
+    image: tailscale/tailscale:v1.104.2
+    depends_on:
+      headscale:
+        condition: service_healthy
+    entrypoint: ["/usr/local/bin/tailscaled"]
+    command: ["--state=/var/lib/tailscale/tailscaled.state", "--socket=/var/run/tailscale/tailscaled.sock", "--port=41641"]
+    hostname: harda-node
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      SSL_CERT_FILE: /etc/it-pki/ca.pem
+    volumes:
+      - ../../bin/idoris-vpnd-linux:/opt/idoris-vpnd:ro
+      - ../.pki-hardA/ca.pem:/etc/it-pki/ca.pem:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
