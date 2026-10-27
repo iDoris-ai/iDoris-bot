@@ -190,6 +190,8 @@ Error: invalid argument "wiz-gw-wait" for "-i, --identifier" flag: strconv.Parse
 
 容器入口脚本里的 `sysctl -w net.ipv4.ip_forward=1` 在这台 OrbStack 上是 `Read-only file system`。向导仍打印 `ip-forward: enabled`：`/proc` 里已经是 `1` 时，守护进程把这一步当作成功。
 
+2026-10-28 的 `make integration` 全绿（286s）。向导用例是项目 `idoris-vpn-r3w2-wizard-c11edc`，`TestWizardGatewayJoin` 39.8s PASS。加入码经 stdin 写入 `/root/.idoris/join.code`，命令用 `--code-file` 和 `--expect-authority`，参数里没有码。自动批准和等待批准两条旧路径仍通过。结束后在 `wiz-gw` 上用旁路文件又核了三件事：`/root/.idoris/keep.json` 里的 `control_url`、`accept_dns`、`tailscale_socket`、`state_dir`、`takeover`、`forwards` 和未知键 `extra_kept` 在应用后还在；同一 URL 再加入一次字节不变；换成 `http://attacker.invalid:9` 时不带 `--replace` 失败且文件不变，带 `--replace` 后 `control_url` 仍是 `https://headscale`。成员码（令牌未登记，发现失败后按码里的 member 继续）写到 `/root/.idoris/member.json`，有 `socks5_listen` `127.0.0.1:1080`，stdout 有 SOCKS5 地址、凭据路径 `/root/.idoris/vpn-state/socks5.auth` 和 `side-member.idoris.internal`。没有经这个代理去连一台 Local AI。正在跑的 `/root/.idoris/vpn.json` 和它的令牌没有被旁路加入改掉。
+
 ## 9. 本地页面的安全模型
 
 `idoris-vpnd ui` 只听 `127.0.0.1` 的随机端口。stdout 打出带一次性秘密的 URL（`?k=`）。浏览器是否被打开：macOS 用 `open`，Linux 用 `xdg-open`，`--no-open` 则不打开。这些约束由 `httptest` 和真实回环监听测过，没有在图形浏览器里点过。本轮对照 `vpn/internal/ui/server.go` 核对过，下面的约束没有改。
