@@ -2,6 +2,7 @@ package enroll
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -352,6 +353,177 @@ func TestReloadKeepsOldConfigWhenTrustedProxyIsInvalid(t *testing.T) {
 	// The second call was limited as the forwarded client, not the proxy.
 	// A different client behind the same proxy still has to pass the global
 	// bucket, which is empty, so the prefix check above is the assertion.
+}
+
+func TestR2GNoisySourceDoesNotStarve(t *testing.T) {
+	s, tok := limitedServer(t, 3, 1)
+	h := s.Handler()
+	call := func(remote string) int {
+		req := httptest.NewRequest(http.MethodGet, "/v1/discover", nil)
+		req.RemoteAddr = remote
+		req.Header.Set("Authorization", "Bearer "+tok)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		return rr.Code
+	}
+	if call("198.51.100.1:1") != http.StatusOK {
+		t.Fatal("first request from the noisy source")
+	}
+	firstReject := call("198.51.100.1:1")
+	secondReject := call("198.51.100.1:1")
+	if firstReject != http.StatusTooManyRequests || secondReject != http.StatusTooManyRequests {
+		t.Fatal("noisy source should be rejected by its own bucket")
+	}
+	if call("198.51.100.2:1") != http.StatusOK {
+		t.Fatal("a second source was starved by the noisy source")
+	}
+	if call("198.51.100.3:1") != http.StatusOK {
+		t.Fatal("global capacity was consumed by rejected requests")
+	}
+	if call("198.51.100.4:1") != http.StatusTooManyRequests {
+		t.Fatal("global bucket should be empty after three admissions")
+	}
+	before := sourceBucketCount(s)
+	if call("198.51.100.5:1") != http.StatusTooManyRequests {
+		t.Fatal("new source should be rejected once the global bucket is empty")
+	}
+	if got := sourceBucketCount(s); got != before {
+		t.Fatalf("global rejection created a source bucket: before %d after %d", before, got)
+	}
+}
+
+func TestR2GSourceBucketsBounded(t *testing.T) {
+	s, tok := limitedServer(t, 100000, 1)
+	base := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	now := base
+	s.now = func() time.Time { return now }
+	call := func(remote string) int {
+		req := httptest.NewRequest(http.MethodGet, "/v1/discover", nil)
+		req.RemoteAddr = remote
+		req.Header.Set("Authorization", "Bearer "+tok)
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		return rr.Code
+	}
+	if call("[2001:db8:1:2::1]:9") != http.StatusOK {
+		t.Fatal("first address in the /64")
+	}
+	if call("[2001:db8:1:2::abcd]:9") != http.StatusTooManyRequests {
+		t.Fatal("second address in the same /64 got its own bucket")
+	}
+	if call("[2001:db8:1:3::1]:9") != http.StatusOK {
+		t.Fatal("a different /64 was aggregated with the first")
+	}
+	if sourceBucketCount(s) != 2 {
+		t.Fatalf("ipv6 buckets %d", sourceBucketCount(s))
+	}
+
+	if call("198.51.100.9:9") != http.StatusOK {
+		t.Fatal("idle source was not admitted")
+	}
+	idleKey := "pre:ip:" + sourceKey("198.51.100.9")
+	now = now.Add(sourceBucketIdle - time.Nanosecond)
+	if call("198.51.100.10:9") != http.StatusOK {
+		t.Fatal("neighbour before idle expiry")
+	}
+	if _, ok := lockedBucket(s, idleKey); !ok {
+		t.Fatal("source expired before it was idle")
+	}
+	now = now.Add(time.Nanosecond)
+	if call("198.51.100.11:9") != http.StatusOK {
+		t.Fatal("request that should expire the idle source")
+	}
+	if _, ok := lockedBucket(s, idleKey); ok {
+		t.Fatal("idle source bucket was kept")
+	}
+	if _, ok := lockedBucket(s, "pre:global"); !ok {
+		t.Fatal("idle sweep removed the global bucket")
+	}
+	if _, ok := lockedBucket(s, "discover:acme"); !ok {
+		t.Fatal("idle sweep removed the tenant bucket")
+	}
+
+	s2, tok2 := limitedServer(t, 100000, 1)
+	now2 := base
+	s2.now = func() time.Time { return now2 }
+	call2 := func(remote string) int {
+		req := httptest.NewRequest(http.MethodGet, "/v1/discover", nil)
+		req.RemoteAddr = remote
+		req.Header.Set("Authorization", "Bearer "+tok2)
+		rr := httptest.NewRecorder()
+		s2.Handler().ServeHTTP(rr, req)
+		return rr.Code
+	}
+	for i := 0; i < maxSourceBuckets; i++ {
+		remote := fmt.Sprintf("198.18.%d.%d:9", i/256, i%256)
+		if call2(remote) != http.StatusOK {
+			t.Fatalf("source %d status", i)
+		}
+	}
+	if got := sourceBucketCount(s2); got != maxSourceBuckets {
+		t.Fatalf("filled buckets %d", got)
+	}
+	now2 = now2.Add(time.Second)
+	if call2("198.18.0.0:9") != http.StatusTooManyRequests {
+		t.Fatal("oldest source should still be over its own limit")
+	}
+	if call2("198.19.0.1:9") != http.StatusOK {
+		t.Fatal("new source past the cap was rejected")
+	}
+	if got := sourceBucketCount(s2); got != maxSourceBuckets {
+		t.Fatalf("buckets after cap %d", got)
+	}
+	if _, ok := lockedBucket(s2, "pre:ip:"+sourceKey("198.18.0.0")); !ok {
+		t.Fatal("recently used source was evicted ahead of an older one")
+	}
+	if _, ok := lockedBucket(s2, "discover:acme"); !ok {
+		t.Fatal("cap eviction removed the tenant bucket")
+	}
+}
+
+func limitedServer(t *testing.T, global, perIP int) (*Server, string) {
+	t.Helper()
+	tok, err := NewToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{
+		ControlURL:          "https://vpn.example.org",
+		GlobalRatePerMinute: global,
+		PerIPRatePerMinute:  perIP,
+		Tenants: []Tenant{{
+			Name:            "acme",
+			HeadscaleUserID: "1",
+			TokenHashes:     []string{HashToken(tok)},
+			RatePerMinute:   100000,
+		}},
+	}
+	s, err := NewServer(cfg, &fakeMinter{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozen := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return frozen }
+	return s, tok
+}
+
+func sourceBucketCount(s *Server) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for key := range s.buckets {
+		if strings.HasPrefix(key, "pre:ip:") {
+			n++
+		}
+	}
+	return n
+}
+
+func lockedBucket(s *Server, key string) (*bucket, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok := s.buckets[key]
+	return b, ok
 }
 
 func TestConfigRejectsBadLimitFields(t *testing.T) {
