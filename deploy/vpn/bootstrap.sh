@@ -89,21 +89,10 @@ EOF
 
 die() { echo "bootstrap: $*" >&2; exit 1; }
 
-# Root's umask 077 files are not readable by uid 65532 until this chown.
+# Root's umask 077 files are not readable by the enroll uid until this chown.
 # Headplane runs as root in its image and can still read the cookie secret.
 chown_enroll_tree() {
-  [[ "$(id -u)" == 0 ]] || return 0
-  local f
-  if [[ -d enroll && ! -L enroll ]]; then
-    chown 65532:65532 enroll
-    chmod 700 enroll
-  fi
-  for f in enroll/config.json enroll/headscale.apikey enroll/minted-tokens.txt; do
-    if [[ -f "$f" && ! -L "$f" ]]; then
-      chown 65532:65532 "$f"
-      chmod 600 "$f"
-    fi
-  done
+  chown_enroll_runtime "$enroll_uid" "$enroll_gid"
 }
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=ops-lib.sh
@@ -188,6 +177,8 @@ done
 if [[ "$cmd" == "add-tenant" && -z "$org" ]]; then
   die "add-tenant requires an organisation name"
 fi
+# One decision, before policy, users or enrollment entries are rendered.
+normalize_admin_choice "$tailnet_admin" "$headplane_access"
 
 command -v docker >/dev/null || die "docker not found"
 docker compose version >/dev/null 2>&1 || die "docker compose v2 is required"
@@ -257,27 +248,32 @@ summary="$( "${policy_args[@]}" )" || { rm -f "$backup"; die "policy render fail
 # On failure the previous file is restored and reloaded.
 restore_policy() {
   cp "$backup" headscale/policy.hujson
-  if [[ -n "$(docker compose ps --status running -q headscale 2>/dev/null || true)" ]]; then
-    docker compose kill -s HUP headscale >/dev/null 2>&1 || docker compose restart headscale >/dev/null 2>&1 || true
+  if [[ -n "$(compose ps --status running -q headscale 2>/dev/null || true)" ]]; then
+    compose kill -s HUP headscale >/dev/null 2>&1 || compose restart headscale >/dev/null 2>&1 || true
     sleep 1
   fi
   rm -f "$backup"
 }
 
 echo "building enrollment image..."
-BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose build enroll
+BUILDX_NO_DEFAULT_ATTESTATIONS=1 compose build enroll
 
 echo "starting headscale..."
-if ! docker compose up -d --wait --wait-timeout 120 headscale; then
+if [[ "$headplane_access" == "tailnet" ]]; then
+  assert_compose_bindings tailnet-admin
+else
+  assert_compose_bindings published
+fi
+if ! compose up -d --wait --wait-timeout 120 headscale; then
   restore_policy
-  docker compose up -d --wait --wait-timeout 120 headscale || true
+  compose up -d --wait --wait-timeout 120 headscale || true
   die "headscale did not become healthy; restored the previous policy.hujson"
 fi
 
-hs() { docker compose exec -T headscale headscale "$@"; }
+hs() { compose exec -T headscale headscale "$@"; }
 
 policy_check() {
-  docker compose exec -T headscale headscale policy check -f /etc/headscale/policy.hujson
+  compose exec -T headscale headscale policy check -f /etc/headscale/policy.hujson
 }
 
 user_id_of() {
@@ -384,7 +380,7 @@ if ! policy_check; then
   die "headscale policy check failed; restored the previous policy.hujson"
 fi
 rm -f "$backup"
-docker compose kill -s HUP headscale >/dev/null
+compose kill -s HUP headscale >/dev/null
 sleep 1
 echo "policy checked and reloaded"
 
@@ -418,7 +414,7 @@ if [[ "$tailnet_flag" == "1" ]]; then
   wanted+=("vpn-server|$(user_id_of "${admins[0]}")|tag:vpn-server|5|10m|")
 fi
 
-image="$(docker compose config --format json | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["enroll"]["image"])')"
+image="$(compose config --format json | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["enroll"]["image"])')"
 mint() {
   local out tok hash
   out="$(docker run --rm --network none --entrypoint idoris-vpn-enroll "$image" token new)"
@@ -508,11 +504,21 @@ PY
   mv enroll/config.json.tmp enroll/config.json
   rm -f "$spec_file"
   echo "wrote enroll/config.json"
-  if [[ -n "$(docker compose ps --status running -q enroll)" ]]; then
-    docker compose restart enroll >/dev/null
+  if [[ -n "$(compose ps --status running -q enroll)" ]]; then
+    compose restart enroll >/dev/null
   fi
 else
   echo "enrollment entries already present; no new tokens minted"
+fi
+
+if [[ -f enroll/config.json && ! -L enroll/config.json ]]; then
+  enroll_cksum="$(cksum enroll/config.json | awk '{print $1}')"
+  python3 "$here/policy.py" reconcile-enroll \
+    --state "$here/headscale/managed.json" \
+    --config "$here/enroll/config.json"
+  if [[ "$(cksum enroll/config.json | awk '{print $1}')" != "$enroll_cksum" ]] && service_running enroll; then
+    compose restart enroll >/dev/null
+  fi
 fi
 
 if [[ ${#printed[@]} -gt 0 ]]; then
@@ -522,24 +528,11 @@ if [[ ${#printed[@]} -gt 0 ]]; then
     fi
   done
 fi
-if [[ -n "$headplane_access" && "$headplane_access" != "tunnel" && "$headplane_access" != "lan" && "$headplane_access" != "tailnet" && "$headplane_access" != "proxy" ]]; then
-  die "--headplane-access must be tunnel, lan, tailnet or proxy"
-fi
-if (( tailnet_admin )) && [[ -n "$headplane_access" && "$headplane_access" != "tailnet" ]]; then
-  die "--tailnet-admin cannot be combined with --headplane-access $headplane_access"
-fi
-if (( tailnet_admin )) && [[ -z "$headplane_access" ]]; then
-  headplane_access="tailnet"
-fi
-if [[ -z "$headplane_access" && -f "$here/.env" ]]; then
-  headplane_access="$(sed -n 's/^HEADPLANE_ACCESS=//p' "$here/.env" | head -n1 | tr -d '[:space:]')"
-fi
-headplane_access="${headplane_access:-tunnel}"
 apply_headplane_access "$headplane_access"
 chown_enroll_tree
 echo "starting services for admin mode $(read_admin_mode)..."
 start_stack_for_mode "$(read_admin_mode)"
-docker compose exec -T enroll idoris-vpn-enroll check --config /etc/idoris/enroll.json
+compose exec -T enroll idoris-vpn-enroll check --config /etc/idoris/enroll.json
 
 if [[ ${#printed[@]} -gt 0 ]]; then
   echo
