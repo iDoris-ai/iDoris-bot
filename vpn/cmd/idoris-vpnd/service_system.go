@@ -401,7 +401,7 @@ func installLaunchDaemon(configPath string) error {
 		return err
 	}
 	plist := renderSystemLaunchdPlist(exe, systemConfigPath, systemLogDir)
-	if err := os.WriteFile(systemLaunchdPath, []byte(plist), 0o600); err != nil {
+	if err := os.WriteFile(systemLaunchdPath, []byte(plist), 0o600); err != nil { //nolint:gosec // G703: fixed LaunchDaemon path under /Library/LaunchDaemons
 		return err
 	}
 	_ = exec.Command("launchctl", "bootout", fmt.Sprintf("gui/%d/%s", os.Getuid(), launchdLabel)).Run()
@@ -453,7 +453,7 @@ func provisionLaunchDaemonDirs(root string) error {
 		if root != "" {
 			dest = filepath.Join(root, strings.TrimPrefix(d.path, "/"))
 		}
-		if err := os.MkdirAll(dest, d.mode); err != nil {
+		if err := os.MkdirAll(dest, d.mode); err != nil { //nolint:gosec // G703: dest is /var/lib/idoris or /var/log/idoris, or those paths under a test root
 			return err
 		}
 		if err := os.Chmod(dest, d.mode); err != nil { //nolint:gosec // 0700 is the required mode; the directory is not left group-writable

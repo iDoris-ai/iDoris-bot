@@ -250,7 +250,7 @@ func installLaunchd(exe, configPath string) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
 		return err
 	}
-	if err := os.WriteFile(p, []byte(plist), 0o600); err != nil {
+	if err := os.WriteFile(p, []byte(plist), 0o600); err != nil { //nolint:gosec // G703: user LaunchAgent path under the current home, not a request path
 		return err
 	}
 	target := fmt.Sprintf("gui/%d", os.Getuid())
