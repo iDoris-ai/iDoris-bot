@@ -282,12 +282,18 @@ func TestWizardGatewayJoin(t *testing.T) {
 		t.Fatalf("policy get does not match the fixture autoApprovers:\n%s", gotPolicy)
 	}
 
-	seed, err := enroll.NewToken()
+	seedHash, err := func() (string, error) {
+		// The plaintext seed never leaves this function. The config stores
+		// only its hash; invite appends the real token hashes later.
+		seed, err := enroll.NewToken()
+		if err != nil {
+			return "", err
+		}
+		return enroll.HashToken(seed), nil
+	}()
 	if err != nil {
 		t.Fatal(err)
 	}
-	seedHash := enroll.HashToken(seed)
-	seed = ""
 	cfgPath := filepath.Join(t.TempDir(), "enroll.json")
 	rawCfg, err := json.MarshalIndent(enroll.Config{
 		ControlURL: "https://headscale",
