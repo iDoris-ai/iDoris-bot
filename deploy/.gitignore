@@ -5,3 +5,6 @@
 .drill-backup/
 # Headplane login proof (deploy/vpn/test/headplane-login.sh).
 .hp-src/
+# Isolation probe and the headplane-access flag test.
+.probe-src/
+.flag-src/
