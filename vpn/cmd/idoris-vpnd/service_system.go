@@ -348,7 +348,20 @@ func installWindowsTask(configPath string) error {
 	if err != nil {
 		return err
 	}
-	if err := writeRootFile(windowsConfigDir, windowsConfigPath, cfg, 0o600); err != nil {
+	if err := os.MkdirAll(windowsConfigDir, 0o750); err != nil {
+		return err
+	}
+	body, creds, err := stageWindowsConfig(cfg, windowsConfigDir)
+	if err != nil {
+		return err
+	}
+	if err := writeRootFile(windowsConfigDir, windowsConfigPath, body, 0o600); err != nil {
+		return err
+	}
+	// Unix modes do not set a DACL. icacls removes inheritance and grants
+	// only SYSTEM and Administrators on the directory, the config, copied
+	// credential files, and the protected executable.
+	if err := protectWindowsInstall(windowsConfigDir, windowsConfigPath, exeDir, exe, creds); err != nil {
 		return err
 	}
 	args := renderSchtasksCreate(exe, windowsConfigPath)
