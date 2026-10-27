@@ -50,8 +50,9 @@ type ModeDecision struct {
 //
 // auto uses system only when that cannot hijack a foreign tailnet: tailscaled
 // is reachable and it is not logged in, already on our control URL, or already
-// has an iDoris profile. A foreign control URL uses system only when takeover
-// was explicitly enabled. Otherwise auto uses embedded, including when
+// has an iDoris profile. A foreign control URL, including an empty URL on a
+// backend that is already Running, Starting, or Stopped, uses system only when
+// takeover was explicitly enabled. Otherwise auto uses embedded, including when
 // tailscaled is not reachable.
 func DecideMode(requested string, takeoverExplicit bool, view SystemView, ourControl string) (ModeDecision, error) {
 	switch requested {
@@ -72,7 +73,7 @@ func DecideMode(requested string, takeoverExplicit bool, view SystemView, ourCon
 	if view.HasOurProfile {
 		return ModeDecision{Mode: ModeSystem, Reason: "system tailscaled has an iDoris profile"}, nil
 	}
-	if !foreignControl(view.ControlURL, ourControl) {
+	if !foreignControl(view.ControlURL, ourControl, view.BackendState) {
 		return ModeDecision{Mode: ModeSystem, Reason: "system tailscaled is not logged in"}, nil
 	}
 	if takeoverExplicit {
@@ -85,19 +86,35 @@ func DecideMode(requested string, takeoverExplicit bool, view SystemView, ourCon
 }
 
 // foreignControl reports whether control is a persisted login to some server
-// other than ours. An empty URL is a fresh install, not a foreign tailnet.
-// A non-empty foreign URL counts even when the backend is NeedsLogin or
-// Stopped: the system client still holds that profile, and the reconciler
-// would switch it.
-func foreignControl(control, ours string) bool {
+// other than ours. A non-empty foreign URL counts even when the backend is
+// NeedsLogin or Stopped: the system client still holds that profile, and the
+// reconciler would switch it.
+//
+// An empty URL is a fresh install only when the backend is logged out
+// (NoState, NeedsLogin, or anything else that is not a live session). Older
+// Tailscale profiles that are logged into the default SaaS sometimes report
+// an empty ControlURL while the backend is Running, Starting, or Stopped.
+// Treating that as fresh would let auto mode hijack the user's tailnet.
+func foreignControl(control, ours, backendState string) bool {
 	control = strings.TrimSpace(control)
 	if control == "" {
-		return false
+		return loggedInBackend(backendState)
 	}
 	if ours != "" && SameControlURL(control, ours) {
 		return false
 	}
 	return true
+}
+
+// loggedInBackend reports states where tailscaled already has a session.
+// NeedsLogin and NoState are a fresh or logged-out install.
+func loggedInBackend(state string) bool {
+	switch state {
+	case ipn.Running.String(), ipn.Starting.String(), ipn.Stopped.String():
+		return true
+	default:
+		return false
+	}
 }
 
 // ProbeSystem reads the system tailscaled. It never calls Start, EditPrefs,
