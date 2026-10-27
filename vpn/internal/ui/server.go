@@ -289,7 +289,7 @@ func (s *Server) WriteLauncher(dir string) (string, error) {
 	// EnsurePrivateDir accepts a directory we own that is not writable by
 	// anyone else, including mode 0755. The launcher directory has to be
 	// 0700 so other local users cannot list the file name.
-	if err := os.Chmod(dir, 0o700); err != nil {
+	if err := os.Chmod(dir, 0o700); err != nil { //nolint:gosec // directory must stay traversable; 0700 is the required mode
 		return "", err
 	}
 	id, err := randomHex(8)
