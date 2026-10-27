@@ -108,10 +108,16 @@ func DefaultListen() string {
 	return "unix:" + filepath.Join(base, "vpnd.sock")
 }
 
-// Forward is one loopback TCP listener and the tailnet target it dials.
+// Forward is one loopback listener and the tailnet target it dials.
+// Listen is host:port or unix:<absolute path>.
 type Forward struct {
 	Listen string `json:"listen"`
 	Target string `json:"target"`
+	// OwnerOnly, on Linux, drops TCP connections whose peer uid is not the
+	// daemon's uid. On other operating systems a TCP OwnerOnly is a
+	// configuration error: the peer uid cannot be read reliably. A unix:
+	// listener is created mode 0600, so OwnerOnly changes nothing there.
+	OwnerOnly bool `json:"owner_only,omitempty"`
 }
 
 // DefaultStateDir is the embedded node's state directory, under the user's
@@ -180,6 +186,11 @@ func applyEnv(cfg *Config) error {
 		if !ok {
 			continue
 		}
+		// A blank credential variable is not set. Treating it as set would
+		// wipe the config-file value and still leave the other side in place.
+		if secretCredential(name) && strings.TrimSpace(raw) == "" {
+			continue
+		}
 		if err := assignEnv(v.Field(i), raw); err != nil {
 			return fmt.Errorf("%s: %w", envKey, err)
 		}
@@ -194,7 +205,53 @@ func applyEnv(cfg *Config) error {
 		sort.Strings(unknown)
 		return fmt.Errorf("unknown environment variable %s", strings.Join(unknown, ", "))
 	}
+	return applyCredentialEnv(cfg, present)
+}
+
+// secretCredential is one side of the enrollment token or the auth key.
+func secretCredential(jsonKey string) bool {
+	switch jsonKey {
+	case "enroll_token", "enroll_token_file", "auth_key", "auth_key_file":
+		return true
+	default:
+		return false
+	}
+}
+
+// applyCredentialEnv makes a higher layer replace the whole credential.
+// Env wins over the config file. Setting both sides in the env, or leaving
+// both sides set in the file when the env sets neither, is an error.
+// A blank variable is not set.
+func applyCredentialEnv(cfg *Config, present map[string]string) error {
+	pairs := []struct {
+		inline, file       string
+		inlineDst, fileDst *string
+	}{
+		{"enroll_token", "enroll_token_file", &cfg.EnrollToken, &cfg.EnrollTokenFile},
+		{"auth_key", "auth_key_file", &cfg.AuthKey, &cfg.AuthKeyFile},
+	}
+	for _, p := range pairs {
+		inlineSet := credentialEnvSet(present, p.inline)
+		fileSet := credentialEnvSet(present, p.file)
+		switch {
+		case inlineSet && fileSet:
+			return fmt.Errorf("%s and %s are both set; set only one", EnvName(p.inline), EnvName(p.file))
+		case inlineSet:
+			*p.fileDst = ""
+		case fileSet:
+			*p.inlineDst = ""
+		default:
+			if strings.TrimSpace(*p.inlineDst) != "" && strings.TrimSpace(*p.fileDst) != "" {
+				return fmt.Errorf("config file sets both %s and %s; set only one", p.inline, p.file)
+			}
+		}
+	}
 	return nil
+}
+
+func credentialEnvSet(present map[string]string, jsonKey string) bool {
+	raw, ok := present[EnvName(jsonKey)]
+	return ok && strings.TrimSpace(raw) != ""
 }
 
 func jsonFieldName(f reflect.StructField) string {
@@ -285,14 +342,17 @@ func readSecretFile(path string) (string, error) {
 
 // Resolve fills defaults, reads *_file secrets and validates.
 func (c *Config) Resolve() error {
-	if c.EnrollToken == "" && c.EnrollTokenFile != "" {
+	if err := c.rejectDualCredentials(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(c.EnrollToken) == "" && c.EnrollTokenFile != "" {
 		t, err := readSecretFile(c.EnrollTokenFile)
 		if err != nil {
 			return fmt.Errorf("enroll_token_file: %w", err)
 		}
 		c.EnrollToken = t
 	}
-	if c.AuthKey == "" && c.AuthKeyFile != "" {
+	if strings.TrimSpace(c.AuthKey) == "" && c.AuthKeyFile != "" {
 		k, err := readSecretFile(c.AuthKeyFile)
 		if err != nil {
 			return fmt.Errorf("auth_key_file: %w", err)
@@ -351,7 +411,20 @@ func (c *Config) Resolve() error {
 	return nil
 }
 
+// rejectDualCredentials refuses one source leaving both the inline value and
+// the file path set. Apply layers clear the other side before this runs.
+func (c *Config) rejectDualCredentials() error {
+	if strings.TrimSpace(c.EnrollToken) != "" && strings.TrimSpace(c.EnrollTokenFile) != "" {
+		return errors.New("enroll_token and enroll_token_file are both set; set only one")
+	}
+	if strings.TrimSpace(c.AuthKey) != "" && strings.TrimSpace(c.AuthKeyFile) != "" {
+		return errors.New("auth_key and auth_key_file are both set; set only one")
+	}
+	return nil
+}
+
 func (c *Config) validateForwards() error {
+	var ownerOnly []string
 	for i, f := range c.Forwards {
 		if err := ValidateForwardListen(f.Listen); err != nil {
 			return fmt.Errorf("forwards[%d].listen: %w", i, err)
@@ -359,6 +432,21 @@ func (c *Config) validateForwards() error {
 		if _, _, err := net.SplitHostPort(f.Target); err != nil {
 			return fmt.Errorf("forwards[%d].target %q: %w", i, f.Target, err)
 		}
+		if !f.OwnerOnly {
+			continue
+		}
+		network, address, err := splitListen(f.Listen)
+		if err != nil {
+			return fmt.Errorf("forwards[%d].listen: %w", i, err)
+		}
+		// unix: is already mode 0600. OwnerOnly does not need a peer-uid check.
+		if network != "tcp" {
+			continue
+		}
+		if !ownerOnlySupported {
+			return fmt.Errorf("forwards[%d].owner_only: refusing TCP owner checks on %s because the peer uid cannot be read reliably (Linux reads /proc/net/tcp; this OS does not). Use a unix: listener, which is created mode 0600", i, runtime.GOOS)
+		}
+		ownerOnly = append(ownerOnly, address)
 	}
 	if c.SOCKS5Listen != "" {
 		if err := ValidateForwardListen(c.SOCKS5Listen); err != nil {
@@ -380,6 +468,10 @@ func (c *Config) validateForwards() error {
 			return errors.New("dial_timeout must be > 0")
 		}
 	}
+	// Publish only after the config is valid, so a rejected file does not
+	// arm or clear the listener policy. StartAccess calls listenLocal and
+	// cannot see Forward.OwnerOnly directly.
+	setOwnerOnlyListens(ownerOnly)
 	return nil
 }
 

@@ -122,6 +122,12 @@ Docker 里 `TestWireAccessForwardsAndSOCKS5` 用嵌入式节点连上真实 Head
 
 Connector / Agent24 的配置应写成 `http://127.0.0.1:8742`（或你们实际监听的端口），不要写 `http://acme-local-ai:8742`。后者只有进了 tailnet 的进程才解析得了。
 
+2026-10-28。共享机器上用 `unix:<绝对路径>` 监听，套接字创建后是 0600。回环 TCP 不做协议认证：本机其他用户连上原始 TCP 转发，就用这个节点的 VPN 身份。每个这种 TCP 监听在 `listenLocal` 里用 `slog.Default()` 打一条警告，正文说明任何本机用户都能连、原始转发因此给出节点身份、SOCKS5 仍核对自己的凭据。守护进程自己的 logger 不接收这条警告，所以 `--log-level=error` 不会把它消掉。`unix:` 监听不打这条警告。
+
+`forwards[].owner_only` 为 true 时，只在 Linux 上对回环 TCP 生效。实现读 `/proc/net/tcp` 或 `/proc/net/tcp6`：已接受连接的 `RemoteAddr` 是客户端本地地址，`LocalAddr` 是服务器地址，按这个方向匹配客户端那一行。空白分开后 uid 在下标 7。IPv4 是小端十六进制（`127.0.0.1` 为 `0100007F`），IPv6 是四个小端 uint32（`::1` 末尾为 `01000000`）。对不上、两行 uid 不同、或文件读不到，连接关掉，不交给转发。查到的 uid 必须等于 `os.Getuid()`。真正加上这个过滤时不再打上面的警告。
+
+本机是 darwin，没有读过真实的 `/proc`。单测用现场 TCP 连接的地址拼了一份快照，解析出 uid 42，并核对了上面两个地址格式。同一天在这台 Mac 上对 TCP 连接调用 `getpeereid` 和 `LOCAL_PEERCRED`，返回 uid 0 且错误是 nil，所以不能拿来做判断。darwin 和 Windows 上 TCP 的 `owner_only` 在 `Resolve` 失败，错误要求改用 `unix:`。`unix:` 再加上 `owner_only` 不报错，套接字仍是 0600。`--forward` 仍是 `listen=target`，没有这一项；字段走 JSON 或 `IDORIS_VPN_FORWARDS`。
+
 ## 6. 登录、状态目录、重启不铸 key
 
 v1.104.2 上对 tsnet 的观察：
@@ -192,6 +198,10 @@ Headscale 还必须批准这些路由（生产环境由 ops 的 `autoApprovers` 
 `/healthz` 仅当 `phase` 为 `connected` 时返回 200，否则 503，正文是阶段名。
 
 `idoris-vpnd status` 走 `FormatStatus`，上表各项都打印。`idoris-vpnd status` 和本地页面的状态回调都调用 `QueryStatus`。它共用一个关掉 keep-alive 的 HTTP 客户端，每次查询的拨号地址放在请求上下文里，避免连到上一次的套接字。单测对回环上的状态服务打了 30 次，服务端新建的连接和关闭的连接对齐。
+
+2026-10-28。Unix 状态套接字在删除任何路径之前，先拿一把状态路径锁：`os.UserCacheDir()/idoris/locks/<sha256>.lock`。哈希输入是 `status`、一个 NUL、再加规范后的监听路径，因此不会和同一路径上的系统 LocalAPI 控制器锁撞车。这不是后端控制器锁。`Listen` 仍在打开节点之前返回，等待 tailscaled 时状态口先起来。锁持有到监听器 `Close`。
+
+`Lstat` 看到符号链接或非套接字就停，不删除，启动失败。只删除当前用户拥有、并且 `Dial` 失败的套接字。本机单测：普通文件留在原地，内容仍是 `keep`，错误写明不是套接字；符号链接还在，目标文件仍是 `keep`；`bind` 之后关掉 fd 留下的残留套接字被换掉，新套接字模式 0600；已经在听的套接字上第二次 `Listen` 失败，第一次仍能拨通；事先持有同一把状态锁时，残留套接字不会被删。Windows 上查不到属主就拒绝删除。这条分支没有在 Windows 上执行，只做了 `GOOS=windows go vet`。属主不符和查不到属主是在 darwin 上用注入函数测的。
 
 ## 9. 平台
 
@@ -286,9 +296,19 @@ iOS / Android 同时只允许一个活动 VPN。这次没有在手机上验证�
 
 Unix 上，令牌文件、auth key 文件、状态文件、SOCKS5 凭据文件，以及在 JSON 里直接写了 `enroll_token` 或 `auth_key` 的配置文件，必须是普通文件、属主为当前用户、权限不含 group/other（`chmod 600`）。符号链接拒绝。错误文本里带有 `chmod 600`。只指向 `enroll_token_file`、自身没有 inline 密钥的配置文件可以是 0644。Windows 上同一检查只打警告，不拒绝。`service install`（用户级和 `--system`）在真正安装之前调用 `vpnd.CheckSecretFile`：登记令牌文件、auth key 文件、`socks5_auth_file`，以及含有 inline `enroll_token` 或 `auth_key` 的配置文件。失败就中止，错误里有 `chmod 600`。`--system` 的 root 检查在这之后。Windows 上这一步只警告。
 
+2026-10-28。注册令牌和 auth key 各是一整份凭证，inline 和文件二选一。优先级仍是配置文件、然后环境变量、然后 flag。更高一层写了其中一边，就清掉较低层留下的另一边。同一层两边都写（配置文件里两个字段、两个环境变量、或两个 flag）直接报错，错误里有 `both`。空白的环境变量不算设置。flag 只要出现在命令行上就算设置，空字符串也会清掉较低层。`Resolve` 只在 inline 为空时读文件；两边都还在则拒绝。单测对两份凭证各跑了文件、环境变量、flag 三层。
+
+Windows 上 Go 把普通文件的权限报成 0666。SOCKS 凭据的加载不再用 0600 去比这些位，否则生成的 `socks5.auth` 每次重启都被拒绝。生成文件走三步 `icacls`：`/reset`、`/inheritance:r`、`/grant:r *<当前用户 SID>:F`。服务安装那套授予 SYSTEM 和 Administrators，因为那是机器目录；这份文件在用户配置里，所以只授予当前用户。操作者提供的 `socks5_auth_file` 不改 ACL，沿用所在目录的 ACL。`icacls` 没有在这台 Mac 上执行。单测注入运行器，核对参数，并核对第二步失败时第三步不跑。`CheckSecretFile` 在 Windows 上仍是警告后放行。
+
 ### 控制器锁
 
 改某个后端之前先拿操作系统的排他锁。system：套接字路径的 SHA-256，锁文件放在默认状态文件所在目录；套接字为空时键名是 `default`。embedded：`<state_dir>/controller.lock`。Unix 用 `flock`（`LOCK_EX|LOCK_NB`），进程活着就持有，`Close` 时释放。第二个守护进程立刻失败，错误含有 `another idoris-vpnd`。`local-ai` / `gateway` 在等待 tailscaled 之前就拿 system 锁，所以第二个进程不用等到 tailscaled 起来才失败。`member` 的 `auto` 只锁最终选中的那个后端：选了 embedded 就不会锁系统套接字。Windows 上是尽力创建锁文件，不保证互斥。
+
+2026-10-28 起，system 锁的位置如下。空套接字先换成 `paths.DefaultTailscaledSocket()`，再做 `Clean`；相对路径先 `Abs`；`EvalSymlinks` 解析已经存在的部分，最后一级还不存在就把缺失的尾巴拼回去。Windows 管道（前缀 `\\` 或 `//./pipe/`）不解析符号链接。锁文件是 `os.UserCacheDir()/idoris/locks/<sha256>.lock`。目录经 `fsutil.EnsurePrivateDir`。文件模式 0600。打开时拒绝符号链接：Unix 用 `O_NOFOLLOW`，Windows 用 `FILE_FLAG_OPEN_REPARSE_POINT` 并检查 reparse 属性。显式写出的默认套接字和留空是同一把锁。embedded 仍是规范路径下的 `controller.lock`，符号链接目录和真实目录共用一把。
+
+本机用重新执行的测试进程核实了两件：两个进程 `XDG_STATE_HOME` 不同、LocalAPI 套接字相同，第二个失败，错误含 `another idoris-vpnd`；一个进程锁空套接字，另一个用显式的默认套接字路径，同样失败。darwin 上 `UserCacheDir` 是 `$HOME/Library/Caches`。root 系统服务和普通用户的 HOME 不同，缓存目录就不同。套接字路径相同也不会把两把锁放进同一个目录。互斥只在同一个用户之内。这一点对照 Go 的 `os.UserCacheDir` 核对过，没有用 sudo 跑。
+
+Windows 用 `LockFileEx`（`LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY`，`golang.org/x/sys/windows`）。第二个持有者失败，错误同样含 `another idoris-vpnd`。这套代码没有在 Windows 上执行。`GOOS=windows go build` 和 `go vet` 通过。
 
 ## 12. 限制与未决问题
 
@@ -320,3 +340,5 @@ Unix 上，令牌文件、auth key 文件、状态文件、SOCKS5 凭据文件�
 已知限制：官方 GUI 和 `tailscale` CLI 仍可能在两次 prefs 读取之间切走 profile，控制器锁排除不了它们。回环上的 TCP 转发让这台机器的每个本地用户都借用本节点身份；要收紧监听，用 `unix:`。
 
 `tailscale.com/net/socks5` 的 `Server` 能做用户名密码，但它自己 `Accept`、用固定 5 秒和 `context.Background` 拨号、不限连接数，第一次 `Accept` 失败就退出。所以这里没有用它的 `Serve`，CONNECT 和认证是一层薄实现。
+
+2026-10-28。共享机器的默认应是 `unix:` 监听（0600）。TCP 转发留给单用户机器。原始 TCP 没有认证，本机其他用户连上就得到这个节点的 VPN 身份；启动警告见第 5 节。SOCKS5 的 TCP 监听也打同一条警告，连上之后仍要 SOCKS 凭据。`owner_only` 的平台范围和 `/proc/net/tcp` 的核对方式也在第 5 节。本机单测看到了 TCP 警告、确认 `unix:` 不警告，并在注入的对端 uid 与本进程不同时关掉连接。

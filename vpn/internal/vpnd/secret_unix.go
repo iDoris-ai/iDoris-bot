@@ -8,6 +8,10 @@ import (
 	"syscall"
 )
 
+// socksChecksUnixMode is true where a file's permission bits are the mode
+// passed to Open/Chmod. Windows reports ordinary files as 0666.
+const socksChecksUnixMode = true
+
 func checkSecretFile(path string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -32,3 +36,7 @@ func checkSecretFile(path string) error {
 	}
 	return nil
 }
+
+// protectGeneratedSecret is a no-op on Unix. writeSOCKSAuth already creates
+// the file mode 0600, and loadOrCreateSOCKSAuth checks those bits.
+func protectGeneratedSecret(string) error { return nil }
