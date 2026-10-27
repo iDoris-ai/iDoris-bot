@@ -23,7 +23,7 @@ type ForwardStatus struct {
 	Listen string `json:"listen"`
 	Target string `json:"target"`
 	State  string `json:"state"`
-	// Error is set when State is "failed". FormatStatus does not print it yet.
+	// Error is set when State is "failed".
 	Error string `json:"error,omitempty"`
 }
 
@@ -32,6 +32,9 @@ type SOCKS5Status struct {
 	Listen string `json:"listen"`
 	State  string `json:"state"`
 	Error  string `json:"error,omitempty"`
+	// AuthFile is the credential file when SOCKS5 is authenticated.
+	// Empty for an anonymous listener. The password is never included.
+	AuthFile string `json:"auth_file,omitempty"`
 }
 
 // AccessOptions controls every listener started by StartAccess.
@@ -83,6 +86,7 @@ type LocalAccess struct {
 	dialTimeout time.Duration
 	user        string
 	pass        string
+	authFile    string
 
 	mu     sync.Mutex
 	closed bool
@@ -102,9 +106,9 @@ type bound struct {
 	max     int
 }
 
-// StartLocalAccess is the daemon entry point that still takes anonymous
-// SOCKS5. New callers use StartAccess and pass credentials. A non-nil logger
-// receives anonymousSOCKSWarning when socksAddr is set.
+// Deprecated: StartLocalAccess opens an anonymous SOCKS5 listener. The daemon
+// calls StartAccess with credentials. A non-nil logger receives
+// anonymousSOCKSWarning when socksAddr is set.
 func StartLocalAccess(dial Dialer, forwards []Forward, socksAddr string, log *slog.Logger) (*LocalAccess, error) {
 	return StartAccess(dial, forwards, socksAddr, AccessOptions{AllowAnonymous: true}, log)
 }
@@ -138,16 +142,20 @@ func StartAccess(dial Dialer, forwards []Forward, socksAddr string, opt AccessOp
 	if dialTimeout < 0 {
 		return nil, errors.New("vpnd: dial_timeout must be >= 0")
 	}
-	var user, pass string
+	var user, pass, authFile string
 	if socksAddr != "" {
-		var anon bool
+		var anon, created bool
 		var err error
-		user, pass, anon, err = resolveSOCKSAuth(opt)
+		user, pass, anon, authFile, created, err = resolveSOCKSAuth(opt)
 		if err != nil {
 			return nil, err
 		}
 		if anon && callerLog != nil {
 			callerLog.Warn(anonymousSOCKSWarning)
+		}
+		// The path only. The password stays in the 0600 file.
+		if created && callerLog != nil {
+			callerLog.Info("SOCKS5 auth file created", "path", authFile)
 		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -160,6 +168,7 @@ func StartAccess(dial Dialer, forwards []Forward, socksAddr string, opt AccessOp
 		dialTimeout: dialTimeout,
 		user:        user,
 		pass:        pass,
+		authFile:    authFile,
 		conns:       map[net.Conn]struct{}{},
 	}
 	fail := func(err error) (*LocalAccess, error) {
@@ -452,7 +461,7 @@ func (a *LocalAccess) snapshot() (rows []ForwardStatus, socks *SOCKS5Status, sus
 	for _, b := range a.bounds {
 		st := ForwardStatus{Listen: b.listen, Target: b.target, State: b.state, Error: b.errText}
 		if b.socks {
-			socks = &SOCKS5Status{Listen: b.listen, State: b.state, Error: b.errText}
+			socks = &SOCKS5Status{Listen: b.listen, State: b.state, Error: b.errText, AuthFile: a.authFile}
 			continue
 		}
 		rows = append(rows, st)
