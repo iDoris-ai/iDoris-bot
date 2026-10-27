@@ -262,5 +262,53 @@ class CallbackPortTest(unittest.TestCase):
         self.assertEqual(self.policy.read_text(), before)
 
 
+class GatewayLanCidrTest(unittest.TestCase):
+    def test_reconcile_sets_prefixes_without_touching_hashes(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        directory = Path(tmp.name)
+        state = directory / "managed.json"
+        config = directory / "config.json"
+        digest = "a" * 64
+        state.write_text(json.dumps({
+            "version": 1,
+            "admins": ["admin"],
+            "orgs": [{
+                "name": "office",
+                "lan_cidrs": ["192.168.1.0/24", "10.8.0.0/24"],
+                "public_cidrs": [],
+            }],
+            "tailnet_admin": False,
+        }))
+        config.write_text(json.dumps({
+            "tenants": [{
+                "name": "office-gateway",
+                "token_hashes": [{"hash": digest, "label": "bootstrap-office-gateway"}],
+                "role": "gateway",
+            }, {
+                "name": "office",
+                "token_hashes": [{"hash": "b" * 64}],
+            }],
+        }))
+        result = subprocess.run(
+            [sys.executable, str(POLICY_PY), "reconcile-enroll",
+             "--state", str(state), "--config", str(config)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cfg = json.loads(config.read_text())
+        gateway = cfg["tenants"][0]
+        self.assertEqual(gateway["lan_cidrs"], ["192.168.1.0/24", "10.8.0.0/24"])
+        self.assertEqual(gateway["token_hashes"][0]["hash"], digest)
+        self.assertNotIn("lan_cidrs", cfg["tenants"][1])
+        again = subprocess.run(
+            [sys.executable, str(POLICY_PY), "reconcile-enroll",
+             "--state", str(state), "--config", str(config)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertFalse(json.loads(again.stdout)["changed"])
+
+
 if __name__ == "__main__":
     unittest.main()
