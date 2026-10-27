@@ -343,7 +343,11 @@ func runCmd(args []string) error {
 		return err
 	}
 
-	access, err := vpnd.StartLocalAccess(node.Dialer, cfg.Forwards, cfg.SOCKS5Listen, log)
+	opt, err := accessOptions(cfg, node.Mode, controlURL, rec)
+	if err != nil {
+		return err
+	}
+	access, err := vpnd.StartAccess(node.Dialer, cfg.Forwards, cfg.SOCKS5Listen, opt, log)
 	if err != nil {
 		return err
 	}
@@ -429,6 +433,40 @@ func openBinding(cfg *vpnd.Config) (*vpnd.StateFile, error) {
 		}
 	}
 	return vpnd.OpenState(path)
+}
+
+// accessOptions is what run passes to StartAccess. Embedded mode leaves the
+// gate open. System mode opens it only while the reconciler snapshot says the
+// live control URL is ours and the phase still carries traffic.
+// CurrentControl is that live URL. Snapshot.ControlURL is always ours.
+// A SOCKS5 listener with no explicit credential file gets one generated at
+// <state_dir>/socks5.auth.
+func accessOptions(cfg *vpnd.Config, mode, ourControl string, src vpnd.StatusSource) (vpnd.AccessOptions, error) {
+	opt := vpnd.AccessOptions{
+		Gate: func() bool {
+			var current string
+			var phase vpnd.Phase
+			if src != nil {
+				snap := src.Snapshot()
+				current = snap.CurrentControl
+				phase = snap.Phase
+			}
+			return vpnd.AccessOpen(mode, current, ourControl, phase)
+		},
+	}
+	if cfg.SOCKS5Listen == "" {
+		return opt, nil
+	}
+	dir := cfg.StateDir
+	if dir == "" {
+		var err error
+		dir, err = vpnd.DefaultStateDir()
+		if err != nil {
+			return vpnd.AccessOptions{}, err
+		}
+	}
+	opt.StateDir = dir
+	return opt, nil
 }
 
 func statusCmd(args []string) error {
