@@ -37,7 +37,7 @@ Usage:
   idoris-vpnd gateway setup [--yes] [--device IP] [--whole-subnet] [--no-service]
   idoris-vpnd gateway apply --plan FILE
   idoris-vpnd ui [--no-open]
-  idoris-vpnd service install|uninstall [--config FILE]   manage the user service
+  idoris-vpnd service install|uninstall [--system] [--config FILE]
   idoris-vpnd version
 
 Config keys may also be given as IDORIS_VPN_* environment variables.
