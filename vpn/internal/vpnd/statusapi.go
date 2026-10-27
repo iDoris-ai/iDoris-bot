@@ -1,0 +1,144 @@
+package vpnd
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+// StatusSource is anything that can report a Snapshot (the Reconciler).
+type StatusSource interface {
+	Snapshot() Snapshot
+}
+
+// StatusHandler serves /healthz and /v1/status for the Bridge Connector and
+// for `idoris-vpnd status`.
+func StatusHandler(src StatusSource, version string) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		s := src.Snapshot()
+		w.Header().Set("Content-Type", "text/plain")
+		if s.Phase == PhaseConnected {
+			_, _ = w.Write([]byte("ok\n"))
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = fmt.Fprintf(w, "%s\n", s.Phase)
+	})
+	mux.HandleFunc("GET /v1/status", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		_ = json.NewEncoder(w).Encode(struct {
+			Snapshot
+			Version string `json:"daemon_version"`
+		}{src.Snapshot(), version})
+	})
+	return mux
+}
+
+// ParseListen accepts "unix:/path/to.sock" or "tcp:127.0.0.1:7845".
+func ParseListen(s string) (network, address string, err error) {
+	switch {
+	case strings.HasPrefix(s, "unix:"):
+		return "unix", strings.TrimPrefix(s, "unix:"), nil
+	case strings.HasPrefix(s, "tcp:"):
+		addr := strings.TrimPrefix(s, "tcp:")
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return "", "", fmt.Errorf("listen %q: %w", s, err)
+		}
+		if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+			return "", "", fmt.Errorf("listen %q: tcp status API must bind a loopback address", s)
+		}
+		return "tcp", addr, nil
+	default:
+		return "", "", fmt.Errorf("listen %q: expected unix:<path> or tcp:<loopback:port>", s)
+	}
+}
+
+// Listen opens the status listener. Unix sockets are created 0600 and any
+// stale socket file is removed first.
+func Listen(spec string) (net.Listener, error) {
+	network, addr, err := ParseListen(spec)
+	if err != nil {
+		return nil, err
+	}
+	if network == "unix" {
+		if err := os.MkdirAll(filepath.Dir(addr), 0o700); err != nil {
+			return nil, err
+		}
+		if _, err := os.Stat(addr); err == nil {
+			// Refuse to steal a live socket from another daemon instance.
+			c, derr := net.DialTimeout("unix", addr, 500*time.Millisecond)
+			if derr == nil {
+				_ = c.Close()
+				return nil, fmt.Errorf("another idoris-vpnd is already serving %s", addr)
+			}
+			_ = os.Remove(addr)
+		}
+	}
+	ln, err := net.Listen(network, addr)
+	if err != nil {
+		return nil, err
+	}
+	if network == "unix" {
+		if err := os.Chmod(addr, 0o600); err != nil {
+			_ = ln.Close()
+			return nil, err
+		}
+	}
+	return ln, nil
+}
+
+// ServeStatus runs the HTTP server until ctx is done.
+func ServeStatus(ctx context.Context, ln net.Listener, h http.Handler) error {
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second}
+	errc := make(chan error, 1)
+	go func() { errc <- srv.Serve(ln) }()
+	select {
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+		return nil
+	case err := <-errc:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	}
+}
+
+// QueryStatus fetches /v1/status from a running daemon at listen spec.
+func QueryStatus(ctx context.Context, spec string) (map[string]any, error) {
+	network, addr, err := ParseListen(spec)
+	if err != nil {
+		return nil, err
+	}
+	tr := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, network, addr)
+	}}
+	hc := &http.Client{Transport: tr, Timeout: 5 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://idoris-vpnd/v1/status", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}

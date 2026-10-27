@@ -17,19 +17,21 @@
 | [09-DECISIONS-OPEN-QUESTIONS.md](09-DECISIONS-OPEN-QUESTIONS.md) | 决策登记及风险 | 哪些已定、哪些有待技术验证或平台确认 |
 | [10-SOURCES-RESEARCH.md](10-SOURCES-RESEARCH.md) | 官方来源及研究核验 | 各平台官方链接、法规/价格信息核对 |
 | [11-OSS-REUSE-AUDIT.md](11-OSS-REUSE-AUDIT.md) | 开源参考项目分析 | 10 个 clone、许可证、可直接用的 SDK、值得借鉴的代码与禁止复用范围 |
+| [12-VPN-HEADSCALE.md](12-VPN-HEADSCALE.md) | 私有接入层（VPN） | 官方 Tailscale 客户端 + 自建 Headscale + idoris-vpnd 守护进程；调研、方案、WBS、测试门禁 |
 | [../vendors/README.md](../vendors/README.md) | 上游 clone 复现 | 本地 vendors/ 克隆、固定 SHA、非产品依赖 |
 | [archive/2026-10-21-G0-G5-baseline.md](archive/2026-10-21-G0-G5-baseline.md) | 旧版计划归档 | 保留原 G0–G5 的所有要求，当前以三阶段规划为准 |
 | [adr/0001-local-first-agent-boundary.md](adr/0001-local-first-agent-boundary.md) | ADR 001 | 只提供通信桥，不重建 Agent |
 | [adr/0002-account-ownership-and-credentials.md](adr/0002-account-ownership-and-credentials.md) | ADR 002 | 客户持有账号，最小凭据委托 |
 | [adr/0003-delivery-and-cost-semantics.md](adr/0003-delivery-and-cost-semantics.md) | ADR 003 | 至少一次传输，业务幂等、付费发送显式授权 |
 | [adr/0004-oss-reuse-boundary.md](adr/0004-oss-reuse-boundary.md) | ADR 004 | 官方 API Schema/Rust SDK 优先，AGPL 与专有代码研究隔离 |
+| [adr/0005-vpn-tailscale-client-headscale-control.md](adr/0005-vpn-tailscale-client-headscale-control.md) | ADR 005 | 客户端用官方 Tailscale 不改、控制面自建 Headscale 不 fork、Go 胶水守护进程 |
 
 ## 文档中的状态词
 
 - **方向已确认**：对话中明确确立的产品/架构边界；仍需开发验证。
 - **建议方案**：可执行的设计建议；在 P1-F0 ADR/评审后冻结。
 - **待验证**：需要读取实际代码、官方渠道确认或实测。
-- **已实现**：只有当前仓库对应代码和测试证据可证明时才可以使用。目前此仓库没有已实现的 Bridge 服务。
+- **已实现**：只有当前仓库对应代码和测试证据可证明时才可以使用。目前此仓库没有已实现的 Bridge Relay/Connector；`vpn/` 下的私有接入层守护进程与注册服务有代码、单测和 Docker 集成测试。
 
 ## 项目与现有内核的关系
 

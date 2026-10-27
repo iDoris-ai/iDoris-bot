@@ -1,0 +1,38 @@
+# Headplane v0.8.x - admin UI for Headscale. https://github.com/tale/headplane
+# Reference: https://github.com/tale/headplane/blob/0.8.2/config.example.yaml
+# Replace vpn.example.org with your public hostname (same as headscale server_url).
+server:
+  host: "0.0.0.0"
+  port: 3000
+  # Public origin of Headplane WITHOUT the /admin dashboard prefix.
+  base_url: "https://vpn.example.org"
+  # Exactly 32 characters; bootstrap.sh generates the file mounted here.
+  cookie_secret_path: "/run/secrets/headplane_cookie_secret"
+  cookie_secure: true
+  cookie_max_age: 86400
+  data_path: "/var/lib/headplane"
+
+headscale:
+  # Internal address on the compose network (plain HTTP).
+  url: "http://headscale:8080"
+  public_url: "https://vpn.example.org"
+  # Mounted read-only: Headplane displays DNS settings but does not edit them.
+  config_path: "/etc/headscale/config.yaml"
+
+integration:
+  # Disabled on purpose, see compose.yaml (would require /var/run/docker.sock).
+  docker:
+    enabled: false
+  agent:
+    enabled: false
+
+# Admin login: open https://vpn.example.org/admin/login and paste a Headscale
+# API key made for yourself (NOT the key used by idoris-vpn-enroll):
+#   docker compose exec headscale headscale apikeys create --expiration 90d
+# Optional SSO instead of API-key login:
+# headscale:
+#   api_key_path: "/run/secrets/headscale_admin_apikey"   # required for OIDC
+# oidc:
+#   issuer: "https://sso.example.org"
+#   client_id: "headplane"
+#   client_secret_path: "/run/secrets/headplane_oidc_secret"

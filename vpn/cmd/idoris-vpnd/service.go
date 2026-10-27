@@ -1,0 +1,200 @@
+package main
+
+import (
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+)
+
+const launchdLabel = "ai.idoris.vpnd"
+
+func serviceCmd(args []string) error {
+	if len(args) < 1 {
+		return errors.New("service: expected install or uninstall")
+	}
+	fs := flag.NewFlagSet("service", flag.ContinueOnError)
+	configPath := fs.String("config", "", "JSON config file the service should load")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	switch args[0] {
+	case "install":
+		if *configPath == "" {
+			return errors.New("service install: --config is required")
+		}
+		abs, err := filepath.Abs(*configPath)
+		if err != nil {
+			return err
+		}
+		if _, err := os.Stat(abs); err != nil {
+			return fmt.Errorf("config: %w", err)
+		}
+		return installService(abs)
+	case "uninstall":
+		return uninstallService()
+	default:
+		return fmt.Errorf("service: unknown action %q", args[0])
+	}
+}
+
+func selfPath() (string, error) {
+	p, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(p)
+}
+
+func installService(configPath string) error {
+	exe, err := selfPath()
+	if err != nil {
+		return err
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		return installLaunchd(exe, configPath)
+	case "linux":
+		return installSystemdUser(exe, configPath)
+	default:
+		return fmt.Errorf("service install is not supported on %s; run `idoris-vpnd run` under your service manager", runtime.GOOS)
+	}
+}
+
+func uninstallService() error {
+	switch runtime.GOOS {
+	case "darwin":
+		p, err := launchdPlistPath()
+		if err != nil {
+			return err
+		}
+		_ = exec.Command("launchctl", "bootout", fmt.Sprintf("gui/%d/%s", os.Getuid(), launchdLabel)).Run()
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		fmt.Println("removed", p)
+		return nil
+	case "linux":
+		_ = exec.Command("systemctl", "--user", "disable", "--now", "idoris-vpnd.service").Run()
+		p, err := systemdUnitPath()
+		if err != nil {
+			return err
+		}
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		fmt.Println("removed", p)
+		return nil
+	default:
+		return fmt.Errorf("service uninstall is not supported on %s", runtime.GOOS)
+	}
+}
+
+func launchdPlistPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist"), nil
+}
+
+func plistEscape(s string) string {
+	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
+	return r.Replace(s)
+}
+
+func installLaunchd(exe, configPath string) error {
+	p, err := launchdPlistPath()
+	if err != nil {
+		return err
+	}
+	home, _ := os.UserHomeDir()
+	logDir := filepath.Join(home, "Library", "Logs", "iDoris")
+	if err := os.MkdirAll(logDir, 0o750); err != nil {
+		return err
+	}
+	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>%s</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>%s</string>
+    <string>run</string>
+    <string>--config</string>
+    <string>%s</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>%s/vpnd.log</string>
+  <key>StandardErrorPath</key><string>%s/vpnd.log</string>
+</dict>
+</plist>
+`, launchdLabel, plistEscape(exe), plistEscape(configPath), plistEscape(logDir), plistEscape(logDir))
+	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+		return err
+	}
+	if err := os.WriteFile(p, []byte(plist), 0o600); err != nil {
+		return err
+	}
+	target := fmt.Sprintf("gui/%d", os.Getuid())
+	_ = exec.Command("launchctl", "bootout", target+"/"+launchdLabel).Run()
+	if out, err := exec.Command("launchctl", "bootstrap", target, p).CombinedOutput(); err != nil {
+		return fmt.Errorf("launchctl bootstrap: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	fmt.Println("installed and started", launchdLabel, "from", p)
+	fmt.Println("logs:", filepath.Join(logDir, "vpnd.log"))
+	return nil
+}
+
+func systemdUnitPath() (string, error) {
+	base := os.Getenv("XDG_CONFIG_HOME")
+	if base == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		base = filepath.Join(home, ".config")
+	}
+	return filepath.Join(base, "systemd", "user", "idoris-vpnd.service"), nil
+}
+
+func installSystemdUser(exe, configPath string) error {
+	p, err := systemdUnitPath()
+	if err != nil {
+		return err
+	}
+	unit := fmt.Sprintf(`[Unit]
+Description=iDoris VPN membership daemon (Tailscale client -> iDoris Headscale)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%s run --config %s
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
+`, exe, configPath)
+	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+		return err
+	}
+	if err := os.WriteFile(p, []byte(unit), 0o600); err != nil {
+		return err
+	}
+	for _, a := range [][]string{{"daemon-reload"}, {"enable", "--now", "idoris-vpnd.service"}} {
+		if out, err := exec.Command("systemctl", append([]string{"--user"}, a...)...).CombinedOutput(); err != nil {
+			return fmt.Errorf("systemctl --user %s: %w: %s", strings.Join(a, " "), err, strings.TrimSpace(string(out)))
+		}
+	}
+	fmt.Println("installed and started idoris-vpnd.service from", p)
+	return nil
+}

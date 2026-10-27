@@ -1,0 +1,5 @@
+# BuildKit uses <Dockerfile>.dockerignore for the ../../vpn context.
+bin
+integration
+.git
+**/*_test.go
