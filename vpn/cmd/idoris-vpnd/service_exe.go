@@ -42,7 +42,7 @@ func copyProtectedExecutable(src, destDir, dest string) error {
 	if !st.Mode().IsRegular() {
 		return fmt.Errorf("service: executable %s is not a regular file", src)
 	}
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
+	if err := os.MkdirAll(destDir, 0o755); err != nil { //nolint:gosec // G301: installed library directory is mode 0755
 		return err
 	}
 	// The directory is a standard library location. 0755 lets the service
@@ -68,7 +68,7 @@ func copyProtectedExecutable(src, destDir, dest string) error {
 	ok := false
 	defer func() {
 		if !ok {
-			_ = os.Remove(tmpName)
+			_ = os.Remove(tmpName) //nolint:gosec // G703: temp file is created in the install directory
 		}
 	}()
 	if _, err := io.Copy(tmp, in); err != nil {
@@ -86,7 +86,7 @@ func copyProtectedExecutable(src, destDir, dest string) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpName, dest); err != nil {
+	if err := os.Rename(tmpName, dest); err != nil { //nolint:gosec // G703: dest is the protected install path
 		return err
 	}
 	ok = true
@@ -94,7 +94,7 @@ func copyProtectedExecutable(src, destDir, dest string) error {
 }
 
 func removeProtectedExecutable(dest string) error {
-	err := os.Remove(dest)
+	err := os.Remove(dest) //nolint:gosec // G703: dest is the protected install path
 	if err == nil || os.IsNotExist(err) {
 		return nil
 	}

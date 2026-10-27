@@ -61,7 +61,7 @@ func SaveFile(path string, cfg *Config) error {
 }
 
 func writeAtomic(path string, data []byte) error {
-	st, err := os.Stat(path)
+	st, err := os.Stat(path) //nolint:gosec // G703: path is the operator-chosen enroll config
 	if err != nil {
 		return err
 	}
@@ -74,7 +74,7 @@ func writeAtomic(path string, data []byte) error {
 	ok := false
 	defer func() {
 		if !ok {
-			_ = os.Remove(tmp)
+			_ = os.Remove(tmp) //nolint:gosec // G703: temp file sits beside the operator-chosen enroll config
 		}
 	}()
 	if _, err := f.Write(data); err != nil {
@@ -88,7 +88,7 @@ func writeAtomic(path string, data []byte) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := os.Rename(tmp, path); err != nil { //nolint:gosec // G703: path is the operator-chosen enroll config
 		return err
 	}
 	ok = true

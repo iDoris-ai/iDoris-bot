@@ -15,5 +15,5 @@ func requireRoot() error {
 }
 
 func chownSystemRootImpl(path string) error {
-	return os.Chown(path, 0, 0)
+	return os.Chown(path, 0, 0) //nolint:gosec // G703: path is an install directory or the protected executable
 }

@@ -192,7 +192,7 @@ func copyCredentialFile(src, dest string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(dest, b, 0o600); err != nil {
+	if err := os.WriteFile(dest, b, 0o600); err != nil { //nolint:gosec // G703: dest is the install copy of an operator credential file
 		return err
 	}
 	return os.Chmod(dest, 0o600) //nolint:gosec // credential copy is mode 0600 before the ACL is applied

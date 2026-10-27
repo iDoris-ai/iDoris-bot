@@ -369,7 +369,9 @@ func TestR2GNoisySourceDoesNotStarve(t *testing.T) {
 	if call("198.51.100.1:1") != http.StatusOK {
 		t.Fatal("first request from the noisy source")
 	}
-	if call("198.51.100.1:1") != http.StatusTooManyRequests || call("198.51.100.1:1") != http.StatusTooManyRequests {
+	firstReject := call("198.51.100.1:1")
+	secondReject := call("198.51.100.1:1")
+	if firstReject != http.StatusTooManyRequests || secondReject != http.StatusTooManyRequests {
 		t.Fatal("noisy source should be rejected by its own bucket")
 	}
 	if call("198.51.100.2:1") != http.StatusOK {
