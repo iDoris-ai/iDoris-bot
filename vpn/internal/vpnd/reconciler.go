@@ -68,6 +68,11 @@ type Options struct {
 	// re-applied with EditPrefs while Running if the node has drifted.
 	// Empty means "do not manage routes".
 	AdvertiseRoutes []netip.Prefix
+	// RunSSH is Tailscale SSH (prefs.RunSSH). Nil means unmanaged: login and
+	// the running reconcile leave whatever the profile already has. An ACL
+	// entry for tcp/22 does not enable Tailscale SSH; the Local AI host sets
+	// this explicitly when it should run the SSH server.
+	RunSSH *bool
 	// Takeover allows switching away from a foreign tailnet in any backend
 	// state that still holds that login: Running, Starting, Stopped, and
 	// NeedsLogin with a non-empty foreign control URL. When false the daemon
@@ -292,14 +297,14 @@ func (r *Reconciler) Step(ctx context.Context) (Snapshot, error) {
 
 	switch state {
 	case ipn.Running.String():
-		if snap, err, handled := r.settleIdentity(ctx); handled {
+		if snap, err, handled := r.settleIdentity(ctx, prefs); handled {
 			return snap, err
 		}
 		r.loginStarted = time.Time{}
 		r.needsLoginSince = time.Time{}
 		r.unconverged = 0
-		if err := r.reconcileRoutes(ctx, prefs); err != nil {
-			return r.fail(fmt.Errorf("advertise routes: %w", err)), err
+		if err := r.reconcileManaged(ctx, prefs); err != nil {
+			return r.fail(fmt.Errorf("managed prefs: %w", err)), err
 		}
 		return r.set(func(s *Snapshot) {
 			fillSelf(s, st)
@@ -312,7 +317,7 @@ func (r *Reconciler) Step(ctx context.Context) (Snapshot, error) {
 		}), nil
 	case ipn.Starting.String():
 		if r.needsLoginWhileStarting(st) {
-			return r.login(ctx, "starting-without-node")
+			return r.login(ctx, "starting-without-node", prefs)
 		}
 		return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil
 	case ipn.NeedsMachineAuth.String():
@@ -329,7 +334,7 @@ func (r *Reconciler) Step(ctx context.Context) (Snapshot, error) {
 		if persistedIdentity(st, prefs) && !r.persistedLoginDue() {
 			return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil
 		}
-		return r.login(ctx, "needs-login")
+		return r.login(ctx, "needs-login", prefs)
 	default:
 		return r.set(func(s *Snapshot) { s.Phase = PhaseUnknown }), nil
 	}
@@ -398,10 +403,16 @@ func (r *Reconciler) stepForeign(ctx context.Context, st *ipnstate.Status, prefs
 	if err := r.be.SwitchToEmptyProfile(ctx); err != nil {
 		return r.fail(fmt.Errorf("switch to empty profile: %w", err)), err
 	}
-	return r.login(ctx, "foreign-or-empty-profile")
+	// The empty profile's prefs are the base. The foreign profile's SSH and
+	// routes must not be copied onto the iDoris login.
+	base, err := r.be.GetPrefs(ctx)
+	if err != nil {
+		return r.fail(fmt.Errorf("get prefs: %w", err)), err
+	}
+	return r.login(ctx, "foreign-or-empty-profile", base)
 }
 
-func (r *Reconciler) login(ctx context.Context, reason string) (Snapshot, error) {
+func (r *Reconciler) login(ctx context.Context, reason string, base *ipn.Prefs) (Snapshot, error) {
 	r.mu.Lock()
 	r.attempts++
 	r.mu.Unlock()
@@ -410,19 +421,9 @@ func (r *Reconciler) login(ctx context.Context, reason string) (Snapshot, error)
 	if err != nil {
 		return r.fail(fmt.Errorf("obtain auth key: %w", err)), err
 	}
-	prefs := ipn.NewPrefs()
-	prefs.ControlURL = r.opt.ControlURL
-	prefs.WantRunning = true
-	prefs.LoggedOut = false
-	prefs.CorpDNS = r.opt.AcceptDNS
-	prefs.RouteAll = r.opt.AcceptRoutes
-	prefs.Hostname = r.opt.Hostname
-	// Leave AdvertiseTags unset. See Options.AdvertiseTags.
+	prefs := r.managedPrefs(base)
 	if len(r.opt.AdvertiseTags) > 0 {
 		r.log.Info("not sending advertise tags; the pre-auth key's acl tags are applied by Headscale")
-	}
-	if len(r.opt.AdvertiseRoutes) > 0 {
-		prefs.AdvertiseRoutes = append([]netip.Prefix(nil), r.opt.AdvertiseRoutes...)
 	}
 	if err := r.be.CheckPrefs(ctx, prefs); err != nil {
 		return r.fail(fmt.Errorf("check prefs: %w", err)), err
@@ -451,7 +452,7 @@ func (r *Reconciler) login(ctx context.Context, reason string) (Snapshot, error)
 // login uses this same profile (the control URL is already ours), which is
 // allowed. The binding is rewritten only after that login call returns.
 // handled is true when the caller should return snap and err as the step result.
-func (r *Reconciler) settleIdentity(ctx context.Context) (Snapshot, error, bool) {
+func (r *Reconciler) settleIdentity(ctx context.Context, prefs *ipn.Prefs) (Snapshot, error, bool) {
 	if r.shouldReenrollIdentity() {
 		bound := r.opt.State.Get()
 		r.awaitingIdentity = true
@@ -459,7 +460,7 @@ func (r *Reconciler) settleIdentity(ctx context.Context) (Snapshot, error, bool)
 		r.log.Warn("bound enrollment identity differs from the configured credential; re-enrolling",
 			"bound_tenant", bound.Tenant, "bound_role", bound.Role,
 			"want_tenant", r.opt.Identity.Tenant, "want_role", r.opt.Identity.Role)
-		snap, err := r.login(ctx, "identity-mismatch")
+		snap, err := r.login(ctx, "identity-mismatch", prefs)
 		return snap, err, true
 	}
 	if r.awaitingIdentity {
@@ -467,7 +468,7 @@ func (r *Reconciler) settleIdentity(ctx context.Context) (Snapshot, error, bool)
 			if r.recentLogin() {
 				return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil, true
 			}
-			snap, err := r.login(ctx, "identity-mismatch")
+			snap, err := r.login(ctx, "identity-mismatch", prefs)
 			return snap, err, true
 		}
 		if err := r.writeIdentity(); err != nil {
@@ -566,25 +567,72 @@ func (r *Reconciler) needsLoginWhileStarting(st *ipnstate.Status) bool {
 	return true
 }
 
-// reconcileRoutes pushes AdvertiseRoutes when the running prefs differ.
-// Headscale still has to approve the routes; this only tells the client to
-// advertise them.
-func (r *Reconciler) reconcileRoutes(ctx context.Context, prefs *ipn.Prefs) error {
-	if len(r.opt.AdvertiseRoutes) == 0 {
+// managedPrefs starts from the profile's current prefs and overwrites only
+// the fields this daemon owns. Start(UpdatePrefs) replaces the whole prefs
+// struct, so building a fresh NewPrefs() would clear manually enabled SSH
+// and routes. AdvertiseTags is always cleared: Headscale v0.29.6 rejects a
+// pre-auth key registration that also requests tags.
+func (r *Reconciler) managedPrefs(base *ipn.Prefs) *ipn.Prefs {
+	var p ipn.Prefs
+	if base != nil {
+		if c := base.Clone(); c != nil {
+			p = *c
+		}
+	} else {
+		p = *ipn.NewPrefs()
+	}
+	p.AdvertiseTags = nil
+	p.ControlURL = r.opt.ControlURL
+	p.WantRunning = true
+	p.LoggedOut = false
+	p.CorpDNS = r.opt.AcceptDNS
+	p.RouteAll = r.opt.AcceptRoutes
+	if h := strings.TrimSpace(r.opt.Hostname); h != "" {
+		p.Hostname = h
+	}
+	if len(r.opt.AdvertiseRoutes) > 0 {
+		p.AdvertiseRoutes = append([]netip.Prefix(nil), r.opt.AdvertiseRoutes...)
+	}
+	if r.opt.RunSSH != nil {
+		p.RunSSH = *r.opt.RunSSH
+	}
+	return &p
+}
+
+// reconcileManaged pushes managed fields that have drifted while the node is
+// already Running. Unset ssh and an empty advertise_routes list are not
+// managed, so a manual `tailscale set --ssh` or a manual route survives.
+func (r *Reconciler) reconcileManaged(ctx context.Context, prefs *ipn.Prefs) error {
+	if prefs == nil {
 		return nil
 	}
-	if sameRoutes(prefs.AdvertiseRoutes, r.opt.AdvertiseRoutes) {
+	mp := &ipn.MaskedPrefs{}
+	if prefs.RouteAll != r.opt.AcceptRoutes {
+		mp.RouteAll = r.opt.AcceptRoutes
+		mp.RouteAllSet = true
+	}
+	if prefs.CorpDNS != r.opt.AcceptDNS {
+		mp.CorpDNS = r.opt.AcceptDNS
+		mp.CorpDNSSet = true
+	}
+	if h := strings.TrimSpace(r.opt.Hostname); h != "" && prefs.Hostname != h {
+		mp.Hostname = h
+		mp.HostnameSet = true
+	}
+	if r.opt.RunSSH != nil && prefs.RunSSH != *r.opt.RunSSH {
+		mp.RunSSH = *r.opt.RunSSH
+		mp.RunSSHSet = true
+	}
+	if len(r.opt.AdvertiseRoutes) > 0 && !sameRoutes(prefs.AdvertiseRoutes, r.opt.AdvertiseRoutes) {
+		mp.AdvertiseRoutes = append([]netip.Prefix(nil), r.opt.AdvertiseRoutes...)
+		mp.AdvertiseRoutesSet = true
+	}
+	if !mp.RouteAllSet && !mp.CorpDNSSet && !mp.HostnameSet && !mp.RunSSHSet && !mp.AdvertiseRoutesSet {
 		return nil
 	}
-	r.log.Info("updating advertised routes", "have", prefs.AdvertiseRoutes, "want", r.opt.AdvertiseRoutes)
-	_, err := r.be.EditPrefs(ctx, &ipn.MaskedPrefs{
-		Prefs:              ipn.Prefs{AdvertiseRoutes: append([]netip.Prefix(nil), r.opt.AdvertiseRoutes...)},
-		AdvertiseRoutesSet: true,
-	})
-	if err != nil {
-		return err
-	}
-	return nil
+	r.log.Info("updating managed preferences")
+	_, err := r.be.EditPrefs(ctx, mp)
+	return err
 }
 
 func sameRoutes(a, b []netip.Prefix) bool {
