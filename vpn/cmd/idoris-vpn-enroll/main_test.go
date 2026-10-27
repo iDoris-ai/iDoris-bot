@@ -427,6 +427,43 @@ func TestReloadFromDiskRotatesHeadscaleAPIKey(t *testing.T) {
 	assertLogHasNoKey(t, text, oldKey, newKey, badKey)
 }
 
+func TestR2GRevokeAllowEmptyCLI(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "enroll.json")
+	hash := enroll.HashToken("seed-token")
+	body := `{
+  "control_url": "https://vpn.example.org",
+  "tenants": [{
+    "name": "acme",
+    "headscale_user_id": "1",
+    "token_hashes": ["` + hash + `"]
+  }]
+}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var denied bytes.Buffer
+	err := revokeCmd([]string{"--config", path, "--entry", "acme", "--hash-prefix", hash[:8]}, &denied)
+	if err == nil || !strings.Contains(err.Error(), "refusing to remove the last token hash") {
+		t.Fatalf("without flag: %v", err)
+	}
+	var out bytes.Buffer
+	if err := revokeCmd([]string{"--config", path, "--entry", "acme", "--hash-prefix", hash[:8], "--allow-empty"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	want := "revoked acme - " + enroll.HashPrefix(hash)
+	if !strings.Contains(out.String(), want) || strings.Contains(out.String(), hash) {
+		t.Fatalf("stdout %q", out.String())
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Tenants) != 1 || len(cfg.Tenants[0].TokenHashes) != 0 {
+		t.Fatalf("hashes %+v", cfg.Tenants[0].TokenHashes)
+	}
+}
+
 func assertLogHasNoKey(t *testing.T, text string, keys ...string) {
 	t.Helper()
 	for _, k := range keys {
