@@ -56,6 +56,26 @@ func TestTakeoverFlagAndEmbeddedRoutes(t *testing.T) {
 	}
 }
 
+func TestAcceptDNSAndAdvertiseTagsFlags(t *testing.T) {
+	t.Setenv("IDORIS_VPN_AUTH_KEY", "k")
+	t.Setenv("IDORIS_VPN_CONTROL_URL", "https://vpn.example")
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	cfg, err := loadConfig([]string{"--accept-dns", "false", "--advertise-tags", "tag:a, tag:b", "--mode", "system"}, fs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AcceptDNS == nil || *cfg.AcceptDNS {
+		t.Fatalf("accept_dns %+v", cfg.AcceptDNS)
+	}
+	if len(cfg.AdvertiseTags) != 2 || cfg.AdvertiseTags[1] != "tag:b" {
+		t.Fatalf("tags %+v", cfg.AdvertiseTags)
+	}
+	fs = flag.NewFlagSet("run", flag.ContinueOnError)
+	if _, err := loadConfig([]string{"--accept-dns", "maybe"}, fs); err == nil || !strings.Contains(err.Error(), "accept-dns") {
+		t.Fatalf("%v", err)
+	}
+}
+
 func TestTakeoverAndNoTakeoverExclusive(t *testing.T) {
 	t.Setenv("IDORIS_VPN_AUTH_KEY", "k")
 	t.Setenv("IDORIS_VPN_CONTROL_URL", "https://vpn.example")
