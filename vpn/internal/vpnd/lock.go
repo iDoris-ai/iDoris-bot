@@ -152,3 +152,32 @@ func canonicalSocket(socketPath string) (string, error) {
 func isPipePath(path string) bool {
 	return strings.HasPrefix(path, `\\`) || strings.HasPrefix(strings.ToLower(path), `//./pipe/`)
 }
+
+// statusLockPath is the flock held for the whole life of one status socket.
+// The hash is prefixed so it cannot collide with the controller lock of a
+// LocalAPI socket that happens to use the same path. It lives in the same
+// per-user cache directory as the controller lock and is not that lock:
+// a root service and a user daemon still do not share it.
+func statusLockPath(addr string) (string, error) {
+	dir, err := systemLockDir()
+	if err != nil {
+		return "", err
+	}
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", fmt.Errorf("status lock: listen path is empty")
+	}
+	canon := addr
+	if !isPipePath(addr) {
+		if !filepath.IsAbs(addr) {
+			abs, err := filepath.Abs(addr)
+			if err != nil {
+				return "", err
+			}
+			canon = abs
+		}
+		canon = canonicalizePath(canon)
+	}
+	sum := sha256.Sum256([]byte("status\x00" + canon))
+	return filepath.Join(dir, hex.EncodeToString(sum[:])+".lock"), nil
+}
