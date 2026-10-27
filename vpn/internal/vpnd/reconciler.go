@@ -220,11 +220,25 @@ func New(be Backend, keys KeySource, opt Options, log *slog.Logger) (*Reconciler
 	return &Reconciler{be: be, keys: keys, opt: opt, log: log, now: time.Now, snap: snap}, nil
 }
 
-// Snapshot returns the latest observed state.
+// Snapshot returns the latest observed state. Slices are copied under the
+// lock so a caller can keep the result while the next Step reuses the
+// reconciler's backing arrays.
 func (r *Reconciler) Snapshot() Snapshot {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.snap
+	return cloneSnapshot(r.snap)
+}
+
+func cloneSnapshot(s Snapshot) Snapshot {
+	s.TailnetIPs = append([]string(nil), s.TailnetIPs...)
+	s.Forwards = append([]ForwardStatus(nil), s.Forwards...)
+	s.Routes = append([]RouteReport(nil), s.Routes...)
+	s.Warnings = append([]string(nil), s.Warnings...)
+	if s.SOCKS5 != nil {
+		socks := *s.SOCKS5
+		s.SOCKS5 = &socks
+	}
+	return s
 }
 
 func (r *Reconciler) set(mutate func(s *Snapshot)) Snapshot {
