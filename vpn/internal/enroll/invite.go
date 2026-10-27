@@ -101,49 +101,50 @@ func writeAtomic(path string, data []byte) error {
 // The plaintext token exists only inside the code. The caller prints the code
 // once and does not log it.
 func Invite(path, entry, hostnameHint, enrollURL, label string, allowInsecure bool) (string, error) {
-	cfg, err := LoadFile(path)
-	if err != nil {
-		return "", err
-	}
-	idx := entryIndex(cfg, entry)
-	if idx < 0 {
-		return "", fmt.Errorf("enroll: unknown entry %q", entry)
-	}
-	token, hash, err := distinctToken(cfg)
-	if err != nil {
-		return "", err
-	}
-	chosen, err := chooseLabel(label, hostnameHint, hash)
-	if err != nil {
-		return "", err
-	}
-	for _, c := range cfg.Tenants[idx].Credentials {
-		if c.Label != "" && c.Label == chosen {
-			return "", fmt.Errorf("enroll: label %q already exists in %q", chosen, entry)
+	var code string
+	err := updateConfig(path, func(cfg *Config) error {
+		idx := entryIndex(cfg, entry)
+		if idx < 0 {
+			return fmt.Errorf("enroll: unknown entry %q", entry)
 		}
-	}
-	role := cfg.Tenants[idx].Role
-	if role == "" {
-		role = join.RoleMember
-	}
-	code, err := join.Encode(join.Payload{
-		V:            join.Version,
-		EnrollURL:    enrollURL,
-		Token:        token,
-		Role:         role,
-		Tenant:       cfg.Tenants[idx].Name,
-		HostnameHint: hostnameHint,
-	}, join.Options{AllowInsecure: allowInsecure})
-	if err != nil {
-		return "", err
-	}
-	cfg.Tenants[idx].Credentials = append(cfg.Tenants[idx].Credentials, Credential{
-		Hash:      hash,
-		Label:     chosen,
-		CreatedAt: time.Now().UTC().Truncate(time.Second),
+		token, hash, err := distinctToken(cfg)
+		if err != nil {
+			return err
+		}
+		chosen, err := chooseLabel(label, hostnameHint, hash)
+		if err != nil {
+			return err
+		}
+		for _, c := range cfg.Tenants[idx].Credentials {
+			if c.Label != "" && c.Label == chosen {
+				return fmt.Errorf("enroll: label %q already exists in %q", chosen, entry)
+			}
+		}
+		role := cfg.Tenants[idx].Role
+		if role == "" {
+			role = join.RoleMember
+		}
+		encoded, err := join.Encode(join.Payload{
+			V:            join.Version,
+			EnrollURL:    enrollURL,
+			Token:        token,
+			Role:         role,
+			Tenant:       cfg.Tenants[idx].Name,
+			HostnameHint: hostnameHint,
+		}, join.Options{AllowInsecure: allowInsecure})
+		if err != nil {
+			return err
+		}
+		cfg.Tenants[idx].Credentials = append(cfg.Tenants[idx].Credentials, Credential{
+			Hash:      hash,
+			Label:     chosen,
+			CreatedAt: time.Now().UTC().Truncate(time.Second),
+		})
+		cfg.Tenants[idx].TokenHashes = append(cfg.Tenants[idx].TokenHashes, hash)
+		code = encoded
+		return nil
 	})
-	cfg.Tenants[idx].TokenHashes = append(cfg.Tenants[idx].TokenHashes, hash)
-	if err := SaveFile(path, cfg); err != nil {
+	if err != nil {
 		return "", err
 	}
 	return code, nil
@@ -164,57 +165,57 @@ func RemoveCredential(path, entry string, m CredentialMatch) (Credential, error)
 	if byLabel == byPrefix {
 		return Credential{}, errors.New("enroll: provide exactly one of label or hash prefix")
 	}
-	cfg, err := LoadFile(path)
+	var removed Credential
+	err := updateConfig(path, func(cfg *Config) error {
+		idx := entryIndex(cfg, entry)
+		if idx < 0 {
+			return fmt.Errorf("enroll: unknown entry %q", entry)
+		}
+		creds := cfg.Tenants[idx].Credentials
+		match := -1
+		if byLabel {
+			label := strings.TrimSpace(m.Label)
+			if !validLabel(label) {
+				return fmt.Errorf("enroll: label %q is invalid", m.Label)
+			}
+			for i, c := range creds {
+				if c.Label == label {
+					if match >= 0 {
+						return fmt.Errorf("enroll: label %q matches more than one token", label)
+					}
+					match = i
+				}
+			}
+			if match < 0 {
+				return fmt.Errorf("enroll: label %q matches no token in %q", label, entry)
+			}
+		} else {
+			prefix, err := normalizeHashPrefix(m.HashPrefix)
+			if err != nil {
+				return err
+			}
+			for i, c := range creds {
+				if strings.HasPrefix(strings.ToLower(c.Hash), prefix) {
+					if match >= 0 {
+						return fmt.Errorf("enroll: hash prefix %s matches more than one token", prefix)
+					}
+					match = i
+				}
+			}
+			if match < 0 {
+				return fmt.Errorf("enroll: hash prefix %s matches no token in %q", prefix, entry)
+			}
+		}
+		if len(creds) == 1 {
+			return errors.New("enroll: refusing to remove the last token hash")
+		}
+		removed = creds[match]
+		cfg.Tenants[idx].Credentials = append(creds[:match], creds[match+1:]...)
+		hashes := cfg.Tenants[idx].TokenHashes
+		cfg.Tenants[idx].TokenHashes = append(hashes[:match], hashes[match+1:]...)
+		return nil
+	})
 	if err != nil {
-		return Credential{}, err
-	}
-	idx := entryIndex(cfg, entry)
-	if idx < 0 {
-		return Credential{}, fmt.Errorf("enroll: unknown entry %q", entry)
-	}
-	creds := cfg.Tenants[idx].Credentials
-	match := -1
-	if byLabel {
-		label := strings.TrimSpace(m.Label)
-		if !validLabel(label) {
-			return Credential{}, fmt.Errorf("enroll: label %q is invalid", m.Label)
-		}
-		for i, c := range creds {
-			if c.Label == label {
-				if match >= 0 {
-					return Credential{}, fmt.Errorf("enroll: label %q matches more than one token", label)
-				}
-				match = i
-			}
-		}
-		if match < 0 {
-			return Credential{}, fmt.Errorf("enroll: label %q matches no token in %q", label, entry)
-		}
-	} else {
-		prefix, err := normalizeHashPrefix(m.HashPrefix)
-		if err != nil {
-			return Credential{}, err
-		}
-		for i, c := range creds {
-			if strings.HasPrefix(strings.ToLower(c.Hash), prefix) {
-				if match >= 0 {
-					return Credential{}, fmt.Errorf("enroll: hash prefix %s matches more than one token", prefix)
-				}
-				match = i
-			}
-		}
-		if match < 0 {
-			return Credential{}, fmt.Errorf("enroll: hash prefix %s matches no token in %q", prefix, entry)
-		}
-	}
-	if len(creds) == 1 {
-		return Credential{}, errors.New("enroll: refusing to remove the last token hash")
-	}
-	removed := creds[match]
-	cfg.Tenants[idx].Credentials = append(creds[:match], creds[match+1:]...)
-	hashes := cfg.Tenants[idx].TokenHashes
-	cfg.Tenants[idx].TokenHashes = append(hashes[:match], hashes[match+1:]...)
-	if err := SaveFile(path, cfg); err != nil {
 		return Credential{}, err
 	}
 	return removed, nil
@@ -223,15 +224,23 @@ func RemoveCredential(path, entry string, m CredentialMatch) (Credential, error)
 // ListCredentials returns the credentials of one entry. The token plaintext
 // is not in the result. Callers that print this must use HashPrefix.
 func ListCredentials(path, entry string) ([]Credential, error) {
-	cfg, err := LoadFile(path)
+	var out []Credential
+	err := withConfigLock(path, func() error {
+		cfg, err := LoadFile(path)
+		if err != nil {
+			return err
+		}
+		idx := entryIndex(cfg, entry)
+		if idx < 0 {
+			return fmt.Errorf("enroll: unknown entry %q", entry)
+		}
+		out = append([]Credential(nil), cfg.Tenants[idx].Credentials...)
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	idx := entryIndex(cfg, entry)
-	if idx < 0 {
-		return nil, fmt.Errorf("enroll: unknown entry %q", entry)
-	}
-	return append([]Credential(nil), cfg.Tenants[idx].Credentials...), nil
+	return out, nil
 }
 
 // Revoke removes the single token hash in entry that starts with prefix.
