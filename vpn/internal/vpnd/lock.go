@@ -3,6 +3,7 @@ package vpnd
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -46,10 +47,13 @@ func (l *ControllerLock) Release() error {
 
 // LockSystem locks the system tailscaled this daemon will drive.
 // The lock file is named by the canonical LocalAPI socket and lives in
-// os.UserCacheDir()/idoris/locks, so XDG_STATE_HOME and an explicit spelling
+// $STATE_DIRECTORY/locks when that variable is set, otherwise
+// os.UserCacheDir()/idoris/locks. XDG_STATE_HOME and an explicit spelling
 // of the default socket do not create a second lock. Two OS users still have
-// two cache directories: a root system service and a user daemon do not
-// exclude each other.
+// two directories when STATE_DIRECTORY is unset: a root system service and a
+// user daemon do not exclude each other. A machine service sets
+// STATE_DIRECTORY, so a second root process started with that same value
+// does.
 func LockSystem(socketPath string) (*ControllerLock, error) {
 	path, err := systemLockPath(socketPath)
 	if err != nil {
@@ -80,11 +84,21 @@ func LockEmbedded(stateDir string) (*ControllerLock, error) {
 }
 
 func systemLockDir() (string, error) {
-	cache, err := os.UserCacheDir()
-	if err != nil || cache == "" {
-		return "", fmt.Errorf("controller lock directory: %w", err)
+	var dir string
+	if sd, err := serviceStateDir(); err != nil {
+		return "", err
+	} else if sd != "" {
+		dir = filepath.Join(sd, "locks")
+	} else {
+		cache, err := os.UserCacheDir()
+		if err != nil || cache == "" {
+			if err == nil {
+				err = errors.New("cache directory is not set")
+			}
+			return "", fmt.Errorf("controller lock directory: set STATE_DIRECTORY or HOME: %w", err)
+		}
+		dir = filepath.Join(cache, "idoris", "locks")
 	}
-	dir := filepath.Join(cache, "idoris", "locks")
 	if err := fsutil.EnsurePrivateDir(dir); err != nil {
 		return "", err
 	}
@@ -156,8 +170,8 @@ func isPipePath(path string) bool {
 // statusLockPath is the flock held for the whole life of one status socket.
 // The hash is prefixed so it cannot collide with the controller lock of a
 // LocalAPI socket that happens to use the same path. It lives in the same
-// per-user cache directory as the controller lock and is not that lock:
-// a root service and a user daemon still do not share it.
+// directory as the controller lock (STATE_DIRECTORY/locks, or the per-user
+// cache) and is not that lock.
 func statusLockPath(addr string) (string, error) {
 	dir, err := systemLockDir()
 	if err != nil {

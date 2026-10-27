@@ -102,8 +102,8 @@ func bindCommon(fs *flag.FlagSet, cfg *vpnd.Config, configPath *string) {
 	fs.StringVar(&cfg.LogLevel, "log-level", "", "debug|info|warn|error")
 	fs.StringVar(&cfg.Mode, "mode", "", "auto|system|embedded (default auto)")
 	fs.StringVar(&cfg.Role, "role", "", "member|local-ai|gateway|admin (default member; discovery wins when it returns a role)")
-	fs.StringVar(&cfg.StateDir, "state-dir", "", "embedded node state directory (default ~/.idoris/vpn-state)")
-	fs.StringVar(&cfg.StateFile, "state-file", "", "identity binding file (default ~/.idoris/vpnd-state.json)")
+	fs.StringVar(&cfg.StateDir, "state-dir", "", "embedded node state directory (default $STATE_DIRECTORY/node, else ~/.idoris/vpn-state)")
+	fs.StringVar(&cfg.StateFile, "state-file", "", "identity binding file (default $STATE_DIRECTORY/vpnd-state.json, else ~/.idoris/vpnd-state.json)")
 	fs.StringVar(&cfg.SOCKS5Listen, "socks5-listen", "", "loopback or unix: SOCKS5 address into the tailnet")
 	fs.StringVar(&cfg.SOCKS5AuthFile, "socks5-auth-file", "", "0600 file containing one SOCKS5 user:password line")
 	fs.BoolVar(&cfg.SOCKS5AllowAnonymous, "socks5-allow-anonymous", false, "allow unauthenticated SOCKS5 (off by default)")
@@ -490,13 +490,9 @@ func prepareKeys(cfg *vpnd.Config, log *slog.Logger) (vpnd.KeySource, string, vp
 }
 
 func openBinding(cfg *vpnd.Config) (*vpnd.StateFile, error) {
-	path := cfg.StateFile
-	if path == "" {
-		var err error
-		path, err = vpnd.DefaultStateFile()
-		if err != nil {
-			return nil, err
-		}
+	path, err := vpnd.ResolveStateFile(cfg.StateFile)
+	if err != nil {
+		return nil, err
 	}
 	return vpnd.OpenState(path)
 }
@@ -545,13 +541,9 @@ func accessOptions(cfg *vpnd.Config, mode, ourControl string, src vpnd.StatusSou
 	// gets a generated credential under the state directory. Passing StateDir
 	// together with AllowAnonymous would create a file instead.
 	if cfg.SOCKS5Listen != "" && cfg.SOCKS5AuthFile == "" && !cfg.SOCKS5AllowAnonymous {
-		dir := cfg.StateDir
-		if dir == "" {
-			var err error
-			dir, err = vpnd.DefaultStateDir()
-			if err != nil {
-				return vpnd.AccessOptions{}, err
-			}
+		dir, err := vpnd.ResolveStateDir(cfg.StateDir)
+		if err != nil {
+			return vpnd.AccessOptions{}, err
 		}
 		opt.StateDir = dir
 	}
@@ -707,12 +699,9 @@ func openNode(ctx context.Context, cfg *vpnd.Config, controlURL string, log *slo
 		return nil, err
 	}
 	if d.Mode == vpnd.ModeEmbedded {
-		dir := cfg.StateDir
-		if dir == "" {
-			dir, err = vpnd.DefaultStateDir()
-			if err != nil {
-				return nil, err
-			}
+		dir, err := vpnd.ResolveStateDir(cfg.StateDir)
+		if err != nil {
+			return nil, err
 		}
 		loginNow, recover, merr := vpnd.EmbeddedLoginMode(dir)
 		if merr != nil {

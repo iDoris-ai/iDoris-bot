@@ -55,13 +55,25 @@ func TokenFingerprint(token string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-// DefaultStateFile is the binding file. Windows uses %AppData%/idoris.
-// Elsewhere $XDG_STATE_HOME/idoris wins, then ~/.idoris.
+// DefaultStateFile is the binding file.
+// Order: $STATE_DIRECTORY/vpnd-state.json (machine service; the first
+// absolute entry of a colon-separated list), then on Windows
+// %AppData%/idoris, otherwise $XDG_STATE_HOME/idoris, then ~/.idoris.
+// A set but unusable STATE_DIRECTORY is an error. HOME is not consulted
+// on that path.
 func DefaultStateFile() (string, error) {
+	if dir, err := serviceStateDir(); err != nil {
+		return "", err
+	} else if dir != "" {
+		return filepath.Join(dir, "vpnd-state.json"), nil
+	}
 	if runtime.GOOS == "windows" {
 		dir, err := os.UserConfigDir()
 		if err != nil || dir == "" {
-			return "", fmt.Errorf("state file: config directory: %w", err)
+			if err == nil {
+				err = errors.New("config directory is not set")
+			}
+			return "", fmt.Errorf("state file: set STATE_DIRECTORY: %w", err)
 		}
 		return filepath.Join(dir, "idoris", "vpnd-state.json"), nil
 	}
@@ -70,7 +82,10 @@ func DefaultStateFile() (string, error) {
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
-		return "", fmt.Errorf("state file: home directory: %w", err)
+		if err == nil {
+			err = errors.New("HOME is not defined")
+		}
+		return "", fmt.Errorf("state file: set STATE_DIRECTORY or HOME: %w", err)
 	}
 	return filepath.Join(home, ".idoris", "vpnd-state.json"), nil
 }

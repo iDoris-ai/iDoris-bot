@@ -57,7 +57,8 @@ type Config struct {
 	// returns a role.
 	Role string `json:"role,omitempty"`
 	// StateDir is the embedded node's private state directory (0700). Empty
-	// uses ~/.idoris/vpn-state.
+	// uses $STATE_DIRECTORY/node when that variable is set, otherwise
+	// ~/.idoris/vpn-state.
 	StateDir string `json:"state_dir,omitempty"`
 	// StateFile is the identity binding (control URL, tenant, role, token
 	// fingerprint). Empty uses DefaultStateFile. Never stores the token.
@@ -91,19 +92,27 @@ type Config struct {
 	LogLevel string `json:"log_level,omitempty"`
 }
 
-// DefaultListen is the per-user status socket location.
+// DefaultListen is the status socket location.
+// Windows stays on a loopback TCP port. Elsewhere $XDG_RUNTIME_DIR/vpnd.sock
+// wins (the system unit sets XDG_RUNTIME_DIR=/run/idoris, which does not need
+// HOME). Then $STATE_DIRECTORY/vpnd.sock for a machine service that has no
+// runtime directory. Then the per-user socket under ~/.idoris.
 func DefaultListen() string {
 	if runtime.GOOS == "windows" {
 		return "tcp:127.0.0.1:7845"
 	}
-	base := os.Getenv("XDG_RUNTIME_DIR")
-	if base == "" {
-		home, err := os.UserHomeDir()
-		if err != nil || home == "" {
-			base = os.TempDir()
-		} else {
-			base = filepath.Join(home, ".idoris")
-		}
+	if base := strings.TrimSpace(os.Getenv("XDG_RUNTIME_DIR")); base != "" {
+		return "unix:" + filepath.Join(base, "vpnd.sock")
+	}
+	if dir, err := serviceStateDir(); err == nil && dir != "" {
+		return "unix:" + filepath.Join(dir, "vpnd.sock")
+	}
+	var base string
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		base = os.TempDir()
+	} else {
+		base = filepath.Join(home, ".idoris")
 	}
 	return "unix:" + filepath.Join(base, "vpnd.sock")
 }
@@ -120,12 +129,20 @@ type Forward struct {
 	OwnerOnly bool `json:"owner_only,omitempty"`
 }
 
-// DefaultStateDir is the embedded node's state directory, under the user's
-// ~/.idoris and created mode 0700 by the daemon.
+// DefaultStateDir is the embedded node's state directory, created mode 0700
+// by the daemon. $STATE_DIRECTORY/node wins. Otherwise ~/.idoris/vpn-state.
 func DefaultStateDir() (string, error) {
+	if dir, err := serviceStateDir(); err != nil {
+		return "", err
+	} else if dir != "" {
+		return filepath.Join(dir, "node"), nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
-		return "", fmt.Errorf("state_dir: home directory: %w", err)
+		if err == nil {
+			err = errors.New("HOME is not defined")
+		}
+		return "", fmt.Errorf("state_dir: set STATE_DIRECTORY or HOME: %w", err)
 	}
 	return filepath.Join(home, ".idoris", "vpn-state"), nil
 }
@@ -342,6 +359,11 @@ func readSecretFile(path string) (string, error) {
 
 // Resolve fills defaults, reads *_file secrets and validates.
 func (c *Config) Resolve() error {
+	// A broken STATE_DIRECTORY must fail here, before a home directory is
+	// used for the socket or for any path Resolve does not itself fill in.
+	if _, err := serviceStateDir(); err != nil {
+		return err
+	}
 	if err := c.rejectDualCredentials(); err != nil {
 		return err
 	}

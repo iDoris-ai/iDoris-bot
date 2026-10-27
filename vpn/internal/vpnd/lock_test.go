@@ -167,4 +167,7 @@ func r3c2IsolateCache(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, "cache"))
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("LocalAppData", filepath.Join(home, "local"))
+	// A machine-service variable in the parent environment must not move
+	// the per-user lock these tests pin to the cache directory.
+	t.Setenv("STATE_DIRECTORY", "")
 }
