@@ -66,9 +66,19 @@ type Config struct {
 	// embedded mode that is the only way other processes on the machine can
 	// reach tailnet addresses.
 	Forwards []Forward `json:"forwards,omitempty"`
-	// SOCKS5Listen, if set, is a loopback address for a SOCKS5 proxy into the
-	// tailnet (embedded: via tsnet; system: via the kernel route).
+	// SOCKS5Listen, if set, is a loopback address or unix:<absolute path> for a
+	// SOCKS5 proxy into the tailnet (embedded: via tsnet; system: via the kernel route).
 	SOCKS5Listen string `json:"socks5_listen,omitempty"`
+	// SOCKS5AuthFile is a 0600 file with one "user:password" line.
+	// Empty, with SOCKS5Listen set, generates <state_dir>/socks5.auth.
+	SOCKS5AuthFile string `json:"socks5_auth_file,omitempty"`
+	// SOCKS5AllowAnonymous turns off SOCKS5 authentication. It cannot be
+	// combined with SOCKS5AuthFile. The default is authenticated.
+	SOCKS5AllowAnonymous bool `json:"socks5_allow_anonymous,omitempty"`
+	// MaxConnections is the per-listener cap. Zero means 64.
+	MaxConnections int `json:"max_connections,omitempty"`
+	// DialTimeout is how long a tailnet dial may take. Empty means 10s.
+	DialTimeout string `json:"dial_timeout,omitempty"`
 	// AdvertiseRoutes are CIDRs this node advertises (subnet router). Valid
 	// only in system mode; embedded mode has no TUN and rejects them.
 	AdvertiseRoutes []string `json:"advertise_routes,omitempty"`
@@ -207,6 +217,13 @@ func assignEnv(dst reflect.Value, raw string) error {
 		}
 		dst.SetBool(b)
 		return nil
+	case reflect.Int:
+		n, err := strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil {
+			return err
+		}
+		dst.SetInt(int64(n))
+		return nil
 	case reflect.Pointer:
 		if dst.Type().Elem().Kind() != reflect.Bool {
 			return fmt.Errorf("unsupported type %s", dst.Type())
@@ -336,7 +353,7 @@ func (c *Config) Resolve() error {
 
 func (c *Config) validateForwards() error {
 	for i, f := range c.Forwards {
-		if err := ValidateLoopback(f.Listen); err != nil {
+		if err := ValidateForwardListen(f.Listen); err != nil {
 			return fmt.Errorf("forwards[%d].listen: %w", i, err)
 		}
 		if _, _, err := net.SplitHostPort(f.Target); err != nil {
@@ -344,11 +361,37 @@ func (c *Config) validateForwards() error {
 		}
 	}
 	if c.SOCKS5Listen != "" {
-		if err := ValidateLoopback(c.SOCKS5Listen); err != nil {
+		if err := ValidateForwardListen(c.SOCKS5Listen); err != nil {
 			return fmt.Errorf("socks5_listen: %w", err)
 		}
 	}
+	if c.MaxConnections < 0 {
+		return errors.New("max_connections must be >= 0")
+	}
+	if c.SOCKS5AllowAnonymous && strings.TrimSpace(c.SOCKS5AuthFile) != "" {
+		return errors.New("socks5_allow_anonymous cannot be combined with socks5_auth_file")
+	}
+	if strings.TrimSpace(c.DialTimeout) != "" {
+		d, err := time.ParseDuration(strings.TrimSpace(c.DialTimeout))
+		if err != nil {
+			return fmt.Errorf("dial_timeout: %w", err)
+		}
+		if d <= 0 {
+			return errors.New("dial_timeout must be > 0")
+		}
+	}
 	return nil
+}
+
+// DialTimeoutDuration returns the parsed dial timeout, or zero when unset.
+// StartAccess treats zero as its 10s default. Resolve rejects a value that
+// does not parse or is not positive.
+func (c *Config) DialTimeoutDuration() time.Duration {
+	d, _ := time.ParseDuration(strings.TrimSpace(c.DialTimeout))
+	if d < 0 {
+		return 0
+	}
+	return d
 }
 
 // RoutePrefixes parses advertise_routes. An empty list returns nil.
