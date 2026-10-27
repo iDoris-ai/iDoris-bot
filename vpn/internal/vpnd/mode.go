@@ -48,12 +48,14 @@ type ModeDecision struct {
 // requested is auto, system, or embedded. takeoverExplicit is true only when
 // the operator set takeover to true (the default is false and is not explicit).
 //
-// auto uses system only when that cannot hijack a foreign tailnet: tailscaled
-// is reachable and it is not logged in, already on our control URL, or already
-// has an iDoris profile. A foreign control URL, including an empty URL on a
-// backend that is already Running, Starting, or Stopped, uses system only when
-// takeover was explicitly enabled. Otherwise auto uses embedded, including when
-// tailscaled is not reachable.
+// auto uses system only when that cannot displace the active profile:
+// tailscaled is reachable and the current control URL is already ours, or the
+// backend is fresh (no persisted foreign login). A saved iDoris profile does
+// not count. HasOurProfile is reported for diagnostics and is ignored here.
+// A foreign control URL, including an empty URL on a backend that is already
+// Running, Starting, or Stopped, and a non-empty foreign URL in NeedsLogin,
+// uses system only when takeover was explicitly enabled. Otherwise auto uses
+// embedded, including when tailscaled is not reachable.
 func DecideMode(requested string, takeoverExplicit bool, view SystemView, ourControl string) (ModeDecision, error) {
 	switch requested {
 	case "", ModeAuto:
@@ -69,9 +71,6 @@ func DecideMode(requested string, takeoverExplicit bool, view SystemView, ourCon
 	}
 	if ourControl != "" && SameControlURL(view.ControlURL, ourControl) {
 		return ModeDecision{Mode: ModeSystem, Reason: "system tailscaled is already on the iDoris control server"}, nil
-	}
-	if view.HasOurProfile {
-		return ModeDecision{Mode: ModeSystem, Reason: "system tailscaled has an iDoris profile"}, nil
 	}
 	if !foreignControl(view.ControlURL, ourControl, view.BackendState) {
 		return ModeDecision{Mode: ModeSystem, Reason: "system tailscaled is not logged in"}, nil
