@@ -1,6 +1,6 @@
 # 16 · 加入码与办公室网关向导
 
-**日期：** 2026-10-27（泰国时区）· **状态：** `vpn/` 内单测与 `make integration-wizard` 已通过。最后一次 Docker 跑在项目 `idoris-vpn-wizard-1e19b7`（办公室网 `10.211.81.0/24`，回声设备 `10.211.81.10` 与 `10.211.81.11`），`TestWizardGatewayJoin` 37s PASS。没有重跑 `make integration` 和 `make integration-lan`（前者的 compose 项目名固定，会和别的代理抢同一套容器）。`deploy/**` 本轮没有改。
+**日期：** 2026-10-27（泰国时区）。加入码与办公室网关的 Docker 证据仍是项目 `idoris-vpn-wizard-1e19b7`（办公室网 `10.211.81.0/24`，回声设备 `10.211.81.10` 与 `10.211.81.11`），`TestWizardGatewayJoin` 37s PASS。本轮补上可单独吊销的凭证标签、登记服务 `/readyz`，以及 `idoris-vpnd service install --system`。Linux 系统单元在 Debian bookworm 容器里 `systemd-analyze verify` 退出码为 0。`deploy/**` 不在这次改动里。
 
 ## 1. 要做成什么样
 
@@ -28,7 +28,7 @@
 | 办公室网关 | `idoris-vpnd join --yes --device <IP> <code>`，或 `gateway setup` | `mode=system`，只广告该 IP 的 `/32`，`accept_routes=false` |
 | 管理员 | `join --yes`（角色 `admin`） | 与成员相同：接受路由，不广告 |
 
-`--role-override` 可以改角色。`--no-service` 只写配置、不安装用户级服务。`--allow-insecure` 才允许 `http://` 登记地址；默认要求 `https`。
+`--role-override` 可以改角色。`--no-service` 只写配置、不安装用户级服务。登录前就要跑的机器服务是另一条命令，见第 12 节。`--allow-insecure` 才允许 `http://` 登记地址；默认要求 `https`。
 
 网关相关命令：
 
@@ -50,18 +50,37 @@ idoris-vpnd ui [--no-open]
 签发（stdout 只有这一行码）：
 
 ```text
-idoris-vpn-enroll invite --config FILE --entry NAME [--hostname-hint H] --enroll-url URL
+idoris-vpn-enroll invite --config F --entry E --label L --enroll-url U
 ```
 
-它为该条目新造一个令牌，把 SHA-256 哈希追加进 `token_hashes`，原子写回并保持原文件权限。条目必须已经存在，而且文件里至少要有一个种子哈希（`Validate` 不允许空的 `token_hashes`）。明文只在这一次出现。每个哈希可以单独吊销：
+`--hostname-hint` 和 `--allow-insecure` 仍可用。`--label` 可省略。省略时，非空且能放进加入码的 hostname hint 就是标签；hint 为空时标签是 `cred-` 加该哈希的前 8 位十六进制。hint 不是主机名标签（例如含空格）时邀请失败，配置文件不改。合法标签匹配 `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`。同一条目里非空标签不能重复。
+
+它为该条目新造一个令牌，把带标签的凭证追加进去，原子写回并保持原文件权限。条目必须已经存在，而且文件里至少要有一张种子凭证（`Validate` 不允许空的 `token_hashes`）。明文只在这一次出现。旧文件里的纯哈希字符串仍然合法，读入后当成没有标签、没有 `created_at` 的凭证。新写入的是对象 `{hash, label, created_at}`。`created_at` 是 UTC，截到秒。
+
+每张凭证可以单独吊销。`--label` 和 `--hash-prefix` 只能给一个：
 
 ```text
-idoris-vpn-enroll revoke --config FILE --entry NAME --hash-prefix XXXX
+idoris-vpn-enroll revoke --config F --entry E --label L
+idoris-vpn-enroll revoke --config F --entry E --hash-prefix P
 ```
 
-前缀是 4 到 64 位十六进制，必须恰好命中一个哈希。拒绝删掉最后一个哈希，否则文件会通不过 `Validate`。
+`--hash-prefix` 是 4 到 64 位十六进制，必须恰好命中一个哈希。stdout 一行：`revoked <条目> <标签> <12 位哈希前缀>`。空标签印成 `-`。不印完整哈希，不印令牌。拒绝删掉最后一张凭证，否则文件通不过 `Validate`。
 
-`invite` / `revoke` 只改文件，不给进程发信号。正在跑的 `idoris-vpn-enroll serve` 要 `SIGHUP` 才重新读配置；新文件不合法时保留旧配置并写日志。重启进程也可以。登记服务的 `/v1/discover` 返回 `role` 和 `lan_cidrs`，不签发密钥。
+列出凭证。没有表头，制表符分隔，三列是标签、12 位哈希前缀、`created_at`。空标签或空时间是 `-`：
+
+```text
+idoris-vpn-enroll list-credentials --config F --entry E
+```
+
+过期或删除 Headscale 节点不会收回登记权：守护进程还能再要一把预授权密钥。下线顺序是：先 `revoke`，再让正在跑的 `idoris-vpn-enroll serve` 收到 `SIGHUP`（或重启进程），然后才过期或删除节点。部署侧用 `ctl.sh offboard` 把这三步包起来；本文件不改 `deploy/`。
+
+`invite` / `revoke` 只改文件，不给进程发信号。`SIGHUP` 重新读配置；新文件不合法时保留旧配置并写日志。吊销过的凭证在这次重载之后不能再登记。`/v1/discover` 返回 `tenant`、`role` 和 `lan_cidrs`，不签发密钥。
+
+扫令牌哈希之前有两道限速，`/v1/enroll` 和 `/v1/discover` 都走：`global_rate_per_minute` 默认每分钟 600，`per_ip_rate_per_minute` 默认每分钟 60。通过认证之后，成功登记按条目另有一桶，`rate_per_minute` 默认 30；`/v1/discover` 再用同一默认值、但是分开的桶。`/healthz` 和 `/readyz` 不限速。`trusted_proxies` 是 CIDR 列表。只有 TCP 对端落在这份名单里才读 `X-Forwarded-For`，取最右边一个不在名单里的地址。对端不受信任时用 TCP 对端，伪造的头选不了桶。失败认证的日志每 10 秒最多一行。成功登记的审计行有 `remote`（只有 IP，没有端口）和凭证 `label`（空标签记成 `-`）。
+
+`/readyz` 用一次带认证的便宜调用检查 Headscale 是否可达、API 密钥是否仍被接受。Headscale v0.29.6 的 `GET /api/v1/apikey` 只返回密钥前缀和 `expiration`（null 表示未知）。命中本密钥且带过期时间时，响应有 `api_key_expires_at`。剩余时间不足 30 天：HTTP 200，`status` 为 `warning`，`warning` 为 `api key expires in less than 30 days`。刚好 30 天不算警告，但仍带过期时间。已经过期、不可达，或密钥被拒（401/403），是 503。密钥列表 404 时改用列出用户：密钥有效，过期时间未知，这时 200 且 `status` 为 `ok`，没有过期字段。没有配置探针时 503。失败原因是固定短语（`api key rejected`、`headscale HTTP N`、`unreachable`、`api key expired`），不回传上游正文。登记服务的 `/healthz` 仍是正文 `ok` 加换行，不探 Headscale。守护进程自己的 `/healthz` 见第 7 节，那是另一条路径。
+
+登记客户端和 Headscale API 客户端都不跟随重定向。对端把请求转到 `http://` 或另一台主机时，调用失败，bearer token 不会被送出去。
 
 ## 4. 网关计划：只广告 /32
 
@@ -83,7 +102,7 @@ idoris-vpn-enroll revoke --config FILE --entry NAME --hash-prefix XXXX
 sudo idoris-vpnd gateway apply --plan <计划文件>
 ```
 
-服务安装沿用现有的用户级单元（systemd `--user` / launchd），不是系统级 root 单元。提权的只有 `ip_forward` 这一步。
+`join` 和 `gateway apply` 在没有 `--no-service` 时仍安装用户级服务（systemd `--user` / LaunchAgent），不会改成系统级单元。登录前就要跑，另执行第 12 节的 `service install --system`。向导自己提权的只有 `ip_forward` 这一步。
 
 ## 5. 预批准名单必须和策略逐条对齐
 
@@ -129,7 +148,7 @@ Headscale v0.29.6 在 `createAndSaveNewNode` 里无条件拒绝「带预授权�
 headscale nodes approve-routes --identifier <ID> --routes 10.211.81.11/32  # <ID> is the numeric id of wiz-gw-wait from `headscale nodes list`
 ```
 
-`/healthz` 在此阶段返回 **503**，正文是阶段名。只有 `connected` 才是 200 和 `ok`。
+守护进程的 `/healthz` 在此阶段返回 **503**，正文是阶段名。只有 `connected` 才是 200 和 `ok`。这和登记服务的 `/healthz`、`/readyz` 不是同一个端口：登记服务是否连得上 Headscale，看第 3 节的 `/readyz`。
 
 Headscale v0.29.6 的 `--identifier` 是数字节点 id。主机名会被拒绝，实测：
 
@@ -156,7 +175,7 @@ Error: invalid argument "wiz-gw-wait" for "-i, --identifier" flag: strconv.Parse
 
 ## 9. 本地页面的安全模型
 
-`idoris-vpnd ui` 只听 `127.0.0.1` 的随机端口。stdout 打出带一次性秘密的 URL（`?k=`）。浏览器是否被打开：macOS 用 `open`，Linux 用 `xdg-open`，`--no-open` 则不打开。这些约束由 `httptest` 和真实回环监听测过，没有在图形浏览器里点过。
+`idoris-vpnd ui` 只听 `127.0.0.1` 的随机端口。stdout 打出带一次性秘密的 URL（`?k=`）。浏览器是否被打开：macOS 用 `open`，Linux 用 `xdg-open`，`--no-open` 则不打开。这些约束由 `httptest` 和真实回环监听测过，没有在图形浏览器里点过。本轮对照 `vpn/internal/ui/server.go` 核对过，下面的约束没有改。
 
 | 约束 | 行为 |
 |---|---|
@@ -172,11 +191,21 @@ Error: invalid argument "wiz-gw-wait" for "-i, --identifier" flag: strconv.Parse
 
 ## 10. 部署侧要补的改动（本轮没有改 `deploy/`）
 
-今天没有 `deploy/vpn/ctl.sh`。登记配置由 `deploy/vpn/bootstrap.sh` 写入 `enroll/config.json`，现有条目只有成员和 `*-local-ai`，没有 `role`、`lan_cidrs`，也没有网关 tag。策略文件 `deploy/vpn/headscale/policy.hujson` 也还没有 `autoApprovers`。
+登记配置由 `deploy/vpn/bootstrap.sh` 写入 `enroll/config.json`。本轮不改 `deploy/`。下线要由部署侧的 `ctl.sh offboard` 按第 3 节的顺序包起来：`revoke`，`SIGHUP`，再过期或删除节点。只删节点，凭证还在。
 
-建议补这些，而不是改客户端：
+建议部署侧保持这些，而不是改客户端：
 
-1. 增加 `deploy/vpn/ctl.sh`（或在 bootstrap 旁加一段），在 enroll 容器里执行 `idoris-vpn-enroll invite` / `revoke`。邀请的 stdout 只有加入码，不要再包一层会把码写进日志的 echo。写完文件后对 enroll 进程发 `SIGHUP`（或重启容器）。bootstrap 今天是改完配置再 `docker compose restart enroll`。
+1. `ctl.sh` 在 enroll 容器里执行下面的 CLI，不要再包一层会把加入码写进日志的 echo。写完文件后对 enroll 进程发 `SIGHUP`（或重启容器）。邀请、吊销、列出凭证的参数是：
+
+```text
+idoris-vpn-enroll invite --config F --entry E --label L --enroll-url U
+idoris-vpn-enroll revoke --config F --entry E --label L
+idoris-vpn-enroll revoke --config F --entry E --hash-prefix P
+idoris-vpn-enroll list-credentials --config F --entry E
+```
+
+`--label` 与 `--hash-prefix` 互斥。`list-credentials` 只有标签、12 位哈希前缀和 `created_at`。
+
 2. 网关条目增加 `role: "gateway"`、`lan_cidrs`（与下面的前缀逐条相同）、`acl_tags: ["tag:<租户>-gateway"]`。Local AI 条目保持 `acl_tags: ["tag:<租户>-local-ai"]`，并写上 `role: "local-ai"`。
 3. 策略里为 `tag:<租户>-gateway` 增加 `tagOwners`（实验室用 `group:admins`）、`autoApprovers.routes` 的**精确前缀**，以及第 5 节那种同时包含租户用户和网关 tag 的 ACL。改完后 `headscale policy check`，再 `SIGHUP`。`policy.mode: file` 时 Headplane 的 ACL 页是只读的。
 4. 不要让客户端在登录时带 `--advertise-tags`。标签放在登记条目的 `acl_tags` 上。
@@ -185,11 +214,38 @@ Error: invalid argument "wiz-gw-wait" for "-i, --identifier" flag: strconv.Parse
 
 - 客户端不能批准自己的路由。
 - 空的 ControlURL 加上已登录状态（`Running` / `Starting` / `Stopped`）视为别人的 Tailscale SaaS，自动模式不接管。`NeedsMachineAuth` 加空 URL 仍当作全新安装。
-- 吊销不能删掉条目的最后一个令牌哈希。
-- `/healthz` 在等待批准时是 503。
+- 吊销不能删掉条目的最后一张凭证。过期或删除节点不会吊销凭证。
+- 守护进程的 `/healthz` 在等待批准时是 503。登记服务的 `/healthz` 不探 Headscale；那要看 `/readyz`。
 - 嵌入式模式不能当网关。macOS / Windows 不推荐网关；本轮没有在那两个系统上跑网关。
-- 服务单元是用户级的。
+- `join` 默认安装的是用户级服务，登录前不跑。开机即跑用第 12 节的 `--system`。
 - 本地页面的 cookie 故意不设 Secure。页面「否」会强制走网关，「是」会强制走 local-ai，即使用加入码写的是成员。
 - 更宽的 `autoApprovers` 前缀是否覆盖更窄的 `/32`，本轮没有验证。
 - 没有在图形浏览器里点本地页面。
-- 没有重跑 `make integration` 与 `make integration-lan`。
+- 第 8 节的数字来自项目 `idoris-vpn-wizard-1e19b7`。本轮没有另起同名 compose 项目重跑那一节。
+
+## 12. 机器服务：`service install --system`
+
+不带 `--system` 时，`service install --config FILE` 仍是用户级。Linux 写 `~/.config/systemd/user/idoris-vpnd.service`（`NoNewPrivileges=yes`，`WantedBy=default.target`）。macOS 写当前用户的 LaunchAgent，标签 `ai.idoris.vpnd`。装完打印：用户级服务在这个用户登录之前不会跑；Linux 上同一句后面是 `loginctl enable-linger`。Windows 上不带 `--system` 的安装仍不支持。`join` 和 `gateway apply` 走的也是这套用户级安装，不会偷偷加上 `--system`。
+
+系统级：
+
+```text
+idoris-vpnd service install --system --config FILE
+idoris-vpnd service uninstall --system
+```
+
+Unix 上不是 root 就失败，原文 `service install --system must run as root; re-run with sudo`，此时还没有写文件。系统单元还启用着的时候，再装用户级会被拒绝：Linux 看 `systemctl is-enabled idoris-vpnd.service` 是不是 `enabled`，macOS 看 `/Library/LaunchDaemons/ai.idoris.vpnd.plist` 在不在。
+
+Linux 单元是 `/etc/systemd/system/idoris-vpnd.service`，模式 0600。配置按原字节复制到 `/etc/idoris/vpn.json`（0600）。目录 `/etc/idoris` 和 `/var/lib/idoris` 是 0750。安装程序不改配置里的 `state_dir`。`state_dir` 为空时，守护进程用 root 的家目录，也就是 `/root/.idoris/vpn-state`。要把状态放进单元已经放开的目录，把 `state_dir` 写成 `/var/lib/idoris` 或它下面的子目录。
+
+单元默认以 root 跑，才能打开 tailscaled 套接字并修改 prefs。单元里的注释写了另一种跑法：设 `User=idoris` 和 `Group=idoris`，并在主机执行 `tailscale set --operator=idoris`。加固是 `NoNewPrivileges=yes` 和 `ProtectSystem=strict`，所以 `/etc` 只读，配置文件不在 `ReadWritePaths` 里。`ReadWritePaths` 一定有 `/var/lib/idoris`，再加上绝对路径的 `state_dir`，以及 `socks5_listen` 和 `forwards[].listen` 里 `unix:` 套接字的父目录。相对路径和 TCP 监听不会写进去。路径里出现 `..` 或控制字符，安装失败。`WantedBy=multi-user.target`。日志是 `journalctl -u idoris-vpnd.service`。
+
+安装会 `systemctl daemon-reload`，再 `enable --now`。同时尽力执行 `systemctl --user disable --now idoris-vpnd.service`。别的账号里如果还有用户单元，要那个账号自己停。卸载时，单元文件还在则 `systemctl disable --now` 必须成功；然后删除单元并 `daemon-reload`。`/etc/idoris/vpn.json` 和 `/var/lib/idoris` 留下，并打印配置还在。
+
+这份单元在 Debian bookworm 容器里跑过 `systemd-analyze verify`（可执行文件换成空脚本，并建好 `ReadWritePaths` 的目录），退出码 0，没有警告。正文由 `vpn/cmd/idoris-vpnd/testdata/idoris-vpnd.system.service` 锁住。
+
+macOS 需要 sudo。plist 写到 `/Library/LaunchDaemons/ai.idoris.vpnd.plist`（0600），标签仍是 `ai.idoris.vpnd`。配置同样是 `/etc/idoris/vpn.json`。日志目录 `/var/log/idoris`（0750），文件 `/var/log/idoris/vpnd.log`。先 `launchctl bootout` 用户域和 `system` 域里的同名任务，再 `launchctl bootstrap system`。卸载只 bootout system 域并删除 plist，配置留下。
+
+Windows 不引入新依赖，用系统自带的 `schtasks.exe`。任务名 `idoris-vpnd`，`ONSTART`，`/RU SYSTEM`，`/RL HIGHEST`。配置复制到 `C:\ProgramData\idoris\vpn.json`。卸载是 `schtasks /Delete /TN idoris-vpnd /F`，配置留下。参数列表由 `vpn/cmd/idoris-vpnd/testdata/idoris-vpnd.task.txt` 锁住；单测不执行 `schtasks`。
+
+本机转发和 SOCKS5 谁能连上，写在 `docs/13-VPN-CLIENT-MODES.md` 第 12 节。那一节和这里的本地页面不是同一件事：页面有自己的秘密和 CSRF；转发监听没有，除非改成 unix 套接字或给 SOCKS5 配认证。
