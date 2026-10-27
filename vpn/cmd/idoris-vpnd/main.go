@@ -491,14 +491,22 @@ type runningNode struct {
 	Dialer             vpnd.Dialer
 	Hostname           string
 	LoginWhileStarting bool
+	lock               *vpnd.ControllerLock
 	close              func() error
 }
 
 func (n *runningNode) Close() error {
-	if n == nil || n.close == nil {
+	if n == nil {
 		return nil
 	}
-	return n.close()
+	var err error
+	if n.close != nil {
+		err = n.close()
+	}
+	if n.lock != nil {
+		err = errors.Join(err, n.lock.Release())
+	}
+	return err
 }
 
 // openNode decides system vs embedded, then opens that backend.
@@ -510,6 +518,23 @@ func openNode(ctx context.Context, cfg *vpnd.Config, controlURL string, log *slo
 	req := cfg.Mode
 	if req == "" {
 		req = vpnd.ModeAuto
+	}
+	// local-ai and gateway already know they will drive the system backend.
+	// Take that lock before the retry loop so a second daemon fails while the
+	// first is still waiting for tailscaled. The probe itself only reads.
+	var ctrl *vpnd.ControllerLock
+	keepLock := false
+	defer func() {
+		if !keepLock && ctrl != nil {
+			_ = ctrl.Release()
+		}
+	}()
+	if vpnd.RequiresSystem(cfg.Role) {
+		var lerr error
+		ctrl, lerr = vpnd.LockSystem(cfg.TailscaleSocket)
+		if lerr != nil {
+			return nil, lerr
+		}
 	}
 	d, err := vpnd.ProbeUntilReady(ctx, req, cfg.Role, cfg.TakeoverValue(), controlURL,
 		func(pctx context.Context) vpnd.SystemView {
@@ -544,6 +569,14 @@ func openNode(ctx context.Context, cfg *vpnd.Config, controlURL string, log *slo
 				return nil, err
 			}
 		}
+		if ctrl != nil {
+			_ = ctrl.Release()
+			ctrl = nil
+		}
+		ctrl, err = vpnd.LockEmbedded(dir)
+		if err != nil {
+			return nil, err
+		}
 		emb, err := vpnd.StartEmbedded(vpnd.EmbeddedOptions{
 			StateDir:      dir,
 			Hostname:      cfg.Hostname,
@@ -553,6 +586,7 @@ func openNode(ctx context.Context, cfg *vpnd.Config, controlURL string, log *slo
 		if err != nil {
 			return nil, err
 		}
+		keepLock = true
 		return &runningNode{
 			Mode:               d.Mode,
 			Reason:             d.Reason,
@@ -560,15 +594,24 @@ func openNode(ctx context.Context, cfg *vpnd.Config, controlURL string, log *slo
 			Dialer:             emb,
 			Hostname:           emb.Hostname(),
 			LoginWhileStarting: emb.Fresh(),
+			lock:               ctrl,
 			close:              emb.Close,
 		}, nil
 	}
+	if ctrl == nil {
+		ctrl, err = vpnd.LockSystem(cfg.TailscaleSocket)
+		if err != nil {
+			return nil, err
+		}
+	}
+	keepLock = true
 	return &runningNode{
 		Mode:     vpnd.ModeSystem,
 		Reason:   d.Reason,
 		Backend:  vpnd.NewLocalBackend(cfg.TailscaleSocket),
 		Dialer:   &net.Dialer{},
 		Hostname: cfg.Hostname,
+		lock:     ctrl,
 		close:    func() error { return nil },
 	}, nil
 }
