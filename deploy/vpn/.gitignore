@@ -6,6 +6,8 @@
 headplane/cookie_secret
 headscale/managed.json
 enroll/minted-tokens.txt
+# Obsolete sidecar. Labels live on token_hashes objects. A leftover file
+# must not be committed.
 enroll/token-labels.json
 headscale/*.tmp
 headscale/policy.hujson.bak.*
