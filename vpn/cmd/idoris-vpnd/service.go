@@ -191,6 +191,29 @@ func plistEscape(s string) string {
 }
 
 func renderLaunchdPlist(exe, configPath, logDir string) string {
+	return renderLaunchdPlistEnv(exe, configPath, logDir, nil)
+}
+
+// renderSystemLaunchdPlist is the machine LaunchDaemon. STATE_DIRECTORY
+// matches the Linux StateDirectory=idoris convention so the daemon does not
+// consult HOME. The user LaunchAgent must not set it.
+func renderSystemLaunchdPlist(exe, configPath, logDir string) string {
+	return renderLaunchdPlistEnv(exe, configPath, logDir, [][2]string{
+		{"STATE_DIRECTORY", systemStateDir},
+	})
+}
+
+func renderLaunchdPlistEnv(exe, configPath, logDir string, env [][2]string) string {
+	var envXML string
+	if len(env) > 0 {
+		var b strings.Builder
+		b.WriteString("  <key>EnvironmentVariables</key>\n  <dict>\n")
+		for _, kv := range env {
+			fmt.Fprintf(&b, "    <key>%s</key><string>%s</string>\n", plistEscape(kv[0]), plistEscape(kv[1]))
+		}
+		b.WriteString("  </dict>\n")
+		envXML = b.String()
+	}
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -206,11 +229,11 @@ func renderLaunchdPlist(exe, configPath, logDir string) string {
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Background</string>
-  <key>StandardOutPath</key><string>%s/vpnd.log</string>
+%s  <key>StandardOutPath</key><string>%s/vpnd.log</string>
   <key>StandardErrorPath</key><string>%s/vpnd.log</string>
 </dict>
 </plist>
-`, launchdLabel, plistEscape(exe), plistEscape(configPath), plistEscape(logDir), plistEscape(logDir))
+`, launchdLabel, plistEscape(exe), plistEscape(configPath), envXML, plistEscape(logDir), plistEscape(logDir))
 }
 
 func installLaunchd(exe, configPath string) error {

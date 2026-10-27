@@ -276,7 +276,12 @@ func rejectUnsafePath(p string) error {
 }
 
 func renderSchtasksCreate(exe, configPath string) []string {
-	tr := fmt.Sprintf("%s run --config %s", quoteTask(exe), quoteTask(configPath))
+	// schtasks has no environment field. cmd /c sets STATE_DIRECTORY for this
+	// process only. Under SYSTEM, os.UserConfigDir is the system profile;
+	// state, the embedded node, and locks must stay in ProgramData, which
+	// the installer creates and locks down with icacls. No space before &&:
+	// cmd would otherwise include it in the value.
+	tr := fmt.Sprintf("cmd /c set STATE_DIRECTORY=%s&& %s run --config %s", quoteTask(windowsConfigDir), quoteTask(exe), quoteTask(configPath))
 	return []string{"/Create", "/TN", windowsTaskName, "/SC", "ONSTART", "/RU", "SYSTEM", "/RL", "HIGHEST", "/F", "/TR", tr}
 }
 
@@ -390,19 +395,12 @@ func installLaunchDaemon(configPath string) error {
 	if err := writeRootFile(systemConfigDir, systemConfigPath, cfg, 0o600); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(systemStateDir, 0o750); err != nil {
+	// STATE_DIRECTORY and the log paths in the plist. 0700 root: a LaunchDaemon
+	// has no HOME, and these directories must not be group-writable.
+	if err := provisionLaunchDaemonDirs(""); err != nil {
 		return err
 	}
-	if err := os.Chmod(systemStateDir, 0o750); err != nil { //nolint:gosec // directory must stay traversable; 0750 is the required mode
-		return err
-	}
-	if err := os.MkdirAll(systemLogDir, 0o750); err != nil {
-		return err
-	}
-	if err := os.Chmod(systemLogDir, 0o750); err != nil { //nolint:gosec // directory must stay traversable; 0750 is the required mode
-		return err
-	}
-	plist := renderLaunchdPlist(exe, systemConfigPath, systemLogDir)
+	plist := renderSystemLaunchdPlist(exe, systemConfigPath, systemLogDir)
 	if err := os.WriteFile(systemLaunchdPath, []byte(plist), 0o600); err != nil {
 		return err
 	}
@@ -435,6 +433,36 @@ func uninstallLaunchDaemon() error {
 	}
 	fmt.Println("removed", exe)
 	fmt.Println("left", systemConfigPath, "in place")
+	return nil
+}
+
+// provisionLaunchDaemonDirs creates every directory the machine plist writes.
+// root is empty on a real install. Tests pass a temp directory; the absolute
+// path's leading slash is stripped before joining, because filepath.Join
+// drops the parent when the child is absolute.
+func provisionLaunchDaemonDirs(root string) error {
+	dirs := []struct {
+		path string
+		mode os.FileMode
+	}{
+		{systemStateDir, 0o700},
+		{systemLogDir, 0o700},
+	}
+	for _, d := range dirs {
+		dest := d.path
+		if root != "" {
+			dest = filepath.Join(root, strings.TrimPrefix(d.path, "/"))
+		}
+		if err := os.MkdirAll(dest, d.mode); err != nil {
+			return err
+		}
+		if err := os.Chmod(dest, d.mode); err != nil { //nolint:gosec // 0700 is the required mode; the directory is not left group-writable
+			return err
+		}
+		if err := chownSystemRoot(dest); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
