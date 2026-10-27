@@ -41,6 +41,10 @@ type ApplyResult struct {
 	IPForwardApplied bool   `json:"ip_forward_applied"`
 	SudoCommand      string `json:"sudo_command,omitempty"`
 	ServiceInstalled bool   `json:"service_installed"`
+	// AccessInfo is human-readable text telling the member how applications reach
+	// the Local AI (for example the loopback SOCKS5 address). It never holds a
+	// secret, only the path of the file that does.
+	AccessInfo []string `json:"access_info,omitempty"`
 }
 
 // SudoApplyCommand is the exact command a non-root gateway prints.
