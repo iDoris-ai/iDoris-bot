@@ -43,10 +43,14 @@ type SOCKS5Status struct {
 type AccessOptions struct {
 	MaxConnections int
 	DialTimeout    time.Duration
-	// Gate reports whether new connections may dial. Closed means system mode
-	// while the reconciler is not connected to our control URL. The daemon
-	// wires the function; this package only enforces it.
+	// Gate reports whether new connections may dial. Closed means the node is
+	// not on our tailnet, or the enrollment identity is not confirmed. The
+	// daemon wires the function; this package only enforces it.
 	Gate func() bool
+	// Owner, when set, is consulted instead of Gate and ties every accepted
+	// connection to an ownership generation. A lost generation cancels dials
+	// and closes streams already in progress.
+	Owner *LiveOwner
 	// SOCKS5User and SOCKS5Password are the RFC 1929 credential. Both empty
 	// means "look at the auth file". Setting only one is an error.
 	SOCKS5User     string
@@ -83,6 +87,7 @@ type LocalAccess struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	gate        func() bool
+	owner       *LiveOwner
 	dialTimeout time.Duration
 	user        string
 	pass        string
@@ -91,7 +96,7 @@ type LocalAccess struct {
 	mu     sync.Mutex
 	closed bool
 	bounds []bound
-	conns  map[net.Conn]struct{}
+	conns  map[net.Conn]uint64
 	wg     sync.WaitGroup
 }
 
@@ -165,11 +170,15 @@ func StartAccess(dial Dialer, forwards []Forward, socksAddr string, opt AccessOp
 		ctx:         ctx,
 		cancel:      cancel,
 		gate:        opt.Gate,
+		owner:       opt.Owner,
 		dialTimeout: dialTimeout,
 		user:        user,
 		pass:        pass,
 		authFile:    authFile,
-		conns:       map[net.Conn]struct{}{},
+		conns:       map[net.Conn]uint64{},
+	}
+	if opt.Owner != nil {
+		opt.Owner.SetOnLost(func() { a.closeStale() })
 	}
 	fail := func(err error) (*LocalAccess, error) {
 		for _, b := range a.bounds {
@@ -226,11 +235,38 @@ func StartAccess(dial Dialer, forwards []Forward, socksAddr string, opt AccessOp
 			return fail(fmt.Errorf("socks5 %s: %w", socksAddr, err))
 		}
 	}
+	if a.owner != nil {
+		a.wg.Add(1)
+		go a.watchOwner()
+	}
 	for i := range a.bounds {
 		a.wg.Add(1)
 		go a.acceptLoop(i)
 	}
 	return a, nil
+}
+
+// watchOwner polls LocalAPI on the ownership cache interval and also wakes
+// when the reconciler bumps the generation. Streams accepted under an older
+// generation are closed as soon as the gate is shut, including dials that
+// have not returned yet (those watch the same generation from dialUpstream).
+func (a *LocalAccess) watchOwner() {
+	defer a.wg.Done()
+	ticker := time.NewTicker(a.owner.TTL())
+	defer ticker.Stop()
+	for {
+		ch := a.owner.WaitCh()
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-ticker.C:
+			a.owner.Poll(a.ctx)
+		case <-ch:
+			if !a.owner.Allow() {
+				a.closeStale()
+			}
+		}
+	}
 }
 
 func (a *LocalAccess) acceptLoop(idx int) {
@@ -324,7 +360,51 @@ func (a *LocalAccess) dialUpstream(client net.Conn, target string) (net.Conn, er
 	defer cancel()
 	stop := watchDisconnect(client, cancel)
 	defer stop()
+	a.watchLost(ctx, cancel)
 	return a.dial.DialContext(ctx, "tcp", target)
+}
+
+// watchLost cancels a dial when the ownership generation moves to a closed
+// gate. The goroutine exits when the dial context ends.
+func (a *LocalAccess) watchLost(ctx context.Context, cancel context.CancelFunc) {
+	if a.owner == nil {
+		return
+	}
+	go func() {
+		for {
+			ch := a.owner.WaitCh()
+			select {
+			case <-ctx.Done():
+				return
+			case <-ch:
+				if !a.owner.Allow() {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+}
+
+// closeStale closes connections accepted under an older ownership generation.
+// The current generation is the one that just lost ownership, so anything
+// still tracked was admitted before that.
+func (a *LocalAccess) closeStale() {
+	var limit uint64
+	if a.owner != nil {
+		limit = a.owner.Generation()
+	}
+	a.mu.Lock()
+	conns := make([]net.Conn, 0, len(a.conns))
+	for c, gen := range a.conns {
+		if a.owner == nil || gen < limit {
+			conns = append(conns, c)
+		}
+	}
+	a.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
 }
 
 func (a *LocalAccess) acquire(idx int) bool {
@@ -367,6 +447,9 @@ func (a *LocalAccess) stopping() bool {
 }
 
 func (a *LocalAccess) gateOpen() bool {
+	if a.owner != nil {
+		return a.owner.Allow()
+	}
 	if a.gate == nil {
 		return true
 	}
@@ -391,7 +474,11 @@ func (a *LocalAccess) track(c net.Conn) bool {
 		_ = c.Close()
 		return false
 	}
-	a.conns[c] = struct{}{}
+	gen := uint64(0)
+	if a.owner != nil {
+		gen = a.owner.Generation()
+	}
+	a.conns[c] = gen
 	return true
 }
 
