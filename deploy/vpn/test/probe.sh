@@ -14,24 +14,69 @@
 set -euo pipefail
 umask 077
 
-root="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$root"
-lab="$root/test/.lab"
+origin="$(cd "$(dirname "$0")/.." && pwd)"
+repo="$(cd "$origin/../.." && pwd)"
+src="$repo/deploy/.probe-src"
+fp="$(mktemp "${TMPDIR:-/tmp}/idoris-probe-fp.XXXXXX")"
 
 die() { echo "probe: $*" >&2; exit 1; }
 
 command -v docker >/dev/null || die "docker not found"
 docker compose version >/dev/null 2>&1 || die "docker compose v2 is required"
 command -v python3 >/dev/null || die "python3 is required"
+command -v rsync >/dev/null || die "rsync is required"
 
-PROJ="idoris-vpn-ctl-$(python3 -c 'import random; print(random.randint(100000, 999999))')"
+python3 - "$origin" "$fp" <<'PY'
+import hashlib, os, sys
+origin, dest = sys.argv[1:]
+rels = [
+    ".admin-mode", ".env", "compose.yaml",
+    "enroll/config.json", "enroll/headscale.apikey", "enroll/minted-tokens.txt",
+    "headplane/cookie_secret", "headplane/config.yaml",
+    "headscale/managed.json", "headscale/config.yaml", "headscale/policy.hujson",
+]
+lines = []
+for rel in rels:
+    path = os.path.join(origin, rel)
+    if os.path.islink(path):
+        lines.append("link %s" % rel)
+    elif os.path.isfile(path):
+        digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
+        lines.append("file %s %s %o" % (rel, digest, os.stat(path).st_mode & 0o777))
+    elif os.path.exists(path):
+        lines.append("other %s" % rel)
+    else:
+        lines.append("absent %s" % rel)
+open(dest, "w").write("\n".join(lines) + "\n")
+PY
+
+rm -rf "$src"
+mkdir -p "$src"
+rsync -a \
+  --exclude 'test/.lab/' \
+  --exclude 'test/.probe.log' \
+  --exclude 'backups/' \
+  --exclude '.admin-mode' \
+  --exclude '.env' \
+  --exclude 'enroll/config.json' \
+  --exclude 'enroll/headscale.apikey' \
+  --exclude 'enroll/token-labels.json' \
+  --exclude 'enroll/minted-tokens.txt' \
+  --exclude 'headplane/cookie_secret' \
+  --exclude 'headscale/managed.json' \
+  "$origin/" "$src/"
+
+root="$src"
+cd "$root"
+lab="$root/test/.lab"
+
+PROJ="idoris-vpn-r2d-$(python3 -c 'import random; print(random.randint(100000, 999999))')"
 export COMPOSE_PROJECT_NAME="$PROJ"
 ENROLL_UID="$(id -u)"
 ENROLL_GID="$(id -g)"
 export ENROLL_UID ENROLL_GID
 LAN_CIDR="10.88.88.0/24"
 LAN_IP="10.88.88.10"
-cookie_created=0
 
 free_port() {
   python3 -c 'import socket,sys; s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
@@ -46,36 +91,12 @@ ENROLL_PORT="$(free_port)"
 DERP_STUN_PORT="$(free_udp)"
 export HEADSCALE_PORT HEADPLANE_PORT ENROLL_PORT DERP_STUN_PORT
 
-dc() { docker compose -f "$root/compose.yaml" -f "$lab/override.yaml" "$@"; }
-
-# Copy a lab secret into the deploy tree only when that path is empty.
-# Cleanup deletes paths recorded in staged-files.
-stage_secret() {
-  local dest="$1" src="$2"
-  if [[ -e "$dest" || -L "$dest" ]]; then
-    return 0
-  fi
-  mkdir -p "$(dirname "$dest")"
-  cp "$src" "$dest"
-  chmod 600 "$dest"
-  printf '%s\n' "$dest" >> "$lab/staged-files"
-}
-
-# Re-copy a file this probe created. A credential test rewrites the lab
-# config after the first copy; backup must see that later file.
-refresh_staged() {
-  local dest="$1" src="$2"
-  [[ -f "$lab/staged-files" ]] || return 0
-  if grep -qxF "$dest" "$lab/staged-files"; then
-    cp "$src" "$dest"
-    chmod 600 "$dest"
-  fi
-}
+dc() { docker compose --project-directory "$root" --project-name "$PROJ" "$@"; }
 
 cleanup() {
   local ec=$?
   echo "probe: tearing down project ${PROJ} (exit ${ec})"
-  if [[ "$ec" -ne 0 ]]; then
+  if [[ "$ec" -ne 0 && -d "$root" ]]; then
     dc logs --tail 40 | sed -E 's/hskey-[A-Za-z0-9_.:+/=-]+/[redacted]/g; s/idv1_[0-9a-f]+/[redacted]/g' >&2 || true
     docker ps -aq --filter "label=idoris-vpn-probe=${PROJ}" | while read -r id; do
       echo "---- logs $id ----" >&2
@@ -86,41 +107,76 @@ cleanup() {
     docker rm -f "$id" >/dev/null 2>&1 || true
   done
   docker network rm "${PROJ}-lan" >/dev/null 2>&1 || true
-  dc --profile tailnet-admin down -v >/dev/null 2>&1 || true
-  if [[ -f "$lab/staged-files" ]]; then
-    while IFS= read -r staged; do
-      [[ -n "$staged" ]] || continue
-      rm -f "$staged"
-    done < "$lab/staged-files"
+  if [[ -d "$root" ]]; then
+    dc --profile tailnet-admin down -v >/dev/null 2>&1 || true
   fi
-  if [[ -f "$lab/file-modes" ]]; then
-    python3 - "$lab/file-modes" <<'PY' || true
-import os, sys
-for line in open(sys.argv[1]):
-    mode, path = line.split(" ", 1)
-    path = path.rstrip("\n")
-    if os.path.isfile(path) and not os.path.islink(path):
-        os.chmod(path, int(mode, 8))
+  # The probe cds into the copy. Removing that directory while it is still
+  # the working directory makes the next process (the origin fingerprint)
+  # fail to start, which looks like a source-tree change.
+  cd "$repo"
+  rm -rf "$src"
+  if ! python3 - "$origin" "$fp" <<'PY'
+import hashlib, os, sys
+origin, fp = sys.argv[1:]
+want = {}
+for line in open(fp):
+    parts = line.rstrip("\n").split(" ", 2)
+    want[parts[1]] = line.rstrip("\n")
+rels = [
+    ".admin-mode", ".env", "compose.yaml",
+    "enroll/config.json", "enroll/headscale.apikey", "enroll/minted-tokens.txt",
+    "headplane/cookie_secret", "headplane/config.yaml",
+    "headscale/managed.json", "headscale/config.yaml", "headscale/policy.hujson",
+]
+for rel in rels:
+    path = os.path.join(origin, rel)
+    if os.path.islink(path):
+        got = "link %s" % rel
+    elif os.path.isfile(path):
+        digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
+        got = "file %s %s %o" % (rel, digest, os.stat(path).st_mode & 0o777)
+    elif os.path.exists(path):
+        got = "other %s" % rel
+    else:
+        got = "absent %s" % rel
+    if want.get(rel) != got:
+        sys.stderr.write("source checkout changed: %s\n  was %s\n  now %s\n" % (rel, want.get(rel), got))
+        raise SystemExit(1)
 PY
+  then
+    echo "probe: source checkout was modified" >&2
+    ec=1
   fi
-  rm -rf "$lab"
-  if [[ "$cookie_created" == 1 ]]; then
-    rm -f "$root/headplane/cookie_secret"
-  fi
-  rm -f "$root/.admin-mode" "$root/.admin-mode."* "$root/.running."*
+  rm -f "$fp"
   exit "$ec"
 }
 trap cleanup EXIT
 
 rm -rf "$lab"
-mkdir -p "$lab"
+mkdir -p "$lab" "$root/enroll"
 
-if [[ ! -s "$root/headplane/cookie_secret" ]]; then
-  od -An -N16 -tx1 /dev/urandom | tr -d ' \n' > "$root/headplane/cookie_secret"
-  cookie_created=1
+cat > "$root/.env" <<EOF
+COMPOSE_PROJECT_NAME=${PROJ}
+ENROLL_UID=${ENROLL_UID}
+ENROLL_GID=${ENROLL_GID}
+HEADSCALE_PORT=${HEADSCALE_PORT}
+HEADPLANE_PORT=${HEADPLANE_PORT}
+ENROLL_PORT=${ENROLL_PORT}
+DERP_STUN_PORT=${DERP_STUN_PORT}
+HEADPLANE_BIND=127.0.0.1
+HEADPLANE_ACCESS=tunnel
+EOF
+chmod 600 "$root/.env"
+od -An -N16 -tx1 /dev/urandom | tr -d ' \n' > "$root/headplane/cookie_secret"
+chmod 600 "$root/headplane/cookie_secret"
+
+if [[ "${PROBE_EARLY_ABORT:-}" == "1" ]]; then
+  printf 'mode=published\n' > "$root/.admin-mode"
+  chmod 600 "$root/.admin-mode"
+  die "probe early abort"
 fi
 
-python3 - "$root/headscale/config.yaml" "$lab/config.yaml" <<'PY'
+python3 - "$root/headscale/config.yaml" "$root/headscale/config.yaml" <<'PY'
 import sys
 src, dst = sys.argv[1:]
 text = open(src).read()
@@ -137,40 +193,24 @@ text = text.replace(old_derp, new_derp, 1)
 open(dst, "w").write(text)
 PY
 
-cp "$root/headscale/policy.hujson" "$lab/policy.hujson"
+# Policy and enroll files live in this copy. compose bind-mounts them
+# directly, so a lab override would be dropped by --force-recreate.
 python3 "$root/policy.py" init \
-  --policy "$lab/policy.hujson" --state "$lab/managed.json" \
+  --policy "$root/headscale/policy.hujson" --state "$root/headscale/managed.json" \
   --org acme --admin admin --tailnet-admin --lan-cidr "$LAN_CIDR" >/dev/null
 python3 "$root/policy.py" add-tenant \
-  --policy "$lab/policy.hujson" --state "$lab/managed.json" \
+  --policy "$root/headscale/policy.hujson" --state "$root/headscale/managed.json" \
   --org globex >/dev/null
 
 # Placeholder enroll files so compose can create the container later.
 # credentials.sh and ctl.sh share this directory with the running service.
-mkdir -p "$lab/enroll-home"
-printf '%s\n' '{"control_url":"http://headscale:8080","headscale_url":"http://headscale:8080","headscale_api_key_file":"/etc/idoris/headscale.apikey","tenants":[{"name":"placeholder","headscale_user_id":"1","token_hashes":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}]}' > "$lab/enroll-home/config.json"
-printf '%s' 'placeholder' > "$lab/enroll-home/headscale.apikey"
-chmod 600 "$lab/enroll-home/config.json" "$lab/enroll-home/headscale.apikey"
-
-cat > "$lab/override.yaml" <<'EOF'
-services:
-  headscale:
-    volumes: !override
-      - ./test/.lab/config.yaml:/etc/headscale/config.yaml:ro
-      - ./test/.lab/policy.hujson:/etc/headscale/policy.hujson:ro
-      - headscale-data:/var/lib/headscale
-      - headscale-run:/var/run/headscale
-  enroll:
-    volumes: !override
-      - ./test/.lab/enroll-home/config.json:/etc/idoris/enroll.json:ro
-      - ./test/.lab/enroll-home/headscale.apikey:/etc/idoris/headscale.apikey:ro
-EOF
+printf '%s\n' '{"control_url":"http://headscale:8080","headscale_url":"http://headscale:8080","headscale_api_key_file":"/etc/idoris/headscale.apikey","tenants":[{"name":"placeholder","headscale_user_id":"1","token_hashes":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}]}' > "$root/enroll/config.json"
+printf '%s' 'placeholder' > "$root/enroll/headscale.apikey"
+chmod 600 "$root/enroll/config.json" "$root/enroll/headscale.apikey"
 
 echo "probe: project=${PROJ} headscale=${HEADSCALE_PORT} enroll=${ENROLL_PORT} stun=${DERP_STUN_PORT}"
 dc config -q
-merged="$(dc config)"
-grep -q 'test/.lab/config.yaml' <<<"$merged" || die "lab headscale config was not mounted"
-grep -q 'server_url: http://headscale:8080' "$lab/config.yaml" || die "lab server_url was not rewritten"
+grep -q 'server_url: http://headscale:8080' "$root/headscale/config.yaml" || die "lab server_url was not rewritten"
 
 echo "probe: building enroll image"
 BUILDX_NO_DEFAULT_ATTESTATIONS=1 dc build enroll
@@ -201,8 +241,8 @@ for name in ("admin", "acme", "globex"):
 
 api_key="$(dc exec -T headscale headscale apikeys create --expiration 24h | tr -d '\r\n')"
 [[ "$api_key" == hskey-api-* ]] || die "apikeys create did not return an API key"
-printf '%s' "$api_key" > "$lab/enroll-home/headscale.apikey"
-chmod 600 "$lab/enroll-home/headscale.apikey"
+printf '%s' "$api_key" > "$root/enroll/headscale.apikey"
+chmod 600 "$root/enroll/headscale.apikey"
 unset api_key
 
 image="$(dc config --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["enroll"]["image"])')"
@@ -233,7 +273,7 @@ for spec in "${entries[@]}"; do
   printf '%s\n' "${ename}|${euser}|${etags}|${erate}|${ettl}|${hash}" >> "$lab/enroll.spec"
 done
 
-python3 - "$lab/users.txt" "$lab/enroll.spec" "$lab/enroll-home/config.json" <<'PY'
+python3 - "$lab/users.txt" "$lab/enroll.spec" "$root/enroll/config.json" <<'PY'
 import json, sys
 users = {}
 for line in open(sys.argv[1]):
@@ -263,6 +303,28 @@ with open(sys.argv[3], "w") as f:
     f.write("\n")
 PY
 rm -f "$lab/enroll.spec"
+chmod 600 "$root/enroll/config.json"
+# The writer leaves lan_cidrs empty. reconcile-enroll copies the managed
+# prefixes onto acme-gateway without minting a new hash.
+gw_hash="$(python3 -c 'import json,sys; cfg=json.load(open(sys.argv[1]));
+print(next(t["token_hashes"][0] for t in cfg["tenants"] if t["name"]=="acme-gateway"))' "$root/enroll/config.json")"
+python3 "$root/policy.py" reconcile-enroll \
+  --state "$root/headscale/managed.json" \
+  --config "$root/enroll/config.json" >/dev/null
+python3 - "$root/enroll/config.json" "$LAN_CIDR" "$gw_hash" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+cidr, want_hash = sys.argv[2:]
+gw = next(t for t in cfg["tenants"] if t["name"] == "acme-gateway")
+if gw.get("lan_cidrs") != [cidr]:
+    raise SystemExit("reconcile lan_cidrs %s" % gw.get("lan_cidrs"))
+if gw.get("token_hashes") != [want_hash]:
+    raise SystemExit("reconcile changed the gateway token hash")
+for tenant in cfg["tenants"]:
+    if tenant["name"] != "acme-gateway" and "lan_cidrs" in tenant:
+        raise SystemExit("lan_cidrs leaked onto %s" % tenant["name"])
+PY
+unset gw_hash
 
 echo "probe: starting enroll"
 dc up -d --wait --wait-timeout 180 enroll
@@ -331,7 +393,7 @@ start_node() {
   if [[ -n "$sysctl" ]]; then
     args+=(--sysctl "$sysctl")
   fi
-  args+=(tailscale/tailscale:v1.104.2)
+  args+=(tailscale/tailscale:v1.104.2@sha256:b11583ad2e93e4671128538c88cf11f460444a5d7e449311dd1933a400ab849d)
   "${args[@]}" >/dev/null
 }
 
@@ -415,6 +477,29 @@ report() {
     printf '  FAIL %s -> %s:%s expected %s\n' "$src" "$dst" "$port" "$expect" >&2
   fi
 }
+
+echo "probe: gateway discover"
+gw_tok="$(token_of acme-gateway)"
+if python3 - "$gw_tok" "http://127.0.0.1:${ENROLL_PORT}/v1/discover" "$LAN_CIDR" <<'PY'
+import json, sys, urllib.request
+token, url, cidr = sys.argv[1:]
+req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+with urllib.request.urlopen(req, timeout=20) as resp:
+    data = json.load(resp)
+got = data.get("lan_cidrs") or []
+if cidr not in got:
+    raise SystemExit("discover lan_cidrs %s missing %s" % (got, cidr))
+if data.get("tenant") != "acme-gateway":
+    raise SystemExit("discover tenant %s" % data.get("tenant"))
+PY
+then
+  pass=$((pass + 1))
+  echo "  ok   discover for acme-gateway returned ${LAN_CIDR}"
+else
+  fail=$((fail + 1))
+  echo "  FAIL discover for acme-gateway did not return ${LAN_CIDR}" >&2
+fi
+unset gw_tok
 
 try_tcp() {
   local src="$1" ip="$2" port="$3"
@@ -543,7 +628,7 @@ docker run -d --name "${PROJ}-lanbox" \
   --cap-add NET_ADMIN --cap-add NET_RAW \
   --network "${PROJ}-lan" --ip "$LAN_IP" \
   --entrypoint /bin/sh \
-  tailscale/tailscale:v1.104.2 \
+  tailscale/tailscale:v1.104.2@sha256:b11583ad2e93e4671128538c88cf11f460444a5d7e449311dd1933a400ab849d \
   -c 'nc -lk -p 8740 -e /bin/cat & nc -lk -p 22 -e /bin/cat & wait' >/dev/null
 docker network connect "${PROJ}-lan" "${PROJ}-acme-gateway"
 gw_lan="$(docker inspect -f "{{(index .NetworkSettings.Networks \"${PROJ}-lan\").IPAddress}}" "${PROJ}-acme-gateway")"
@@ -647,12 +732,8 @@ else
 fi
 
 echo "probe: credential lifecycle"
-# compose run (ctl.sh) also bind-mounts deploy/vpn/enroll/*. Those files have
-# to exist. The credential commands write ENROLL_DIR, which is the file the
-# running enroll process reloads.
-stage_secret "$root/enroll/config.json" "$lab/enroll-home/config.json"
-stage_secret "$root/enroll/headscale.apikey" "$lab/enroll-home/headscale.apikey"
-if ENROLL_DIR="$lab/enroll-home" PROJ="$PROJ" bash "$root/test/credentials.sh"; then
+# The copy's enroll directory is the file the running container has mounted.
+if ENROLL_DIR="$root/enroll" PROJ="$PROJ" bash "$root/test/credentials.sh"; then
   pass=$((pass + 1))
   echo "  ok   credential lifecycle"
 else
@@ -663,40 +744,11 @@ fi
 echo "probe: backup/restore keeps the published Headplane stopped"
 printf 'mode=tailnet-admin\n' > "$root/.admin-mode"
 chmod 600 "$root/.admin-mode"
-# ctl.sh backup reads host files. The lab keeps the live copies under test/.lab
-# so a developer tree without secrets can still take the bundle. Only paths
-# this probe created are deleted on the way out.
-if [[ ! -e "$root/.env" && ! -L "$root/.env" ]]; then
-  cat > "$root/.env" <<EOF
-COMPOSE_PROJECT_NAME=${PROJ}
-ENROLL_UID=${ENROLL_UID}
-ENROLL_GID=${ENROLL_GID}
-HEADSCALE_PORT=${HEADSCALE_PORT}
-HEADPLANE_PORT=${HEADPLANE_PORT}
-ENROLL_PORT=${ENROLL_PORT}
-DERP_STUN_PORT=${DERP_STUN_PORT}
-EOF
-  chmod 600 "$root/.env"
-  printf '%s\n' "$root/.env" >> "$lab/staged-files"
-fi
-refresh_staged "$root/enroll/config.json" "$lab/enroll-home/config.json"
-refresh_staged "$root/enroll/headscale.apikey" "$lab/enroll-home/headscale.apikey"
-stage_secret "$root/enroll/config.json" "$lab/enroll-home/config.json"
-stage_secret "$root/enroll/headscale.apikey" "$lab/enroll-home/headscale.apikey"
-stage_secret "$root/headscale/managed.json" "$lab/managed.json"
-python3 - "$lab/file-modes" \
-  "$root/headscale/config.yaml" "$root/headscale/policy.hujson" \
-  "$root/headplane/config.yaml" "$root/compose.yaml" <<'PY'
-import os, sys
-out = sys.argv[1]
-with open(out, "w") as fh:
-    for path in sys.argv[2:]:
-        fh.write("%o %s\n" % (os.stat(path).st_mode & 0o777, path))
-PY
 bash "$root/ctl.sh" backup "$lab/mode-backup"
 [[ -f "$lab/mode-backup/state/enroll/config.json" ]] || die "backup missed enroll config"
 [[ -f "$lab/mode-backup/state/dotenv" ]] || die "backup missed .env"
 [[ -f "$lab/mode-backup/manifest.json" ]] || die "backup missed manifest"
+[[ -s "$lab/mode-backup/sidecar/state.tar" ]] || die "backup missed sidecar state"
 if grep -qE 'idv1_|hskey-|ENROLL_TOKEN' "$lab/mode-backup/manifest.json"; then
   die "backup manifest contains a secret"
 fi
@@ -745,7 +797,50 @@ else
   fail=$((fail + 1))
   echo "  FAIL after restore, 127.0.0.1:${HEADPLANE_PORT} accepted a connection" >&2
 fi
-rm -f "$root/.admin-mode"
+echo "probe: wipe volumes and restore the sidecar without a shell token"
+state_copy="$(mktemp "${TMPDIR:-/tmp}/idoris-sidecar.XXXXXX")"
+docker cp "$(dc --profile tailnet-admin ps -q vpn-sidecar):/var/lib/tailscale/tailscaled.state" "$state_copy"
+state_sum="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$state_copy")"
+rm -f "$state_copy"
+[[ -n "$state_sum" ]] || die "no sidecar state checksum"
+docker ps -aq --filter "label=idoris-vpn-probe=${PROJ}" | while read -r id; do
+  docker rm -f "$id" >/dev/null
+done
+dc --profile tailnet-admin down -v
+if docker volume ls --format '{{.Name}}' | grep -q "^${PROJ}_"; then
+  die "volumes survived compose down -v"
+fi
+unset VPN_SERVER_ENROLL_TOKEN
+env -u VPN_SERVER_ENROLL_TOKEN bash "$root/ctl.sh" restore "$lab/mode-backup" --force
+sidecar_up=0
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  if dc --profile tailnet-admin ps --status running -q vpn-sidecar | grep -q . \
+    && dc --profile tailnet-admin ps --status running -q headplane-tailnet | grep -q .; then
+    sidecar_up=1
+    break
+  fi
+  sleep 3
+done
+[[ "$sidecar_up" == 1 ]] || die "sidecar or headplane-tailnet did not return after the volume wipe"
+state_copy="$(mktemp "${TMPDIR:-/tmp}/idoris-sidecar.XXXXXX")"
+docker cp "$(dc --profile tailnet-admin ps -q vpn-sidecar):/var/lib/tailscale/tailscaled.state" "$state_copy"
+after_sum="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$state_copy")"
+rm -f "$state_copy"
+if [[ "$after_sum" == "$state_sum" ]]; then
+  pass=$((pass + 1))
+  echo "  ok   restored sidecar state matches the backup"
+else
+  fail=$((fail + 1))
+  echo "  FAIL restored sidecar state checksum changed" >&2
+fi
+pub_running="$(docker compose --project-directory "$root" --project-name "$PROJ" ps --status running -q headplane || true)"
+if [[ -z "$pub_running" ]]; then
+  pass=$((pass + 1))
+  echo "  ok   after volume-wipe restore, published headplane is stopped"
+else
+  fail=$((fail + 1))
+  echo "  FAIL after volume-wipe restore, published headplane is running" >&2
+fi
 
 echo "probe: ${pass} passed, ${fail} failed"
 [[ "$fail" == 0 ]] || die "${fail} probe(s) failed"

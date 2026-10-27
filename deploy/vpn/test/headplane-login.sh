@@ -44,11 +44,11 @@ ENROLL_PORT="$(free_port)"
 DERP_STUN_PORT="$(free_udp)"
 export HEADSCALE_PORT HEADPLANE_PORT ENROLL_PORT DERP_STUN_PORT
 
-CURL_IMAGE="${HP_CURL_IMAGE:-curlimages/curl:8.16.0}"
+CURL_IMAGE="${HP_CURL_IMAGE:-curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6}"
 HP_NET=""
 API_KEY=""
 
-dc() { docker compose -f "$src/compose.yaml" "$@"; }
+dc() { docker compose --project-directory "$src" --project-name "$PROJ" -f "$src/compose.yaml" "$@"; }
 
 cleanup() {
   local ec=$?
@@ -64,9 +64,71 @@ cleanup() {
   if [[ -d "$src" ]]; then
     dc --profile tailnet-admin down -v --remove-orphans >/dev/null 2>&1 || true
   fi
+  # Leave the copy before deleting it so the fingerprint check can start.
+  cd "$repo"
   rm -rf "$src" ${work:+"$work"}
+  if [[ -n "${fp:-}" && -f "$fp" ]]; then
+    if ! python3 - "$root" "$fp" <<'PY'
+import hashlib, os, sys
+origin, fp = sys.argv[1:]
+want = {}
+for line in open(fp):
+    parts = line.rstrip("\n").split(" ", 2)
+    if len(parts) >= 2:
+        want[parts[1]] = line.rstrip("\n")
+rels = [
+    ".admin-mode", ".env", "compose.yaml",
+    "enroll/config.json", "enroll/headscale.apikey", "enroll/minted-tokens.txt",
+    "headplane/cookie_secret", "headplane/config.yaml",
+    "headscale/managed.json", "headscale/config.yaml", "headscale/policy.hujson",
+]
+for rel in rels:
+    path = os.path.join(origin, rel)
+    if os.path.islink(path):
+        got = "link %s" % rel
+    elif os.path.isfile(path):
+        digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
+        got = "file %s %s %o" % (rel, digest, os.stat(path).st_mode & 0o777)
+    elif os.path.exists(path):
+        got = "other %s" % rel
+    else:
+        got = "absent %s" % rel
+    if want.get(rel) != got:
+        sys.stderr.write("source checkout changed: %s\n  was %s\n  now %s\n" % (rel, want.get(rel), got))
+        raise SystemExit(1)
+PY
+    then
+      echo "hp-login: source checkout was modified" >&2
+      ec=1
+    fi
+    rm -f "$fp"
+  fi
   exit "$ec"
 }
+fp="$(mktemp "${TMPDIR:-/tmp}/idoris-hp-fp.XXXXXX")"
+python3 - "$root" "$fp" <<'PY'
+import hashlib, os, sys
+origin, dest = sys.argv[1:]
+rels = [
+    ".admin-mode", ".env", "compose.yaml",
+    "enroll/config.json", "enroll/headscale.apikey", "enroll/minted-tokens.txt",
+    "headplane/cookie_secret", "headplane/config.yaml",
+    "headscale/managed.json", "headscale/config.yaml", "headscale/policy.hujson",
+]
+lines = []
+for rel in rels:
+    path = os.path.join(origin, rel)
+    if os.path.islink(path):
+        lines.append("link %s" % rel)
+    elif os.path.isfile(path):
+        digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
+        lines.append("file %s %s %o" % (rel, digest, os.stat(path).st_mode & 0o777))
+    elif os.path.exists(path):
+        lines.append("other %s" % rel)
+    else:
+        lines.append("absent %s" % rel)
+open(dest, "w").write("\n".join(lines) + "\n")
+PY
 trap cleanup EXIT
 
 rm -rf "$src"
