@@ -208,6 +208,8 @@ type Server struct {
 	// authScans counts token-hash walks. Tests use it to prove the pre-auth
 	// limiter runs before the scan. It is not a metric.
 	authScans int
+	// prober is optional. /readyz answers 503 until SetControlProber is called.
+	prober ControlProber
 }
 
 type bucket struct {
@@ -243,6 +245,7 @@ func (s *Server) Handler() http.Handler {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("ok\n"))
 	})
+	mux.HandleFunc("GET /readyz", s.handleReadyz)
 	mux.HandleFunc("POST /v1/enroll", s.handleEnroll)
 	mux.HandleFunc("GET /v1/discover", s.handleDiscover)
 	return mux
