@@ -23,9 +23,10 @@ func Collect(mode string) (Snapshot, error) {
 			continue
 		}
 		item := Iface{
-			Name:     ifi.Name,
-			Up:       ifi.Flags&net.FlagUp != 0,
-			Loopback: ifi.Flags&net.FlagLoopback != 0,
+			Name:         ifi.Name,
+			Up:           ifi.Flags&net.FlagUp != 0,
+			Loopback:     ifi.Flags&net.FlagLoopback != 0,
+			PointToPoint: ifi.Flags&net.FlagPointToPoint != 0,
 		}
 		for _, a := range addrs {
 			item.Addrs = append(item.Addrs, a.String())
