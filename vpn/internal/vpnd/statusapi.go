@@ -77,6 +77,22 @@ func FormatStatus(st map[string]any) string {
 	if s5, ok := st["socks5"].(map[string]any); ok && s5["listen"] != "" {
 		fmt.Fprintf(&b, "%-13s %v (%v)\n", "socks5:", s5["listen"], s5["state"])
 	}
+	if routes, ok := st["routes"].([]any); ok {
+		for _, item := range routes {
+			m, _ := item.(map[string]any)
+			if m == nil {
+				continue
+			}
+			mark := "pending"
+			if m["approved"] == true {
+				mark = "approved"
+			}
+			fmt.Fprintf(&b, "%-13s %v (%s)\n", "route:", m["cidr"], mark)
+		}
+	}
+	if v, _ := st["admin_hint"].(string); v != "" {
+		line("admin_hint", v)
+	}
 	if v, _ := st["last_error"].(string); v != "" {
 		line("last_error", v)
 	}
