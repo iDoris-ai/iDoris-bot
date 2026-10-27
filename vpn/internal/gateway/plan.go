@@ -342,3 +342,17 @@ func aclTag(tenant, suffix string) (string, error) {
 	}
 	return "tag:" + tenant + "-" + suffix, nil
 }
+
+// ValidateRoleChoice refuses a wizard answer that the credential cannot carry
+// out. A join code is bound to one role (its enrollment entry's tags), so a
+// gateway code cannot make this machine the Local AI and the other way round.
+func ValidateRoleChoice(codeRole string, thisMachineIsLocalAI bool) error {
+	want := join.RoleGateway
+	if thisMachineIsLocalAI {
+		want = join.RoleLocalAI
+	}
+	if codeRole == want {
+		return nil
+	}
+	return fmt.Errorf("gateway: this join code is for a %q machine, not a %q one: ask your administrator for a %s code", codeRole, want, want)
+}

@@ -30,3 +30,25 @@ func TestPathsForScopesTokenAndPlanToTheConfig(t *testing.T) {
 		t.Fatalf("token should sit next to its config: %+v", a)
 	}
 }
+
+func TestValidateRoleChoice(t *testing.T) {
+	cases := []struct {
+		code    string
+		localAI bool
+		ok      bool
+	}{
+		{"local-ai", true, true},
+		{"gateway", false, true},
+		{"gateway", true, false},
+		{"local-ai", false, false},
+		{"member", false, false},
+		{"member", true, false},
+		{"", false, false},
+	}
+	for _, c := range cases {
+		err := ValidateRoleChoice(c.code, c.localAI)
+		if (err == nil) != c.ok {
+			t.Errorf("code=%q localAI=%v: err=%v want ok=%v", c.code, c.localAI, err, c.ok)
+		}
+	}
+}
