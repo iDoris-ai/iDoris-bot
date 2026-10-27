@@ -27,8 +27,11 @@ const (
 	PhaseSwitching    Phase = "switching-profile"
 	PhaseEnrolling    Phase = "enrolling"
 	PhaseNeedsApprove Phase = "needs-admin-approval"
-	PhaseBlocked      Phase = "blocked-foreign-tailnet"
-	PhaseError        Phase = "error"
+	// PhaseRoutesPending means the node is up and advertising, and Headscale
+	// has not approved every configured route yet. The backend stays Running.
+	PhaseRoutesPending Phase = "routes-pending-approval"
+	PhaseBlocked       Phase = "blocked-foreign-tailnet"
+	PhaseError         Phase = "error"
 )
 
 // KeySource yields a fresh node auth key when the reconciler needs one.
@@ -78,22 +81,27 @@ type Options struct {
 
 // Snapshot is the observable state exposed over the status API.
 type Snapshot struct {
-	Phase           Phase     `json:"phase"`
-	ControlURL      string    `json:"control_url"`
-	BackendState    string    `json:"backend_state,omitempty"`
-	CurrentControl  string    `json:"current_control_url,omitempty"`
-	TailnetIPs      []string  `json:"tailnet_ips,omitempty"`
-	SelfName        string    `json:"self_dns_name,omitempty"`
-	PeersOnline     int       `json:"peers_online"`
-	KeyExpiry       time.Time `json:"key_expiry,omitempty"`
-	LastError       string    `json:"last_error,omitempty"`
-	Attempts        int       `json:"login_attempts"`
+	Phase           Phase           `json:"phase"`
+	ControlURL      string          `json:"control_url"`
+	BackendState    string          `json:"backend_state,omitempty"`
+	CurrentControl  string          `json:"current_control_url,omitempty"`
+	TailnetIPs      []string        `json:"tailnet_ips,omitempty"`
+	SelfName        string          `json:"self_dns_name,omitempty"`
+	PeersOnline     int             `json:"peers_online"`
+	KeyExpiry       time.Time       `json:"key_expiry,omitempty"`
+	LastError       string          `json:"last_error,omitempty"`
+	Attempts        int             `json:"login_attempts"`
 	PreviousProfile string          `json:"previous_profile_id,omitempty"`
 	UpdatedAt       time.Time       `json:"updated_at"`
 	Mode            string          `json:"mode,omitempty"`
 	ModeReason      string          `json:"mode_reason,omitempty"`
 	Forwards        []ForwardStatus `json:"forwards,omitempty"`
 	SOCKS5          *SOCKS5Status   `json:"socks5,omitempty"`
+	// Routes is set only when AdvertiseRoutes is configured.
+	Routes []RouteReport `json:"routes,omitempty"`
+	// AdminHint is the exact Headscale command while any route is unapproved.
+	// It is not LastError: the node is still connected.
+	AdminHint string `json:"admin_hint,omitempty"`
 }
 
 // Reconciler converges tailscaled onto the configured control server.
@@ -241,6 +249,10 @@ func (r *Reconciler) Step(ctx context.Context) (Snapshot, error) {
 	r.set(func(s *Snapshot) {
 		s.BackendState = state
 		s.CurrentControl = prefs.ControlURL
+		// Drop route fields from the previous pass. The Running branch sets
+		// them again when advertise_routes is configured.
+		s.Routes = nil
+		s.AdminHint = ""
 	})
 
 	if !same {
@@ -255,7 +267,11 @@ func (r *Reconciler) Step(ctx context.Context) (Snapshot, error) {
 		if err := r.reconcileRoutes(ctx, prefs); err != nil {
 			return r.fail(fmt.Errorf("advertise routes: %w", err)), err
 		}
-		return r.set(func(s *Snapshot) { fillSelf(s, st); s.Phase = PhaseConnected; s.LastError = "" }), nil
+		return r.set(func(s *Snapshot) {
+			fillSelf(s, st)
+			s.LastError = ""
+			s.Routes, s.AdminHint, s.Phase = routePhase(r.opt.Hostname, r.opt.AdvertiseRoutes, st)
+		}), nil
 	case ipn.Starting.String():
 		if r.needsLoginWhileStarting(st) {
 			return r.login(ctx, "starting-without-node")
