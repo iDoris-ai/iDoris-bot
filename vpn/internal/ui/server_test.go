@@ -309,7 +309,9 @@ func TestJoinPlanAndApplyHideTheToken(t *testing.T) {
 	if status != http.StatusOK || bytes.Contains(body, []byte(uiToken)) || len(plan.Routes) != 1 || plan.Routes[0] != "10.251.73.10/32" || !plan.WillAutoApprove {
 		t.Fatalf("plan %d %+v %s", status, plan.Routes, body)
 	}
-	status, body = call("/api/apply", map[string]any{})
+	status, body = call("/api/apply", map[string]any{
+		"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"},
+	})
 	if status != http.StatusOK || bytes.Contains(body, []byte(uiToken)) || !bytes.Contains(body, []byte("sudo idoris-vpnd gateway apply")) {
 		t.Fatalf("apply %d %s", status, body)
 	}
