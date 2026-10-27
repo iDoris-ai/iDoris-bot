@@ -287,14 +287,12 @@ func accessLines(plan Plan, vals map[string]json.RawMessage) []string {
 	if !ok || addr == "" {
 		return nil
 	}
-	host := strings.TrimSpace(plan.Hostname)
-	if host == "" {
-		host = "<hostname>"
-	}
+	// plan.Hostname is THIS machine's name. The wizard does not know the Local AI
+	// host, so it only shows the shape of the name; the administrator supplies it.
 	return []string{
 		"SOCKS5 " + addr,
 		"SOCKS5 credential file " + socksAuthPath(plan.ConfigPath, vals),
-		"Reach the Local AI through this proxy by its MagicDNS name " + host + ".idoris.internal",
+		"Reach the Local AI through this proxy by its MagicDNS name <local-ai-hostname>.idoris.internal (your administrator gives you the exact name)",
 	}
 }
 
