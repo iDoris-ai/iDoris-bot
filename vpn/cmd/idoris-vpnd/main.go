@@ -104,7 +104,11 @@ func bindCommon(fs *flag.FlagSet, cfg *vpnd.Config, configPath *string) {
 	fs.StringVar(&cfg.Role, "role", "", "member|local-ai|gateway|admin (default member; discovery wins when it returns a role)")
 	fs.StringVar(&cfg.StateDir, "state-dir", "", "embedded node state directory (default ~/.idoris/vpn-state)")
 	fs.StringVar(&cfg.StateFile, "state-file", "", "identity binding file (default ~/.idoris/vpnd-state.json)")
-	fs.StringVar(&cfg.SOCKS5Listen, "socks5-listen", "", "loopback SOCKS5 address into the tailnet")
+	fs.StringVar(&cfg.SOCKS5Listen, "socks5-listen", "", "loopback or unix: SOCKS5 address into the tailnet")
+	fs.StringVar(&cfg.SOCKS5AuthFile, "socks5-auth-file", "", "0600 file containing one SOCKS5 user:password line")
+	fs.BoolVar(&cfg.SOCKS5AllowAnonymous, "socks5-allow-anonymous", false, "allow unauthenticated SOCKS5 (off by default)")
+	fs.IntVar(&cfg.MaxConnections, "max-connections", 0, "per-listener connection cap; 0 means 64")
+	fs.StringVar(&cfg.DialTimeout, "dial-timeout", "", "tailnet dial timeout, for example 10s; empty means 10s")
 }
 
 // loadConfig merges file < env < flags. Flags only override when set.
@@ -158,11 +162,19 @@ func loadConfig(args []string, fs *flag.FlagSet) (*vpnd.Config, error) {
 	override("state-dir", &cfg.StateDir, flagCfg.StateDir)
 	override("state-file", &cfg.StateFile, flagCfg.StateFile)
 	override("socks5-listen", &cfg.SOCKS5Listen, flagCfg.SOCKS5Listen)
+	override("socks5-auth-file", &cfg.SOCKS5AuthFile, flagCfg.SOCKS5AuthFile)
+	override("dial-timeout", &cfg.DialTimeout, flagCfg.DialTimeout)
 	if set["enroll-allow-insecure"] {
 		cfg.EnrollAllowInsecure = flagCfg.EnrollAllowInsecure
 	}
 	if set["accept-routes"] {
 		cfg.AcceptRoutes = flagCfg.AcceptRoutes
+	}
+	if set["socks5-allow-anonymous"] {
+		cfg.SOCKS5AllowAnonymous = flagCfg.SOCKS5AllowAnonymous
+	}
+	if set["max-connections"] {
+		cfg.MaxConnections = flagCfg.MaxConnections
 	}
 	if set["takeover"] {
 		cfg.Takeover = &takeover
@@ -453,19 +465,25 @@ func accessOptions(cfg *vpnd.Config, mode, ourControl string, src vpnd.StatusSou
 			}
 			return vpnd.AccessOpen(mode, current, ourControl, phase)
 		},
+		MaxConnections: cfg.MaxConnections,
+		DialTimeout:    cfg.DialTimeoutDuration(),
+		SOCKS5AuthFile: cfg.SOCKS5AuthFile,
+		AllowAnonymous: cfg.SOCKS5AllowAnonymous,
 	}
-	if cfg.SOCKS5Listen == "" {
-		return opt, nil
-	}
-	dir := cfg.StateDir
-	if dir == "" {
-		var err error
-		dir, err = vpnd.DefaultStateDir()
-		if err != nil {
-			return vpnd.AccessOptions{}, err
+	// An explicit auth file or anonymous opt-in wins. Otherwise a listener
+	// gets a generated credential under the state directory. Passing StateDir
+	// together with AllowAnonymous would create a file instead.
+	if cfg.SOCKS5Listen != "" && cfg.SOCKS5AuthFile == "" && !cfg.SOCKS5AllowAnonymous {
+		dir := cfg.StateDir
+		if dir == "" {
+			var err error
+			dir, err = vpnd.DefaultStateDir()
+			if err != nil {
+				return vpnd.AccessOptions{}, err
+			}
 		}
+		opt.StateDir = dir
 	}
-	opt.StateDir = dir
 	return opt, nil
 }
 

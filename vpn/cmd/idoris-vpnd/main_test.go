@@ -76,6 +76,39 @@ func TestAcceptDNSAndAdvertiseTagsFlags(t *testing.T) {
 	}
 }
 
+func TestAccessFlags(t *testing.T) {
+	t.Setenv("IDORIS_VPN_AUTH_KEY", "k")
+	t.Setenv("IDORIS_VPN_CONTROL_URL", "https://vpn.example")
+	t.Setenv("IDORIS_VPN_MAX_CONNECTIONS", "4")
+	dir := t.TempDir()
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	cfg, err := loadConfig([]string{
+		"--socks5-listen", "unix:" + dir + "/socks.sock",
+		"--socks5-auth-file", dir + "/socks5.auth",
+		"--max-connections", "8",
+		"--dial-timeout", "3s",
+		"--mode", "embedded",
+	}, fs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SOCKS5Listen != "unix:"+dir+"/socks.sock" || cfg.SOCKS5AuthFile != dir+"/socks5.auth" {
+		t.Fatalf("socks %+v", cfg)
+	}
+	if cfg.SOCKS5AllowAnonymous || cfg.MaxConnections != 8 || cfg.DialTimeout != "3s" {
+		t.Fatalf("flags did not override env: anon=%v max=%d dial=%s", cfg.SOCKS5AllowAnonymous, cfg.MaxConnections, cfg.DialTimeout)
+	}
+
+	fs = flag.NewFlagSet("run", flag.ContinueOnError)
+	if _, err := loadConfig([]string{"--socks5-allow-anonymous", "--socks5-auth-file", "/tmp/a"}, fs); err == nil || !strings.Contains(err.Error(), "socks5_allow_anonymous") {
+		t.Fatalf("conflict: %v", err)
+	}
+	fs = flag.NewFlagSet("run", flag.ContinueOnError)
+	if _, err := loadConfig([]string{"--dial-timeout", "0s"}, fs); err == nil || !strings.Contains(err.Error(), "dial_timeout") {
+		t.Fatalf("zero dial: %v", err)
+	}
+}
+
 func TestTakeoverAndNoTakeoverExclusive(t *testing.T) {
 	t.Setenv("IDORIS_VPN_AUTH_KEY", "k")
 	t.Setenv("IDORIS_VPN_CONTROL_URL", "https://vpn.example")
