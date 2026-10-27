@@ -148,10 +148,12 @@ func loadConfig(args []string, fs *flag.FlagSet) (*vpnd.Config, error) {
 	}
 	override("control-url", &cfg.ControlURL, flagCfg.ControlURL)
 	override("enroll-url", &cfg.EnrollURL, flagCfg.EnrollURL)
-	override("enroll-token", &cfg.EnrollToken, flagCfg.EnrollToken)
-	override("enroll-token-file", &cfg.EnrollTokenFile, flagCfg.EnrollTokenFile)
-	override("auth-key", &cfg.AuthKey, flagCfg.AuthKey)
-	override("auth-key-file", &cfg.AuthKeyFile, flagCfg.AuthKeyFile)
+	if err := overlayCredential(set, "enroll-token", "enroll-token-file", &cfg.EnrollToken, &cfg.EnrollTokenFile, flagCfg.EnrollToken, flagCfg.EnrollTokenFile); err != nil {
+		return nil, err
+	}
+	if err := overlayCredential(set, "auth-key", "auth-key-file", &cfg.AuthKey, &cfg.AuthKeyFile, flagCfg.AuthKey, flagCfg.AuthKeyFile); err != nil {
+		return nil, err
+	}
 	override("hostname", &cfg.Hostname, flagCfg.Hostname)
 	override("tailscale-socket", &cfg.TailscaleSocket, flagCfg.TailscaleSocket)
 	override("listen", &cfg.Listen, flagCfg.Listen)
@@ -210,6 +212,27 @@ func loadConfig(args []string, fs *flag.FlagSet) (*vpnd.Config, error) {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// overlayCredential applies one flag layer to a credential pair. A visited
+// flag is set even when its value is empty, and it clears the other side
+// from the config file and the environment. Both flags at once is an error.
+func overlayCredential(set map[string]bool, inlineFlag, fileFlag string, inlineDst, fileDst *string, inlineVal, fileVal string) error {
+	inlineSet := set[inlineFlag]
+	fileSet := set[fileFlag]
+	if inlineSet && fileSet {
+		return fmt.Errorf("--%s and --%s are both set; set only one", inlineFlag, fileFlag)
+	}
+	if inlineSet {
+		*inlineDst = inlineVal
+		*fileDst = ""
+		return nil
+	}
+	if fileSet {
+		*fileDst = fileVal
+		*inlineDst = ""
+	}
+	return nil
 }
 
 func newLogger(level string) *slog.Logger {

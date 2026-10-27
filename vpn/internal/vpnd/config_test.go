@@ -145,11 +145,17 @@ func TestRoleDefaultsAndRejectsEmbeddedService(t *testing.T) {
 
 func TestEnvCoversEveryJSONField(t *testing.T) {
 	typ := reflect.TypeOf(Config{})
+	// One layer must not set both sides of a credential. Cover the inline side
+	// here; the file side is covered by TestR3c2CredentialLayers.
+	skip := map[string]bool{"enroll_token_file": true, "auth_key_file": true}
 	for i := 0; i < typ.NumField(); i++ {
 		field := typ.Field(i)
 		name := jsonFieldName(field)
 		if name == "" {
 			t.Fatalf("%s has no json name, so it has no IDORIS_VPN_ variable", field.Name)
+		}
+		if skip[name] {
+			continue
 		}
 		sample, err := envSample(field.Type)
 		if err != nil {
@@ -163,8 +169,12 @@ func TestEnvCoversEveryJSONField(t *testing.T) {
 	}
 	got := reflect.ValueOf(cfg).Elem()
 	for i := 0; i < typ.NumField(); i++ {
+		name := jsonFieldName(typ.Field(i))
+		if skip[name] {
+			continue
+		}
 		if got.Field(i).IsZero() {
-			t.Fatalf("%s was not set via %s", typ.Field(i).Name, EnvName(jsonFieldName(typ.Field(i))))
+			t.Fatalf("%s was not set via %s", typ.Field(i).Name, EnvName(name))
 		}
 	}
 	if cfg.Forwards[0].Listen != "127.0.0.1:1" || len(cfg.AdvertiseRoutes) != 2 || !cfg.EnrollAllowInsecure || !cfg.AcceptRoutes {
