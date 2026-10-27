@@ -669,11 +669,14 @@ func r3w2SideConfigChecks(t *testing.T, e *wizEnv, enrollURL, gatewayCode, devic
 	for _, want := range []string{
 		"access: SOCKS5 127.0.0.1:1080",
 		"access: SOCKS5 credential file /root/.idoris/vpn-state/socks5.auth",
-		"side-member.idoris.internal",
+		"<local-ai-hostname>.idoris.internal",
 	} {
 		if !strings.Contains(mout, want) {
 			t.Fatalf("member access missing %s:\n%s", want, e.redact(mout))
 		}
+	}
+	if strings.Contains(mout, "side-member.idoris.internal") {
+		t.Fatalf("access text names this member's own host as the Local AI:\n%s", e.redact(mout))
 	}
 	mb := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", memberPath)
 	if !strings.Contains(mb, `"socks5_listen": "127.0.0.1:1080"`) || strings.Contains(mb, "socks5_auth_file") || strings.Contains(mb, "socks5_allow_anonymous") || !strings.Contains(mb, `"role": "member"`) {
