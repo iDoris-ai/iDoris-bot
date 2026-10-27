@@ -10,7 +10,7 @@ Bridge 除了把 LINE / Telegram / WhatsApp 等中心化 SNS 桥接到客户本�
 
 | 目标 | 说明 |
 |---|---|
-| 客户端零改动 | 成员设备只安装 **官方 Tailscale 客户端**（App Store / Homebrew / apt / MSI / iOS / Android），不分发修改版 |
+| 客户端零改动 | 成员设备只安装 **官方 Tailscale 客户端**（App Store / Homebrew / apt / MSI / iOS / Android），不分发修改版。**唯一例外**：`embedded` 模式（用来与成员已有的 Tailscale 并存）在 `idoris-vpnd` 进程内运行 Tailscale 官方开源库（`tsnet`），不是驱动已安装的官方客户端；它随 `idoris-vpnd` 发布，升级需要发新版 `idoris-vpnd`，见 [13](13-VPN-CLIENT-MODES.md) |
 | 控制面自建 | 坐标服务器是我们运营的 **Headscale**（官方开源实现，不 fork），不连 Tailscale Inc. 的 SaaS |
 | 无感加入 | 成员机器上跑一个后台守护进程 `idoris-vpnd`，它让 Tailscale 自动登录到我们的服务器地址，断线/过期自动续期 |
 | 服务中小组织 | **默认一个组织**（十几个人加一台 Local AI）。多组织是显式的进阶选项：每个组织 = 一个 Headscale user + 一个专属 tag `tag:<租户>-local-ai`，ACL 按租户逐条授权；成员互不可达，只能访问本组织 Local AI 主机的指定端口 |
@@ -119,7 +119,7 @@ sequenceDiagram
     end
     loop 每 5s
         D->>T: Status
-        Note over D: Running→connected；Stopped→EditPrefs WantRunning；NeedsLogin（节点被过期）→立即重新 enroll；连续失败时观望期 20s→40s→80s…封顶 10 分钟
+        Note over D: Running→connected；Stopped→EditPrefs WantRunning；NeedsLogin（节点被过期）→已有 node key 时先等约 15 秒的恢复窗口，仍未恢复才重新 enroll；连续失败时观望期 20s→40s→80s…封顶 10 分钟
     end
 ~~~
 
@@ -129,7 +129,7 @@ sequenceDiagram
 - **与用户已有 Tailscale 账号共存**：`mode` 有三档，默认 `auto`。`auto` 只在不会抢占别人登录时才驱动系统客户端（未登录、全新安装、或已经在我们的控制面上）；系统 tailscaled 不可达，或已登录别的控制面而又没有显式 `takeover: true` 时，改用进程内的 `tsnet` 用户态节点：自有状态目录，不碰 TUN，不改系统 DNS，只在回环地址上提供端口转发与 SOCKS5。`takeover` 默认 **false**；显式 `takeover: true` 才会切走系统客户端并记录原 profile。判定表与限制见 [13](13-VPN-CLIENT-MODES.md)。移动端同一时刻只能有一个 VPN，官方 App 只能用多账号快速切换，不能并存。
 - **网关角色**：`advertise_routes` 在 `system` 模式下写入 prefs 并纠正漂移，`embedded` 模式拒绝该配置。路由仍需 Headscale 批准（手动或 `autoApprovers`）；Linux 网关还要 `net.ipv4.ip_forward=1`。见 [14](14-VPN-OPERATIONS.md)、[15](15-VPN-LAN-AND-GATEWAY.md)。
 - **登录调用顺序**：与官方 `tailscale up --auth-key` 完全一致：`CheckPrefs` → `Start` → `StartLoginInteractive`。实测证明只调 `Start` 时，全新节点会一直停在 NeedsLogin，从不联系控制面。`Start` 会重建控制客户端并清掉残留的浏览器登录 URL，所以随后的 login-interactive 一定使用这把 key，不会弹浏览器；它还会强制生成新 node key，过期续期正需要这一点。
-- **一次性 key 的节约**：每次登录只领一把 key。登录后进入观望期，观望期内不再领 key：首次 20s，此后每次未能进入 Running 的连续尝试翻倍，封顶 10 分钟，进入 Running 后清零。健康节点被过期后的第一次续期立即进行。tailscaled 不可达等错误另按 2s→2min 指数退避加 ±20% 抖动。实测对照：修复前持续失败时约 2 分钟铸了 7 把 key，修复后在 +0s、+20s、+60s 各一把。
+- **一次性 key 的节约**：每次登录只领一把 key。登录后进入观望期，观望期内不再领 key：首次 20s，此后每次未能进入 Running 的连续尝试翻倍，封顶 10 分钟，进入 Running 后清零。健康节点被过期后，若本机已有 node key，会先等约 15 秒的恢复窗口（tsnet 重启时会短暂处于 NeedsLogin 并自己用已存的 key 恢复，此时再领 key 会取消恢复并浪费一把），超过窗口才续期。tailscaled 不可达等错误另按 2s→2min 指数退避加 ±20% 抖动。实测对照：修复前持续失败时约 2 分钟铸了 7 把 key，修复后在 +0s、+20s、+60s 各一把。
 - **启动不铸 key**：未固定 `control_url` 时，守护进程启动只调 `GET /v1/discover` 获取地址。已注册节点重启不消耗任何 key，集成测试对此做了断言。
 - **状态 API**：默认 `unix:~/.idoris/vpnd.sock`（0600）或 `tcp:127.0.0.1:<port>`（只允许回环）。`GET /healthz`（connected→200，否则 503）、`GET /v1/status`（JSON：phase、tailnet_ips、self_dns_name、key_expiry、last_error、login_attempts、previous_profile_id）。Bridge Connector 后续用它判断 Local AI 是否可达。
 - **服务安装**：`idoris-vpnd service install --config ~/.idoris/vpnd.json` 生成 launchd LaunchAgent（macOS，KeepAlive）或 systemd user unit（Linux，Restart=always）。Windows 暂不内建安装器，可用 NSSM/任务计划运行 `idoris-vpnd run`。
@@ -140,11 +140,11 @@ sequenceDiagram
 
 | 风险 | 控制 |
 |---|---|
-| Headscale API key 泄露 = 全网管理权 | 服务用 key 只存在于 `idoris-vpn-enroll` 容器挂载的文件里，容器以非 root、只读根文件系统、`cap_drop: ALL` 运行；客户端拿到的是**一次性、10 分钟**的 preauthkey。运维登录 Headplane 用各自的 API key，需单独保管与轮换 |
-| 租户 token 泄露 | token 服务端只存 SHA-256；可按租户配多把 token 以便轮换；按租户限流（默认 30/min）；每次签发写审计日志（tenant、hostname、key id） |
+| Headscale API key 泄露 = 全网管理权 | 服务用 key 只存在于 `idoris-vpn-enroll` 容器挂载的文件里，容器以非 root（bootstrap 以当前用户的 uid/gid 运行它，**以 root 执行 bootstrap 会让注册服务也以 root 运行**，应改用专用普通用户）、只读根文件系统、`cap_drop: ALL` 运行；客户端拿到的是**一次性、10 分钟**的 preauthkey。运维登录 Headplane 用各自的 API key，需单独保管与轮换 |
+| 令牌泄露 | 令牌服务端只存 SHA-256（客户端保存的是**明文**令牌，被盗即可注册）；每台设备/每人单独签发邀请令牌（带标签），可单独撤销；按组织限流（默认 30/min）；每次签发写审计日志（tenant、hostname、令牌标签、来源地址） |
 | 中间人改写 control_url | 注册 URL 强制 https（`enroll_allow_insecure` 仅限实验室）；客户端若固定了 `control_url`，服务端返回不一致即拒绝 |
 | 守护进程劫持用户私有 tailnet | `takeover` 默认 false；`auto` 发现外部登录时改用独立的嵌入式节点，原登录不动（集成测试断言它全程保持 Running）；只有显式 `takeover: true` 才切换并记录 previous_profile；状态 API 显示 `mode` 与 `mode_reason` |
-| 节点被盗/离职 | 运维在 Headplane 或 API `expire`/`delete`；成员节点 180 天过期来自本部署的 `node.expiry: 4320h`（Headscale 默认 0，即不过期），守护进程会自动续期；**带 tag 的 Local AI 节点永不过期**，失窃只能手动 expire/delete；ephemeral 租户用于临时设备 |
+| 节点被盗/离职 | **先撤销该设备的邀请令牌，再 `expire`/`delete` 节点**（`ctl.sh offboard`）。只做 `expire` 或 `delete` 不够：守护进程会用同一枚令牌自动续期或重新注册，等于没撤销。成员节点 180 天过期来自本部署的 `node.expiry: 4320h`（Headscale 默认 0，即不过期），守护进程会自动续期；**带 tag 的 Local AI 节点永不过期**，失窃要撤销令牌后手动 expire/delete；ephemeral 租户用于临时设备。仍在使用整个组织共用的老令牌时，只能轮换这枚共用令牌，影响所有成员 |
 | 横向移动 / 跨租户 | ACL 按租户授权，只放行 `<租户>@` → 本租户 Local AI 指定端口；Tailscale SSH 仅 `group:admins` 且 `check` 模式，不允许以 root 登录 |
 | 中继被蹭 | DERP `verify_clients: true` |
 
@@ -197,7 +197,7 @@ sequenceDiagram
 5. **管理 UI**：Headplane 默认只绑 `127.0.0.1`（配 SSH 隧道）；`HEADPLANE_BIND` 可改为办公室局域网地址；`--profile tailnet-admin` 让它只在 VPN 内可达，成员访问不到。
 6. **隔离回归**：`bash deploy/vpn/test/probe.sh`，两个组织加管理员加网关，47 项允许/拒绝断言。
 7. 备份内容：`db.sqlite`（含 `-wal`/`-shm`）、`noise_private.key`、`derp_server_private.key`、Headplane 数据卷。私钥必须和 sqlite 一起恢复。
-8. 观测：注册服务每次签发写一行审计日志，`remote=` 目前是反代 IP；客户端用 `idoris-vpnd status`。
+8. 观测：注册服务每次签发写一行审计日志（含令牌标签与来源地址；只有配置了 `trusted_proxies` 才信任 X-Forwarded-For，否则记录的是反代地址）；`/readyz` 检查 Headscale 连通与 API key 有效期；客户端用 `idoris-vpnd status`。
 
 ## 9. 待决问题
 
