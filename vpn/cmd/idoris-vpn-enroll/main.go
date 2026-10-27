@@ -125,6 +125,18 @@ func apiKey(cfg *enroll.Config) (string, error) {
 	return "", errors.New("no Headscale API key: set HEADSCALE_API_KEY or headscale_api_key_file")
 }
 
+// controlProber adapts the Headscale client to enroll.ControlProber.
+// The two packages cannot share the interface: enroll already imports headscale.
+type controlProber struct{ c *headscale.Client }
+
+func (p controlProber) ProbeControl(ctx context.Context) (enroll.ControlProbe, error) {
+	st, err := p.c.ProbeControl(ctx)
+	if err != nil {
+		return enroll.ControlProbe{}, err
+	}
+	return enroll.ControlProbe{ExpiresAt: st.ExpiresAt, Known: st.Known}, nil
+}
+
 func hsClient(cfg *enroll.Config) (*headscale.Client, error) {
 	k, err := apiKey(cfg)
 	if err != nil {
@@ -153,6 +165,7 @@ func serveCmd(args []string) error {
 	if err != nil {
 		return err
 	}
+	srv.SetControlProber(controlProber{hs})
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		return err
