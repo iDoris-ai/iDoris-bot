@@ -38,6 +38,7 @@ Usage:
   idoris-vpn-enroll version
 
 serve reloads the config on SIGHUP. An invalid file keeps the previous config.
+A bad or empty headscale_api_key_file keeps the previous Headscale client.
 invite prints one join code to stdout and nothing else. The code contains the
 token; it is not written to the config file or the log.
 list-credentials prints the label, a hash prefix, and created_at. It never
@@ -178,7 +179,7 @@ func serveCmd(args []string) error {
 	defer signal.Stop(hup)
 	go func() {
 		for range hup {
-			if err := reloadFromDisk(srv, *configPath); err != nil {
+			if err := reloadFromDisk(srv, *configPath, log); err != nil {
 				log.Error("config reload rejected; keeping the previous config", "err", err)
 				continue
 			}
@@ -199,13 +200,59 @@ func serveCmd(args []string) error {
 }
 
 // reloadFromDisk reads the file again, reapplies environment overrides, and
-// swaps the server only when the result validates.
-func reloadFromDisk(srv *enroll.Server, path string) error {
+// swaps the tenant config only when the result validates. When the file names
+// headscale_api_key_file and HEADSCALE_API_KEY is unset, it also probes that
+// key and swaps the client. A bad or empty key keeps the client already
+// serving and is logged without the key. The caller must not treat that as a
+// rejected reload: the tenant config has already been swapped.
+func reloadFromDisk(srv *enroll.Server, path string, log *slog.Logger) error {
 	cfg, err := loadConfig(path)
 	if err != nil {
 		return err
 	}
-	return srv.Reload(*cfg)
+	if err := srv.Reload(*cfg); err != nil {
+		return err
+	}
+	reloadHeadscaleKey(srv, cfg, log)
+	return nil
+}
+
+func reloadHeadscaleKey(srv *enroll.Server, cfg *enroll.Config, log *slog.Logger) {
+	if log == nil {
+		log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	if os.Getenv("HEADSCALE_API_KEY") != "" {
+		return
+	}
+	path := strings.TrimSpace(cfg.HeadscaleAPIKeyFile)
+	if path == "" {
+		return
+	}
+	b, err := os.ReadFile(path) //nolint:gosec // G304: the path is the operator's headscale_api_key_file
+	if err != nil {
+		log.Warn("headscale api key file unreadable; keeping the previous client", "path", path, "err", err)
+		return
+	}
+	key := strings.TrimSpace(string(b))
+	if key == "" {
+		log.Warn("headscale api key file is empty; keeping the previous client", "path", path)
+		return
+	}
+	hs := &headscale.Client{BaseURL: cfg.HeadscaleURL, APIKey: key}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := hs.ProbeControl(ctx); err != nil {
+		var ae *headscale.APIError
+		if errors.As(err, &ae) {
+			log.Warn("headscale api key probe failed; keeping the previous client", "status", ae.Status)
+			return
+		}
+		log.Warn("headscale api key probe failed; keeping the previous client")
+		return
+	}
+	srv.SetMinter(hs)
+	srv.SetControlProber(controlProber{hs})
+	log.Info("headscale api key reloaded", "path", path)
 }
 
 func inviteCmd(args []string, stdout io.Writer) error {
