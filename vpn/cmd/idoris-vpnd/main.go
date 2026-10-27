@@ -388,7 +388,7 @@ func prepareKeys(cfg *vpnd.Config, log *slog.Logger) (vpnd.KeySource, string, vp
 	if derr != nil {
 		url, degraded, rerr := vpnd.ResolveStartupControl(cfg.ControlURL, "", saved, false)
 		if rerr != nil {
-			return nil, "", ident, nil, false, fmt.Errorf("%w (discovery: %v)", rerr, derr)
+			return nil, "", ident, nil, false, fmt.Errorf("%w (discovery: %w)", rerr, derr)
 		}
 		cfg.Role = vpnd.RoleWhileEnrollDown(cfg.Role, binding.Get().Role)
 		log.Warn("enrollment discovery failed; resuming the saved control URL", "err", derr, "control_url", url, "role", cfg.Role)
