@@ -74,3 +74,31 @@ func TestStatusViewAddsModeAndForwards(t *testing.T) {
 		t.Fatalf("health %d %q", health.Code, b)
 	}
 }
+
+func TestStatusPrintsPendingRoutes(t *testing.T) {
+	src := stubStatus{snap: Snapshot{
+		Phase: PhaseRoutesPending,
+		Routes: []RouteReport{
+			{CIDR: "10.251.73.10/32", Advertised: true, Approved: false},
+		},
+		AdminHint: "headscale nodes approve-routes --identifier office-gw --routes 10.251.73.10/32",
+	}}
+	rr := httptest.NewRecorder()
+	StatusHandler(src, "v-test").ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/v1/status", nil))
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	text := FormatStatus(body)
+	for _, want := range []string{"routes-pending-approval", "10.251.73.10/32", "pending", "admin_hint:", "office-gw"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("text missing %q:\n%s", want, text)
+		}
+	}
+	health := httptest.NewRecorder()
+	StatusHandler(src, "v-test").ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	b, _ := io.ReadAll(health.Body)
+	if health.Code != http.StatusServiceUnavailable || string(b) != "routes-pending-approval\n" {
+		t.Fatalf("health %d %q", health.Code, b)
+	}
+}

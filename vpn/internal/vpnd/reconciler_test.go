@@ -13,6 +13,7 @@ import (
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/types/key"
 	"tailscale.com/types/persist"
+	"tailscale.com/types/views"
 )
 
 const ours = "https://vpn.idoris.example"
@@ -408,6 +409,24 @@ func TestBackoffIsBoundedAndJittered(t *testing.T) {
 	}
 }
 
+func TestLoginDoesNotSendAdvertiseTags(t *testing.T) {
+	want := []netip.Prefix{netip.MustParsePrefix("10.251.73.10/32")}
+	be := &fakeBackend{state: ipn.NeedsLogin}
+	r := newR(t, be, &countingKeys{}, func(o *Options) {
+		o.AdvertiseRoutes = want
+		o.AdvertiseTags = []string{"tag:acme-gateway"}
+	})
+	if _, err := r.Step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(be.prefs.AdvertiseTags) != 0 {
+		t.Fatalf("login prefs sent tags %v; Headscale v0.29.6 rejects that on a pre-auth key", be.prefs.AdvertiseTags)
+	}
+	if !sameRoutes(be.prefs.AdvertiseRoutes, want) {
+		t.Fatalf("routes %+v", be.prefs.AdvertiseRoutes)
+	}
+}
+
 func TestLoginAdvertisesRoutes(t *testing.T) {
 	want := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("192.168.1.0/24")}
 	be := &fakeBackend{state: ipn.NeedsLogin}
@@ -425,11 +444,14 @@ func TestAdvertisedRoutesReconcileDrift(t *testing.T) {
 	be := &fakeBackend{state: ipn.Running, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true}}
 	r := newR(t, be, &countingKeys{}, func(o *Options) { o.AdvertiseRoutes = want })
 	snap, err := r.Step(context.Background())
-	if err != nil || snap.Phase != PhaseConnected {
-		t.Fatalf("step: %+v %v", snap, err)
+	if err != nil || snap.Phase != PhaseRoutesPending || be.state != ipn.Running {
+		t.Fatalf("unapproved routes stay connected: %+v state %v %v", snap, be.state, err)
 	}
 	if !sameRoutes(be.prefs.AdvertiseRoutes, want) {
 		t.Fatalf("routes %+v", be.prefs.AdvertiseRoutes)
+	}
+	if snap.AdminHint == "" || len(snap.Routes) != 1 || snap.Routes[0].Approved || snap.LastError != "" {
+		t.Fatalf("pending report: %+v", snap)
 	}
 	be.calls = nil
 	if _, err := r.Step(context.Background()); err != nil {
@@ -556,6 +578,94 @@ func TestNormalizeControlURL(t *testing.T) {
 	}
 	if SameControlURL(ours, "https://controlplane.tailscale.com") {
 		t.Error("ours must differ from SaaS")
+	}
+}
+
+func prefixSlice(cidrs ...string) *views.Slice[netip.Prefix] {
+	ps := make([]netip.Prefix, 0, len(cidrs))
+	for _, c := range cidrs {
+		ps = append(ps, netip.MustParsePrefix(c))
+	}
+	s := views.SliceOf(ps)
+	return &s
+}
+
+func TestRouteApprovalState(t *testing.T) {
+	want := []netip.Prefix{netip.MustParsePrefix("10.251.73.10/32")}
+	cases := []struct {
+		name     string
+		self     *ipnstate.PeerStatus
+		approved bool
+	}{
+		{name: "primary exact", self: &ipnstate.PeerStatus{PrimaryRoutes: prefixSlice("10.251.73.10/32")}, approved: true},
+		{name: "allowed parent", self: &ipnstate.PeerStatus{AllowedIPs: prefixSlice("10.251.73.0/24")}, approved: true},
+		{name: "tailnet address does not approve", self: &ipnstate.PeerStatus{AllowedIPs: prefixSlice("100.64.0.7/32")}, approved: false},
+		{name: "narrower does not cover a subnet", self: &ipnstate.PeerStatus{PrimaryRoutes: prefixSlice("10.251.73.10/32")}, approved: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			routes := want
+			if tc.name == "narrower does not cover a subnet" {
+				routes = []netip.Prefix{netip.MustParsePrefix("10.251.73.0/24")}
+			}
+			be := &fakeBackend{
+				state: ipn.Running,
+				prefs: ipn.Prefs{ControlURL: ours, WantRunning: true, AdvertiseRoutes: append([]netip.Prefix(nil), routes...)},
+				self:  tc.self,
+			}
+			r := newR(t, be, &countingKeys{}, func(o *Options) {
+				o.AdvertiseRoutes = routes
+				o.Hostname = "office-gw"
+			})
+			snap, err := r.Step(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if be.state != ipn.Running || snap.LastError != "" {
+				t.Fatalf("node must stay up: state %v %+v", be.state, snap)
+			}
+			if len(snap.Routes) != 1 || !snap.Routes[0].Advertised || snap.Routes[0].Approved != tc.approved {
+				t.Fatalf("routes %+v", snap.Routes)
+			}
+			if tc.approved {
+				if snap.Phase != PhaseConnected || snap.AdminHint != "" {
+					t.Fatalf("approved: %+v", snap)
+				}
+				return
+			}
+			if snap.Phase != PhaseRoutesPending || !strings.Contains(snap.AdminHint, "office-gw") || !strings.Contains(snap.AdminHint, snap.Routes[0].CIDR) {
+				t.Fatalf("pending: %+v", snap)
+			}
+		})
+	}
+
+	// Approval arriving on a later pass clears the waiting phase.
+	be := &fakeBackend{
+		state: ipn.Running,
+		prefs: ipn.Prefs{ControlURL: ours, WantRunning: true, AdvertiseRoutes: want},
+		self:  &ipnstate.PeerStatus{AllowedIPs: prefixSlice("100.64.0.8/32")},
+	}
+	r := newR(t, be, &countingKeys{}, func(o *Options) {
+		o.AdvertiseRoutes = want
+		o.Hostname = "office-gw"
+	})
+	snap, err := r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseRoutesPending {
+		t.Fatalf("before: %+v %v", snap, err)
+	}
+	be.self = &ipnstate.PeerStatus{PrimaryRoutes: prefixSlice("10.251.73.10/32")}
+	snap, err = r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseConnected || snap.AdminHint != "" || !snap.Routes[0].Approved {
+		t.Fatalf("after approval: %+v %v", snap, err)
+	}
+}
+
+func TestNoRoutesOmitsRouteStatus(t *testing.T) {
+	be := &fakeBackend{state: ipn.Running, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true}}
+	r := newR(t, be, &countingKeys{}, nil)
+	snap, err := r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseConnected || snap.Routes != nil || snap.AdminHint != "" {
+		t.Fatalf("%+v %v", snap, err)
 	}
 }
 

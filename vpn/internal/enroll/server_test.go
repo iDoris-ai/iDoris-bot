@@ -135,7 +135,7 @@ func TestDiscoverDoesNotMint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.ControlURL != "https://vpn.example.org" || d.Tenant != "acme" {
+	if d.ControlURL != "https://vpn.example.org" || d.Tenant != "acme" || d.Role != "" || len(d.LANCIDRs) != 0 {
 		t.Fatalf("bad discovery %+v", d)
 	}
 	if len(m.calls) != 0 {
@@ -151,6 +151,90 @@ func TestClientRefusesPlainHTTPByDefault(t *testing.T) {
 	c := &Client{URL: "http://enroll.example.org", Token: "x"}
 	if _, err := c.Fetch(context.Background(), Request{}); err == nil || !strings.Contains(err.Error(), "non-https") {
 		t.Fatalf("expected non-https refusal, got %v", err)
+	}
+}
+
+func TestDiscoverReturnsRoleAndApprovedCIDRs(t *testing.T) {
+	m := &fakeMinter{}
+	tok, err := NewToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{
+		ControlURL: "https://vpn.example.org",
+		Tenants: []Tenant{{
+			Name:            "acme",
+			HeadscaleUserID: "1",
+			TokenHashes:     []string{HashToken(tok)},
+			Role:            "gateway",
+			LANCIDRs:        []string{"10.251.73.10/32", "10.20.0.0/16"},
+		}},
+	}
+	s, err := NewServer(cfg, m, slog.New(slog.NewTextHandler(testWriter{t}, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+	d, err := (&Client{URL: ts.URL, Token: tok, AllowInsecure: true}).Discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Role != "gateway" || len(d.LANCIDRs) != 2 || d.LANCIDRs[0] != "10.251.73.10/32" {
+		t.Fatalf("discovery %+v", d)
+	}
+	if len(m.calls) != 0 {
+		t.Fatal("discover minted a key")
+	}
+}
+
+func TestReloadKeepsOldConfigWhenNewOneIsInvalid(t *testing.T) {
+	m := &fakeMinter{}
+	s, tok := newTestServer(t, m)
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	bad := Config{
+		ControlURL: "https://vpn.example.org",
+		Tenants:    []Tenant{{Name: "acme", HeadscaleUserID: "1", TokenHashes: []string{"nope"}, LANCIDRs: []string{"192.168.1.1/24"}}},
+	}
+	if err := s.Reload(bad); err == nil {
+		t.Fatal("invalid config was accepted")
+	}
+	d, err := (&Client{URL: ts.URL, Token: tok, AllowInsecure: true}).Discover(context.Background())
+	if err != nil || d.Tenant != "acme" {
+		t.Fatalf("old config dropped: %v %+v", err, d)
+	}
+
+	nextTok, err := NewToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	good := Config{
+		ControlURL: "https://vpn.example.org",
+		Tenants: []Tenant{{
+			Name:            "acme",
+			HeadscaleUserID: "9",
+			TokenHashes:     []string{HashToken(nextTok)},
+			Role:            "local-ai",
+			LANCIDRs:        []string{"192.168.50.9/32"},
+		}},
+	}
+	if err := s.Reload(good); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Client{URL: ts.URL, Token: tok, AllowInsecure: true}).Discover(context.Background()); !errors.Is(err, ErrRejected) {
+		t.Fatalf("old token still accepted: %v", err)
+	}
+	d, err = (&Client{URL: ts.URL, Token: nextTok, AllowInsecure: true}).Discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Role != "local-ai" || len(d.LANCIDRs) != 1 || d.LANCIDRs[0] != "192.168.50.9/32" {
+		t.Fatalf("reloaded discovery %+v", d)
+	}
+	if len(m.calls) != 0 {
+		t.Fatal("reload path minted a key")
 	}
 }
 
@@ -173,5 +257,25 @@ func TestConfigValidate(t *testing.T) {
 	bad.Tenants = append(bad.Tenants, bad.Tenants[0])
 	if err := bad.Validate(); err == nil {
 		t.Fatal("expected duplicate tenant error")
+	}
+	bad = good
+	bad.Tenants = []Tenant{{Name: "a", HeadscaleUserID: "1", TokenHashes: []string{HashToken("t")}, Role: "boss"}}
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "role") {
+		t.Fatalf("role: %v", err)
+	}
+	bad = good
+	bad.Tenants = []Tenant{{Name: "a", HeadscaleUserID: "1", TokenHashes: []string{HashToken("t")}, LANCIDRs: []string{"192.168.1.1/24"}}}
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "host bits") {
+		t.Fatalf("cidr: %v", err)
+	}
+	bad = good
+	bad.Tenants = []Tenant{{Name: "a", HeadscaleUserID: "1", TokenHashes: []string{HashToken("t")}, LANCIDRs: []string{"not-a-cidr"}}}
+	if err := bad.Validate(); err == nil {
+		t.Fatal("expected cidr parse error")
+	}
+	ok := good
+	ok.Tenants = []Tenant{{Name: "a", HeadscaleUserID: "1", TokenHashes: []string{HashToken("t")}, Role: "gateway", LANCIDRs: []string{"192.168.1.0/24"}}}
+	if err := ok.Validate(); err != nil {
+		t.Fatal(err)
 	}
 }

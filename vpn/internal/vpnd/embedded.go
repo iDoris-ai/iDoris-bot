@@ -26,8 +26,9 @@ type EmbeddedOptions struct {
 	Hostname string
 	// ControlURL is the iDoris Headscale URL. Required.
 	ControlURL string
-	// AdvertiseTags are requested on the node. The control server decides
-	// whether to grant them.
+	// AdvertiseTags is accepted and ignored. Headscale v0.29.6 rejects a
+	// pre-auth-key registration that also requests tags. Tag the node with
+	// the enrollment entry's acl_tags instead.
 	AdvertiseTags []string
 }
 
@@ -90,13 +91,15 @@ func StartEmbedded(opt EmbeddedOptions, log *slog.Logger) (*Embedded, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(opt.AdvertiseTags) > 0 {
+		log.Info("not requesting advertise tags from the embedded node; the pre-auth key's acl tags are applied by Headscale")
+	}
 	srv := &tsnet.Server{
-		Dir:           opt.StateDir,
-		Hostname:      host,
-		ControlURL:    opt.ControlURL,
-		AdvertiseTags: opt.AdvertiseTags,
-		UserLogf:      func(format string, args ...any) { log.Info(formatMsg(format, args...)) },
-		Logf:          func(format string, args ...any) { log.Debug(formatMsg(format, args...)) },
+		Dir:        opt.StateDir,
+		Hostname:   host,
+		ControlURL: opt.ControlURL,
+		UserLogf:   func(format string, args ...any) { log.Info(formatMsg(format, args...)) },
+		Logf:       func(format string, args ...any) { log.Debug(formatMsg(format, args...)) },
 	}
 	if err := srv.Start(); err != nil {
 		return nil, fmt.Errorf("embedded tailscale: %w", err)

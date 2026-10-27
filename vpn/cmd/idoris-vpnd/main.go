@@ -32,12 +32,21 @@ func usage() {
 Usage:
   idoris-vpnd run     [--config FILE] [flags]   run in the foreground (launchd/systemd)
   idoris-vpnd status  [--listen SPEC] [--json]  query a running daemon
+  idoris-vpnd join <code> [--yes] [--no-service] [--role-override ROLE] [--device IP] [--whole-subnet]
+  idoris-vpnd gateway detect [--json]
+  idoris-vpnd gateway setup [--yes] [--device IP] [--whole-subnet] [--no-service]
+  idoris-vpnd gateway apply --plan FILE
+  idoris-vpnd ui [--no-open]
   idoris-vpnd service install|uninstall [--config FILE]   manage the user service
   idoris-vpnd version
 
 Config keys may also be given as IDORIS_VPN_* environment variables.
 --mode auto (default) leaves a foreign system Tailscale alone and uses an
 in-process node. --takeover switches that system Tailscale; the default is not to.
+
+join accepts one code. A gateway code asks whether this machine is the Local AI
+host. --yes skips prompts: a gateway then needs --device or --whole-subnet.
+The program never escalates to root; it prints the sudo command instead.
 `, version.Version)
 }
 
@@ -52,6 +61,12 @@ func main() {
 		err = runCmd(os.Args[2:])
 	case "status":
 		err = statusCmd(os.Args[2:])
+	case "join":
+		err = joinCmd(os.Args[2:], realDeps())
+	case "gateway":
+		err = gatewayCmd(os.Args[2:], realDeps())
+	case "ui":
+		err = uiCmd(os.Args[2:])
 	case "service":
 		err = serviceCmd(os.Args[2:])
 	case "version", "--version", "-v":
