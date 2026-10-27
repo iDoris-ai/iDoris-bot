@@ -125,10 +125,14 @@ type Server struct {
 	mu            sync.Mutex
 	last          time.Time
 	bootstrapUsed bool
+	applying      bool
 	launcherPath  string
+	joinRev       uint64
+	detectGen     uint64
+	planNote      string
 	join          *heldJoin
 	report        *netdetect.Report
-	plan          *gateway.Plan
+	plan          *boundPlan
 	paths         idorisPaths
 
 	served   chan struct{}
@@ -143,6 +147,18 @@ type heldJoin struct {
 	Hostname      string
 	Approved      []string
 	AllowInsecure bool
+	discovered    bool
+}
+
+// boundPlan is one plan plus the inputs it was built from. Apply refuses
+// the plan when any of those inputs has moved on.
+type boundPlan struct {
+	plan      gateway.Plan
+	joinRev   uint64
+	detectGen uint64
+	localAI   bool
+	devices   []string
+	whole     bool
 }
 
 type idorisPaths struct {
@@ -152,11 +168,12 @@ type idorisPaths struct {
 }
 
 type joinView struct {
-	Role     string   `json:"role"`
-	Tenant   string   `json:"tenant"`
-	Hostname string   `json:"hostname"`
-	Approved []string `json:"approved,omitempty"`
-	Warning  string   `json:"warning,omitempty"`
+	Role      string   `json:"role"`
+	Tenant    string   `json:"tenant"`
+	Hostname  string   `json:"hostname"`
+	Authority string   `json:"authority"`
+	Approved  []string `json:"approved,omitempty"`
+	Warning   string   `json:"warning,omitempty"`
 }
 
 // CheckSessionUser refuses to serve a page into a different user's session.
@@ -581,21 +598,17 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	if host == "" {
 		host = "idoris"
 	}
-	view := joinView{Role: payload.Role, Tenant: payload.Tenant, Hostname: host}
+	authority, err := authorityHost(payload.EnrollURL)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Decode only. Discover sends the enrollment credential, so it waits
+	// until the operator has confirmed this authority.
+	view := joinView{Role: payload.Role, Tenant: payload.Tenant, Hostname: host, Authority: authority}
 	held := heldJoin{
 		EnrollURL: payload.EnrollURL, Token: payload.Token, Role: payload.Role,
 		Tenant: payload.Tenant, Hostname: host, AllowInsecure: body.AllowInsecure || strings.HasPrefix(payload.EnrollURL, "http://"),
-	}
-	if s.svc.Discover != nil {
-		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-		disc, err := s.svc.Discover(ctx, payload.EnrollURL, payload.Token, held.AllowInsecure)
-		cancel()
-		if err != nil {
-			view.Warning = "could not read the pre-approved list; a gateway route will wait for an admin"
-		} else if disc != nil {
-			held.Approved = append([]string(nil), disc.LANCIDRs...)
-			view.Approved = held.Approved
-		}
 	}
 	paths, err := s.ensurePaths()
 	if err != nil {
@@ -603,8 +616,13 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
+	s.joinRev++
 	s.join = &held
 	s.paths = paths
+	if s.plan != nil {
+		s.planNote = stalePlanMsg
+	}
+	s.plan = nil
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, view)
 }
@@ -621,6 +639,11 @@ func (s *Server) handleDetect(w http.ResponseWriter, _ *http.Request) {
 	}
 	s.mu.Lock()
 	s.report = &rep
+	s.detectGen++
+	if s.plan != nil {
+		s.planNote = stalePlanMsg
+	}
+	s.plan = nil
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, rep)
 }
@@ -653,15 +676,24 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &body) {
 		return
 	}
+	devices := normDevices(body.DeviceIPs)
 	s.mu.Lock()
-	held := s.join
-	rep := s.report
-	paths := s.paths
-	s.mu.Unlock()
-	if held == nil {
+	if s.join == nil {
+		s.mu.Unlock()
 		writeErr(w, http.StatusBadRequest, "paste a join code first")
 		return
 	}
+	if s.plan != nil {
+		s.planNote = stalePlanMsg
+	}
+	s.plan = nil
+	copied := *s.join
+	held := &copied
+	rev := s.joinRev
+	det := s.detectGen
+	rep := s.report
+	paths := s.paths
+	s.mu.Unlock()
 	if paths.config == "" {
 		var err error
 		paths, err = s.ensurePaths()
@@ -670,6 +702,7 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	discoverWarning := s.discoverInto(r.Context(), held)
 	var plan gateway.Plan
 	var err error
 	if body.ThisMachineIsLocalAI {
@@ -683,7 +716,7 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		plan, err = gateway.BuildPlan(gateway.Request{
-			DeviceIPs: body.DeviceIPs, WholeSubnet: body.WholeSubnet,
+			DeviceIPs: devices, WholeSubnet: body.WholeSubnet,
 			Detection: *rep, Approved: held.Approved, Tenant: held.Tenant, Hostname: held.Hostname,
 		})
 	}
@@ -695,37 +728,151 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	plan.AllowInsecure = held.AllowInsecure
 	plan.TokenFile = paths.token
 	plan.ConfigPath = paths.config
+	if discoverWarning != "" {
+		plan.Warnings = append(plan.Warnings, netdetect.Notice{Code: "discover", Text: discoverWarning})
+	}
 	s.mu.Lock()
-	s.plan = &plan
+	if s.joinRev != rev || s.detectGen != det {
+		s.plan = nil
+		s.planNote = stalePlanMsg
+		s.mu.Unlock()
+		writeErr(w, http.StatusConflict, stalePlanMsg)
+		return
+	}
+	s.plan = &boundPlan{
+		plan: plan, joinRev: rev, detectGen: det,
+		localAI: body.ThisMachineIsLocalAI, devices: devices, whole: body.WholeSubnet,
+	}
+	s.planNote = ""
 	s.paths = paths
+	if s.join != nil {
+		s.join.Approved = append([]string(nil), held.Approved...)
+		s.join.discovered = held.discovered
+	}
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, plan)
 }
 
-func (s *Server) handleApply(w http.ResponseWriter, _ *http.Request) {
-	s.mu.Lock()
-	held := s.join
-	plan := s.plan
-	paths := s.paths
-	s.mu.Unlock()
-	if held == nil || plan == nil {
-		writeErr(w, http.StatusBadRequest, "build a plan first")
+func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ThisMachineIsLocalAI bool     `json:"this_machine_is_local_ai"`
+		DeviceIPs            []string `json:"device_ips"`
+		WholeSubnet          bool     `json:"whole_subnet"`
+	}
+	if !readJSON(w, r, &body) {
 		return
 	}
-	if plan.Blocked {
-		writeErr(w, http.StatusConflict, plan.BlockReason)
+	devices := normDevices(body.DeviceIPs)
+	s.mu.Lock()
+	if s.applying {
+		s.mu.Unlock()
+		writeErr(w, http.StatusConflict, "another apply is already running")
+		return
+	}
+	if s.plan == nil || s.join == nil || s.plan.joinRev != s.joinRev || s.plan.detectGen != s.detectGen {
+		msg := s.planNote
+		s.mu.Unlock()
+		if msg == "" {
+			msg = "build a plan first"
+		}
+		code := http.StatusBadRequest
+		if msg == stalePlanMsg {
+			code = http.StatusConflict
+		}
+		writeErr(w, code, msg)
+		return
+	}
+	if body.ThisMachineIsLocalAI != s.plan.localAI || body.WholeSubnet != s.plan.whole || !sameStrings(devices, s.plan.devices) {
+		s.plan = nil
+		s.planNote = answerMismatchMsg
+		s.mu.Unlock()
+		writeErr(w, http.StatusConflict, answerMismatchMsg)
+		return
+	}
+	if s.plan.plan.Blocked {
+		reason := s.plan.plan.BlockReason
+		s.mu.Unlock()
+		writeErr(w, http.StatusConflict, reason)
 		return
 	}
 	if s.svc.Apply == nil {
+		s.mu.Unlock()
 		writeErr(w, http.StatusInternalServerError, "apply is not available")
 		return
 	}
-	res, err := s.svc.Apply(*plan, gateway.ApplyOptions{Token: held.Token, PlanPath: paths.plan})
+	// Snapshot the plan and the token from the same join revision. A later
+	// join cannot be paired with this plan: the revision check above, and
+	// this copy, are the only values Apply sees.
+	plan := s.plan.plan
+	token := s.join.Token
+	planPath := s.paths.plan
+	s.applying = true
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.applying = false
+		s.mu.Unlock()
+	}()
+	res, err := s.svc.Apply(plan, gateway.ApplyOptions{Token: token, PlanPath: planPath})
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+const stalePlanMsg = "the plan is stale; build it again"
+const answerMismatchMsg = "the plan does not match the answers on the page; build it again"
+
+// discoverInto contacts the enrollment service only after the operator has
+// confirmed the authority. It records the result on held, which is a copy;
+// the caller writes Approved back under the lock.
+func (s *Server) discoverInto(ctx context.Context, held *heldJoin) string {
+	if held.discovered || s.svc.Discover == nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	disc, err := s.svc.Discover(ctx, held.EnrollURL, held.Token, held.AllowInsecure)
+	if err != nil {
+		return "could not read the pre-approved list; a gateway route will wait for an admin"
+	}
+	held.discovered = true
+	if disc != nil {
+		held.Approved = append([]string(nil), disc.LANCIDRs...)
+	}
+	return ""
+}
+
+func authorityHost(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "", errors.New("ui: enrollment URL has no host")
+	}
+	return u.Host, nil
+}
+
+func normDevices(in []string) []string {
+	var out []string
+	for _, d := range in {
+		d = strings.TrimSpace(d)
+		if d != "" {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) ensurePaths() (idorisPaths, error) {
