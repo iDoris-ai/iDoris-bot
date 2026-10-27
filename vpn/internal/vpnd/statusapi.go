@@ -148,11 +148,22 @@ func FormatStatus(st map[string]any) string {
 			if m == nil {
 				continue
 			}
-			fmt.Fprintf(&b, "%-13s %v -> %v (%v)\n", "forward:", m["listen"], m["target"], m["state"])
+			fmt.Fprintf(&b, "%-13s %v -> %v (%v)", "forward:", m["listen"], m["target"], m["state"])
+			if errText, _ := m["error"].(string); errText != "" {
+				fmt.Fprintf(&b, " error=%s", errText)
+			}
+			fmt.Fprintln(&b)
 		}
 	}
 	if s5, ok := st["socks5"].(map[string]any); ok && s5["listen"] != "" {
-		fmt.Fprintf(&b, "%-13s %v (%v)\n", "socks5:", s5["listen"], s5["state"])
+		fmt.Fprintf(&b, "%-13s %v (%v)", "socks5:", s5["listen"], s5["state"])
+		if errText, _ := s5["error"].(string); errText != "" {
+			fmt.Fprintf(&b, " error=%s", errText)
+		}
+		if auth, _ := s5["auth_file"].(string); auth != "" {
+			fmt.Fprintf(&b, " auth=%s", auth)
+		}
+		fmt.Fprintln(&b)
 	}
 	if routes, ok := st["routes"].([]any); ok {
 		for _, item := range routes {

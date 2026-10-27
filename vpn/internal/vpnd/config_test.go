@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadConfigFileAndEnv(t *testing.T) {
@@ -183,6 +184,8 @@ func envSample(t reflect.Type) (string, error) {
 		return "a,b", nil
 	case reflect.TypeOf([]Forward(nil)):
 		return `[{"listen":"127.0.0.1:1","target":"h:2"}]`, nil
+	case reflect.TypeOf(0):
+		return "1", nil
 	default:
 		return "", fmt.Errorf("no env sample for %s; assignEnv must learn this kind", t)
 	}
@@ -243,6 +246,105 @@ func TestInlineSecretAndTokenFileMustBeOwnerOnly(t *testing.T) {
 	auth := &Config{ControlURL: "https://vpn.example", AuthKeyFile: key}
 	if err := auth.Resolve(); err == nil || !strings.Contains(err.Error(), "chmod 600") {
 		t.Fatalf("auth key file: %v", err)
+	}
+}
+
+func TestAccessConfigValidation(t *testing.T) {
+	base := func() *Config {
+		return &Config{AuthKey: "k", ControlURL: "https://x"}
+	}
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "fwd.sock")
+	socks := filepath.Join(dir, "socks.sock")
+	okUNIX := base()
+	okUNIX.Forwards = []Forward{{Listen: "unix:" + sock, Target: "acme-local-ai:11434"}}
+	okUNIX.SOCKS5Listen = "unix:" + socks
+	okUNIX.MaxConnections = 0
+	okUNIX.DialTimeout = "10s"
+	okUNIX.SOCKS5AuthFile = filepath.Join(dir, "socks5.auth")
+	if err := okUNIX.Resolve(); err != nil {
+		t.Fatal(err)
+	}
+	if okUNIX.DialTimeoutDuration() != 10*time.Second {
+		t.Fatalf("dial %s", okUNIX.DialTimeoutDuration())
+	}
+
+	open := filepath.Join(dir, "open")
+	if err := os.Mkdir(open, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(open, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{name: "tcp loopback", mutate: func(c *Config) {
+			c.Forwards = []Forward{{Listen: "127.0.0.1:11434", Target: "acme:11434"}}
+			c.SOCKS5Listen = "[::1]:1055"
+		}},
+		{name: "non-loopback forward", mutate: func(c *Config) {
+			c.Forwards = []Forward{{Listen: "0.0.0.0:1", Target: "acme:1"}}
+		}, wantErr: "forwards[0].listen"},
+		{name: "relative unix", mutate: func(c *Config) {
+			c.SOCKS5Listen = "unix:relative.sock"
+		}, wantErr: "socks5_listen"},
+		{name: "world-writable parent", mutate: func(c *Config) {
+			c.Forwards = []Forward{{Listen: "unix:" + filepath.Join(open, "s"), Target: "acme:1"}}
+		}, wantErr: "world-writable"},
+		{name: "bad dial", mutate: func(c *Config) { c.DialTimeout = "nope" }, wantErr: "dial_timeout"},
+		{name: "zero dial", mutate: func(c *Config) { c.DialTimeout = "0s" }, wantErr: "dial_timeout"},
+		{name: "negative dial", mutate: func(c *Config) { c.DialTimeout = "-1s" }, wantErr: "dial_timeout"},
+		{name: "negative cap", mutate: func(c *Config) { c.MaxConnections = -1 }, wantErr: "max_connections"},
+		{name: "anonymous with auth file", mutate: func(c *Config) {
+			c.SOCKS5AllowAnonymous = true
+			c.SOCKS5AuthFile = filepath.Join(dir, "a")
+		}, wantErr: "socks5_allow_anonymous"},
+		{name: "anonymous alone", mutate: func(c *Config) {
+			c.SOCKS5Listen = "127.0.0.1:1055"
+			c.SOCKS5AllowAnonymous = true
+		}},
+		{name: "empty dial is default", mutate: func(c *Config) { c.DialTimeout = "" }},
+		{name: "cap zero is default", mutate: func(c *Config) { c.MaxConnections = 0 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := base()
+			tc.mutate(c)
+			err := c.Resolve()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+
+	t.Setenv("IDORIS_VPN_AUTH_KEY", "k")
+	t.Setenv("IDORIS_VPN_CONTROL_URL", "https://x")
+	t.Setenv("IDORIS_VPN_SOCKS5_AUTH_FILE", filepath.Join(dir, "from-env"))
+	t.Setenv("IDORIS_VPN_SOCKS5_ALLOW_ANONYMOUS", "false")
+	t.Setenv("IDORIS_VPN_MAX_CONNECTIONS", "8")
+	t.Setenv("IDORIS_VPN_DIAL_TIMEOUT", "3s")
+	cfg, err := LoadConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Resolve(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SOCKS5AuthFile == "" || cfg.SOCKS5AllowAnonymous || cfg.MaxConnections != 8 || cfg.DialTimeoutDuration() != 3*time.Second {
+		t.Fatalf("%+v", cfg)
+	}
+	t.Setenv("IDORIS_VPN_MAX_CONNECTIONS", "nope")
+	if _, err := LoadConfig(""); err == nil || !strings.Contains(err.Error(), "IDORIS_VPN_MAX_CONNECTIONS") {
+		t.Fatalf("bad int env: %v", err)
 	}
 }
 

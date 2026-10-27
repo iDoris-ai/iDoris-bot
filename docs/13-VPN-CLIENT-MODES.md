@@ -103,14 +103,16 @@ tailscaled is logged into <url>; takeover is disabled. Set mode: embedded to run
 }
 ```
 
-`listen` 与 `socks5_listen` 必须是回环地址（与状态 API 的 `ParseListen` 同一规则），否则配置拒绝。环境变量 `IDORIS_VPN_FORWARDS` 是同一 JSON 数组。flag `--forward` 可重复，形式 `listen=target`。`--socks5-listen` 对应 `socks5_listen`。
+`forwards[].listen` 与 `socks5_listen` 都走 `ValidateForwardListen`：回环 TCP（`127.0.0.1` 或 `::1`），或 `unix:<绝对路径>`。`0.0.0.0`、相对路径、全员可写的父目录都会拒绝。未知 JSON 字段仍然拒绝。环境变量 `IDORIS_VPN_FORWARDS` 是同一 JSON 数组。flag `--forward` 可重复，形式 `listen=target`。`--socks5-listen` 对应 `socks5_listen`。
 
 转发是回环 TCP 监听，经一个小 `Dialer` 接口拨号：
 
 - `embedded`：`tsnet.Server.Dial`。它会等到节点 Running，并能解析 MagicDNS。
 - `system`：`&net.Dialer{}`，由内核路由把 tailnet IP 送进官方客户端。这条路径有单测（假 dialer），没有在 Docker 里再跑一遍。
 
-SOCKS5 用同模块的 `tailscale.com/net/socks5`（BSD-3，无新许可证）。不设用户名密码，即无认证。该库把出站拨号限制在 5 秒。单测覆盖了经 SOCKS5 打到 echo 服务；Docker 集成测试没有跑 SOCKS5。
+上面这份配置没有写 `socks5_auth_file`，也没有 `socks5_allow_anonymous`。SOCKS5 因此默认认证：`StartAccess` 在 `<state_dir>/socks5.auth` 写入一行 `idoris:<随机密码>`，模式 0600。文件已经存在就接着用，不换密码。创建时 info 日志只打路径，不打密码。`idoris-vpnd status` 在 SOCKS5 活动时打印同一路径，形式是 `auth=<path>`。显式 `socks5_auth_file` 只读取、不创建。`socks5_allow_anonymous: true` 才不认证，并打出警告；它和 `socks5_auth_file` 不能同时出现。实现是本模块的 CONNECT（RFC 1928）加用户名密码（RFC 1929）。`tailscale.com/net/socks5` 的 `Serve` 没有用，原因在第 13 节。
+
+Docker 里 `TestWireAccessForwardsAndSOCKS5` 用嵌入式节点连上真实 Headscale，核实了 TCP 转发、`unix:` 转发、SOCKS5 无凭据被拒、错误凭据被拒、生成的凭据能打到 tailnet 里的 echo、超过 `max_connections` 的连接被马上关掉，以及 unix 套接字和 `socks5.auth` 都是 0600。2026-10-27 单独跑这一项是 19.74s。整包 `make integration` 的计时以第 10 节为准。
 
 单测（假 dialer，不起 tsnet）覆盖：半关闭、大包、拨号失败、监听关闭、关闭后无 goroutine 泄漏。Docker 里的 echo 是长度前缀帧（uint32 大端 + 正文），不依赖 TCP 半关闭；半关闭只在单测里验证。
 
@@ -177,8 +179,8 @@ Headscale 还必须批准这些路由（生产环境由 ops 的 `autoApprovers` 
 | `phase` | `phase:` | 见下。节点已经 enroll 不等于主机可用 |
 | `warnings` | 每行一条 | 降级说明。没有则为空 |
 | `enroll_reachable` | `enroll: unreachable`（仅当为 false） | 这次启动没有连上注册服务 |
-| `forwards[]` | `forward:` 每行 `listen -> target (state)` | `listen` 是实际 `Listen` 地址（端口 0 会变成内核分配的端口）。`state` 为 `listening` |
-| `socks5` | `socks5:` | `{listen, state}`。未配置时省略 |
+| `forwards[]` | `forward:` 每行 `listen -> target (state)`，失败再加 `error=<text>` | `listen` 是实际 `Listen` 地址（端口 0 会变成内核分配的端口）。`state` 为 `listening`、`failed` 或 `suspended` |
+| `socks5` | `socks5:` 为 `listen (state)`，失败加 `error=<text>`，有凭据文件加 `auth=<path>` | JSON 是 `{listen, state, error, auth_file}`。未配置时省略。`auth_file` 只是路径 |
 
 `phase` 除了原来的 `connected`、`starting`、`enrolling`、`needs-admin-approval`、`routes-pending-approval`、`blocked-foreign-tailnet`、`error`，还有：
 
@@ -219,6 +221,8 @@ iOS / Android 同时只允许一个活动 VPN。这次没有在手机上验证�
 
 结束后 `docker ps -a`、`docker volume ls`、`docker network ls` 里没有 `idoris-vpn-*` 容器、卷或网络。
 
+接线这一轮在 `work/vpn-wiring` 上又跑了一次门禁，数字如下。`make test` 退出码 0：`cmd/idoris-vpn-enroll` 1.422s，`cmd/idoris-vpnd` 1.691s，`internal/enroll` 3.452s，`internal/gateway` 5.102s，`internal/headscale` 2.635s，`internal/join` 2.113s，`internal/netdetect` 4.477s，`internal/ui` 4.331s，`internal/vpnd` 4.510s。两次 `golangci-lint`（第二次带 `--build-tags integration`）都是 `0 issues`。`make licenses` 扫完 linux、darwin、windows 的 amd64 与 arm64，输出 `THIRD_PARTY_NOTICES.md is up to date`。`make build-linux` 版本串是 `5797c87`（gosec 修正在这次编译之后才提交）。`make integration` 退出码 0，包耗时 275.545s。`TestWireAccessForwardsAndSOCKS5` 16.23s，日志是 `max_connections refusal in 0s` 和 `wire access ok: tcp, unix mode 0600, socks5 auth, cap refusal 0s`。这一项开始编译 `wireclient` 时，gosec 修正已经在磁盘上。同轮其余项：`TestEmbeddedAutoLeavesForeignTailscale` 48.73s，`TestHardAAwaitTailscaled` 3.37s，`TestHardAClientCore` 53.43s（`foreign-stays` 15.94s，`unmanaged-prefs` 25.51s，`enroll-down` 5.22s），`TestEnrollConnectAndReauth` 36.14s，`TestLanDirect` 28.95s，`TestLanAwayRelay` 22.59s，`TestGatewaySubnetRoute` 34.16s，`TestWizardGatewayJoin` 30.89s。结束后 `docker ps -a` 没有 `wire-*` 或 `idoris-vpn-*` 容器。
+
 ## 11. 身份绑定、环境变量、锁
 
 ### 身份与控制面
@@ -258,13 +262,19 @@ iOS / Android 同时只允许一个活动 VPN。这次没有在手机上验证�
 | `state_file` | `IDORIS_VPN_STATE_FILE` | `--state-file` |
 | `forwards` | `IDORIS_VPN_FORWARDS` | `--forward`（可重复，`listen=target`） |
 | `socks5_listen` | `IDORIS_VPN_SOCKS5_LISTEN` | `--socks5-listen` |
+| `socks5_auth_file` | `IDORIS_VPN_SOCKS5_AUTH_FILE` | `--socks5-auth-file` |
+| `socks5_allow_anonymous` | `IDORIS_VPN_SOCKS5_ALLOW_ANONYMOUS` | `--socks5-allow-anonymous` |
+| `max_connections` | `IDORIS_VPN_MAX_CONNECTIONS` | `--max-connections`（0 表示 64） |
+| `dial_timeout` | `IDORIS_VPN_DIAL_TIMEOUT` | `--dial-timeout`（空表示 10s） |
 | `advertise_routes` | `IDORIS_VPN_ADVERTISE_ROUTES` | `--advertise-routes` |
 | `tailscale_socket` | `IDORIS_VPN_TAILSCALE_SOCKET` | `--tailscale-socket` |
 | `listen` | `IDORIS_VPN_LISTEN` | `--listen` |
 | `interval` | `IDORIS_VPN_INTERVAL` | `--interval` |
 | `log_level` | `IDORIS_VPN_LOG_LEVEL` | `--log-level` |
 
-Unix 上，令牌文件、auth key 文件、状态文件，以及在 JSON 里直接写了 `enroll_token` 或 `auth_key` 的配置文件，必须是普通文件、属主为当前用户、权限不含 group/other（`chmod 600`）。符号链接拒绝。错误文本里带有 `chmod 600`。只指向 `enroll_token_file`、自身没有 inline 密钥的配置文件可以是 0644。Windows 上同一检查只打警告，不拒绝。`vpnd.CheckSecretFile` 导出给 `service install` 使用；安装路径在 `vpn/cmd/idoris-vpnd/service.go`，这次没有改那个文件。
+`dial_timeout` 是时长字符串，例如 `10s`。空字符串用 10 秒。解析失败或小于等于 0 拒绝。`max_connections` 小于 0 拒绝，0 用默认 64。`socks5_allow_anonymous` 为 true 时再写 `socks5_auth_file` 是错误。
+
+Unix 上，令牌文件、auth key 文件、状态文件、SOCKS5 凭据文件，以及在 JSON 里直接写了 `enroll_token` 或 `auth_key` 的配置文件，必须是普通文件、属主为当前用户、权限不含 group/other（`chmod 600`）。符号链接拒绝。错误文本里带有 `chmod 600`。只指向 `enroll_token_file`、自身没有 inline 密钥的配置文件可以是 0644。Windows 上同一检查只打警告，不拒绝。`service install`（用户级和 `--system`）在真正安装之前调用 `vpnd.CheckSecretFile`：登记令牌文件、auth key 文件、`socks5_auth_file`，以及含有 inline `enroll_token` 或 `auth_key` 的配置文件。失败就中止，错误里有 `chmod 600`。`--system` 的 root 检查在这之后。Windows 上这一步只警告。
 
 ### 控制器锁
 
@@ -273,7 +283,7 @@ Unix 上，令牌文件、auth key 文件、状态文件，以及在 JSON 里直
 ## 12. 限制与未决问题
 
 - 15 秒是针对 v1.104.2 这次日志定的。若一次合法的 node key 恢复超过 15 秒仍停在 NeedsLogin，Reconciler 仍会铸一把新 key。没有把这个窗口做成配置。
-- SOCKS5 未在 Docker 里跑过。官方客户端的子网路由数据面、`ip_forward` 和 Headscale 批准，由 `TestGatewaySubnetRoute` 覆盖（见第 10 节）。`idoris-vpnd` 自己宣告的路由只核实了偏好被保留，没有再打一跳数据面。
+- SOCKS5、TCP 转发和 `unix:` 转发在 Docker 里由 `TestWireAccessForwardsAndSOCKS5` 覆盖，见第 5 节。官方客户端的子网路由数据面、`ip_forward` 和 Headscale 批准，由 `TestGatewaySubnetRoute` 覆盖（见第 10 节）。`idoris-vpnd` 自己宣告的路由只核实了偏好被保留，没有再打一跳数据面。系统模式的 Gate 有表驱动单测，没有在 Docker 里用系统 tailscaled 再跑一遍。
 - 嵌入式节点与官方客户端的 DERP / 打洞性能没有在真实 NAT 后测量。集成测试在同一个 Docker 网络里，STUN 看到的是容器地址。
 - MagicDNS 只核实了短名 `acme-local-ai`。没有单独打 FQDN。
 - Windows 命名管道上的 LocalAPI、macOS GUI 版与嵌入式节点并存，这次没有再测。
@@ -288,11 +298,11 @@ Unix 上，令牌文件、auth key 文件、状态文件，以及在 JSON 里直
 
 因此两件事要分开做：
 
-- 传输层收紧。优先 `unix:<绝对路径>`，套接字创建后是 `0600`，只有拥有者能连。父目录不能是全员可写。已经有进程在听的套接字不会被清掉；没人听的残留文件会删掉再监听。SOCKS5 默认要用户名和密码（RFC 1929）。凭据放在 `0600` 的 `socks5_auth_file`，文件内容一行 `user:password`；或者交给状态目录，首次生成 `socks5.auth`（用户名 `idoris`，密码随机），重启继续用同一份。只有显式 `socks5_allow_anonymous: true` 才不认证，进程会打出警告。
+- 传输层收紧。优先 `unix:<绝对路径>`，套接字创建后是 `0600`，只有拥有者能连。父目录不能是全员可写。已经有进程在听的套接字不会被清掉；没人听的残留文件会删掉再监听。SOCKS5 默认要用户名和密码（RFC 1929）。凭据放在 `0600` 的 `socks5_auth_file`，文件内容一行 `user:password`，这个路径只读取、不创建。都不给时，在 `<state_dir>/socks5.auth` 生成用户名 `idoris` 和随机密码，模式 0600；重启继续用同一份。创建时 info 日志和 `idoris-vpnd status` 都只出现路径。只有显式 `socks5_allow_anonymous: true` 才不认证，进程会打出警告。它和 `socks5_auth_file` 一起写是配置错误。
 - 应用自己再认证一次。转到 Local AI 的流量，Local AI 应用必须自己验身份。转发和 SOCKS5 只决定谁能用这条通道，不代替应用的登录。
 
 每个监听单独限制。`max_connections` 默认 64，满了就立刻关掉新连接，不排队。`dial_timeout` 默认 10 秒。客户端在拨号期间断开，拨号的 goroutine 会跟着结束。`Accept` 遇到暂时错误会退避重试；致命错误把该监听的 `state` 写成 `failed`，并把错误放进状态的 `error` 字段。
 
-系统模式如果还没有连上本组织的控制面，Gate 关闭。状态是 `suspended`（`failed` 和 `closed` 优先）。新连接马上拒绝，不会向外拨号。Gate 由 daemon 在启动时接上：系统模式看协调器是否已经 `connected` 且控制 URL 是我们自己的；嵌入式模式 Gate 保持打开。
+系统模式如果还没有连上本组织的控制面，Gate 关闭。状态是 `suspended`（`failed` 和 `closed` 优先，只改写 `listening`）。新连接马上关掉，不会向外拨号。启动时 `accessOptions` 把 `AccessOpen` 接成 Gate。嵌入式模式始终打开。系统模式只在协调器快照的 `current_control_url` 与本进程的控制 URL 被 `SameControlURL` 判成同一台（忽略大小写、末尾斜杠、默认端口；Tailscale SaaS 的同义地址也算），并且 phase 是 `connected` 或 `routes-pending-approval` 时打开。状态里的 `control_url` 永远是本进程想要的地址，不拿来做这比较。其他模式关闭。
 
 `tailscale.com/net/socks5` 的 `Server` 能做用户名密码，但它自己 `Accept`、用固定 5 秒和 `context.Background` 拨号、不限连接数，第一次 `Accept` 失败就退出。所以这里没有用它的 `Serve`，CONNECT 和认证是一层薄实现。

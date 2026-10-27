@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -190,6 +191,18 @@ func TestSOCKS5AuthFileModeAndStateDirReuse(t *testing.T) {
 	}
 	if bytes.Contains(logs.Bytes(), body) || bytes.Contains(logs.Bytes(), []byte("s3cret")) {
 		t.Fatal("log contains a SOCKS5 password")
+	}
+	if strings.Count(logs.String(), authPath) != 1 || !strings.Contains(logs.String(), "SOCKS5 auth file created") {
+		t.Fatalf("created auth path was not logged once:\n%s", logs.String())
+	}
+	if first.SOCKS5Status() == nil || first.SOCKS5Status().AuthFile != authPath {
+		t.Fatalf("status auth file %+v", first.SOCKS5Status())
+	}
+	text := FormatStatus(map[string]any{
+		"socks5": map[string]any{"listen": "127.0.0.1:1", "state": "listening", "auth_file": authPath},
+	})
+	if !strings.Contains(text, "auth="+authPath) {
+		t.Fatalf("status text missing auth path:\n%s", text)
 	}
 }
 
