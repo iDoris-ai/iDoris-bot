@@ -96,7 +96,7 @@ func hold(args []string) error {
 		return err
 	}
 	defer func() { _ = c.Close() }()
-	if err := os.WriteFile(args[3], []byte("up\n"), 0o644); err != nil {
+	if err := os.WriteFile(args[3], []byte("up\n"), 0o600); err != nil { //nolint:gosec // G703: path is the integration test's ready file
 		return err
 	}
 	_, err = io.Copy(io.Discard, c)
@@ -117,6 +117,13 @@ func readAuth(path string) (string, string, error) {
 }
 
 var errRejected = errors.New("rejected")
+
+func asByte(n int) (byte, error) {
+	if n < 0 || n > 255 {
+		return 0, errors.New("length exceeds 255")
+	}
+	return byte(n), nil //nolint:gosec // G115: n is bounded to 0..255 above
+}
 
 func socksConnect(proxy, target, user, pass string) (net.Conn, error) {
 	c, err := net.DialTimeout("tcp", proxy, 5*time.Second) //nolint:gosec // G704: proxy is the fixture's loopback SOCKS5
@@ -157,7 +164,11 @@ func socksConnect(proxy, target, user, pass string) (net.Conn, error) {
 	if err != nil || port < 1 || port > 65535 || len(host) == 0 || len(host) > 255 {
 		return nil, errors.New("bad target")
 	}
-	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(host))}
+	hostLen, err := asByte(len(host))
+	if err != nil {
+		return nil, err
+	}
+	req := []byte{0x05, 0x01, 0x00, 0x03, hostLen}
 	req = append(req, host...)
 	var pb [2]byte
 	binary.BigEndian.PutUint16(pb[:], uint16(port))
@@ -181,9 +192,17 @@ func socksConnect(proxy, target, user, pass string) (net.Conn, error) {
 }
 
 func writeAuth(c net.Conn, user, pass string) error {
-	buf := []byte{0x01, byte(len(user))}
+	userLen, err := asByte(len(user))
+	if err != nil {
+		return err
+	}
+	passLen, err := asByte(len(pass))
+	if err != nil {
+		return err
+	}
+	buf := []byte{0x01, userLen}
 	buf = append(buf, user...)
-	buf = append(buf, byte(len(pass)))
+	buf = append(buf, passLen)
 	buf = append(buf, pass...)
 	if _, err := c.Write(buf); err != nil {
 		return err
