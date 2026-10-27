@@ -8,6 +8,14 @@ server:
   base_url: "https://vpn.example.org"
   # Exactly 32 characters; bootstrap.sh generates the file mounted here.
   cookie_secret_path: "/run/secrets/headplane_cookie_secret"
+  # true: the session cookie is HTTPS-only. Correct behind the TLS proxy
+  # (HEADPLANE_BIND=127.0.0.1 plus the proxy, or an SSH tunnel to that port
+  # while the browser still uses https://<base_url>).
+  # For plain HTTP on a LAN address (HEADPLANE_BIND=192.168.x.x or 0.0.0.0)
+  # set cookie_secure: false AND base_url to that http origin, including the
+  # port. Otherwise the browser drops the session cookie and API-key login
+  # does not stick. That cookie is then sent in clear text on the LAN.
+  # Anyone on that LAN can steal it. Prefer the SSH tunnel.
   cookie_secure: true
   cookie_max_age: 86400
   data_path: "/var/lib/headplane"
