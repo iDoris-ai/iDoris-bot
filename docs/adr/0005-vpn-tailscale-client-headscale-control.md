@@ -20,10 +20,10 @@ Organisation members must reach their own Local AI host (Agent24 / iDoris) from 
 
 ## Consequences
 
-- Zero client maintenance burden; we inherit Tailscale's NAT traversal, key rotation, platform support and security updates.
+- Little client maintenance for system mode: we inherit Tailscale's NAT traversal, key rotation, platform support and security updates through the official client. Embedded mode is different: it ships Tailscale's library inside `idoris-vpnd`, so Tailscale fixes reach members only through a new `idoris-vpnd` release. This is an explicit exception to "clients stay official" and a maintenance obligation of this project.
 - Tenant isolation on a shared instance is only as good as the policy file. Adding a tenant means adding its rule block, and a wrong rule can leak across tenants. Production Headscale must be reachable at https on port 443, because the Tailscale client forces TLS on 443 for re-dials.
 - Headscale is single-instance by design; acceptable for small/medium organisations, requires a documented backup/upgrade routine (sqlite, noise key, DERP key).
-- The Headscale API key is a crown jewel and is confined to the enrollment service container; clients only ever see single-use short-lived keys and a hashed tenant token.
+- The Headscale API key is a crown jewel and is confined to the enrollment service container. Clients receive single-use short-lived pre-auth keys, but they also store a long-lived **plaintext** enrollment token (the server keeps only its SHA-256), so a stolen device can re-enroll until that token is revoked. Each device or person therefore gets its own labelled, individually revocable invite token, and offboarding means revoking the token before expiring or deleting the node.
 - Members who already use Tailscale elsewhere are not disturbed: the embedded `tsnet` node coexists with their system client on macOS, Windows and Linux. The price is no system-level routing or MagicDNS for that node; applications reach the Local AI through `127.0.0.1` forwards or SOCKS5.
 - Licensing: Headscale and Tailscale are BSD-3-Clause, Headplane MIT, all compatible with this repository's Apache-2.0. The transitive dependencies of the shipped binaries were scanned (42 modules, all permissive) and are guarded by `make licenses`. GPL-3.0 UIs (headscale-admin) may be deployed but not vendored. Publishing a built container image needs a different base than Alpine (GPL/MPL packages), see doc 12 section 10. Product naming must not imply endorsement by Tailscale or Headscale.
 
