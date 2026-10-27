@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 )
 
 // Client is the daemon-side caller of the enrollment service.
@@ -57,15 +56,17 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 	if in != nil {
 		hr.Header.Set("Content-Type", "application/json")
 	}
-	hc := c.HTTP
-	if hc == nil {
-		hc = &http.Client{Timeout: 20 * time.Second}
-	}
-	resp, err := hc.Do(hr)
+	resp, err := c.httpClient().Do(hr)
 	if err != nil {
 		return fmt.Errorf("enroll: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	// A 3xx is a failure even when the next hop would be HTTPS on the same
+	// host. Following it would resend the bearer token; Go's default client
+	// does that, including onto an http:// URL.
+	if resp.StatusCode >= 300 && resp.StatusCode <= 399 {
+		return fmt.Errorf("enroll: %w", errRefusingRedirect(resp))
+	}
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
