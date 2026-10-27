@@ -13,3 +13,7 @@ func requireRoot() error {
 	}
 	return nil
 }
+
+func chownSystemRootImpl(path string) error {
+	return os.Chown(path, 0, 0)
+}

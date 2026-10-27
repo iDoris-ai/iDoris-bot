@@ -9,4 +9,4 @@ SYSTEM
 HIGHEST
 /F
 /TR
-/usr/local/bin/idoris-vpnd run --config /etc/idoris/vpn.json
+"C:\Program Files\iDoris\idoris-vpnd.exe" run --config C:\ProgramData\idoris\vpn.json

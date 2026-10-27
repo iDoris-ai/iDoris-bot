@@ -192,8 +192,12 @@ func installSystemdSystem(configPath string) error {
 	if err := requireRoot(); err != nil {
 		return err
 	}
-	exe, err := selfPath()
+	src, err := selfPath()
 	if err != nil {
+		return err
+	}
+	exeDir, exe := systemExecutable(runtime.GOOS, os.Getenv("ProgramFiles"))
+	if err := copyProtectedExecutable(src, exeDir, exe); err != nil {
 		return err
 	}
 	cfg, err := os.ReadFile(configPath) //nolint:gosec // operator-chosen config copied into /etc
@@ -249,6 +253,11 @@ func uninstallSystemdSystem() error {
 		return fmt.Errorf("systemctl daemon-reload: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	fmt.Println("removed", systemUnitPath)
+	_, exe := systemExecutable(runtime.GOOS, os.Getenv("ProgramFiles"))
+	if err := removeProtectedExecutable(exe); err != nil {
+		return err
+	}
+	fmt.Println("removed", exe)
 	fmt.Println("left", systemConfigPath, "in place")
 	return nil
 }
@@ -260,8 +269,12 @@ func installLaunchDaemon(configPath string) error {
 	if err := requireRoot(); err != nil {
 		return err
 	}
-	exe, err := selfPath()
+	src, err := selfPath()
 	if err != nil {
+		return err
+	}
+	exeDir, exe := systemExecutable(runtime.GOOS, os.Getenv("ProgramFiles"))
+	if err := copyProtectedExecutable(src, exeDir, exe); err != nil {
 		return err
 	}
 	cfg, err := os.ReadFile(configPath) //nolint:gosec // operator-chosen config copied into /etc
@@ -310,6 +323,11 @@ func uninstallLaunchDaemon() error {
 		return err
 	}
 	fmt.Println("removed", systemLaunchdPath)
+	_, exe := systemExecutable(runtime.GOOS, os.Getenv("ProgramFiles"))
+	if err := removeProtectedExecutable(exe); err != nil {
+		return err
+	}
+	fmt.Println("removed", exe)
 	fmt.Println("left", systemConfigPath, "in place")
 	return nil
 }
@@ -318,8 +336,12 @@ func installWindowsTask(configPath string) error {
 	if runtime.GOOS != "windows" {
 		return errors.New("scheduled tasks are only installed on Windows")
 	}
-	exe, err := selfPath()
+	src, err := selfPath()
 	if err != nil {
+		return err
+	}
+	exeDir, exe := systemExecutable(runtime.GOOS, os.Getenv("ProgramFiles"))
+	if err := copyProtectedExecutable(src, exeDir, exe); err != nil {
 		return err
 	}
 	cfg, err := os.ReadFile(configPath) //nolint:gosec // operator-chosen config copied into ProgramData
@@ -347,6 +369,11 @@ func uninstallWindowsTask() error {
 		return fmt.Errorf("schtasks: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	fmt.Println("removed scheduled task", windowsTaskName)
+	_, exe := systemExecutable(runtime.GOOS, os.Getenv("ProgramFiles"))
+	if err := removeProtectedExecutable(exe); err != nil {
+		return err
+	}
+	fmt.Println("removed", exe)
 	fmt.Println("left", windowsConfigPath, "in place")
 	return nil
 }
