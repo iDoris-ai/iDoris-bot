@@ -69,6 +69,8 @@ tailscaled is logged into <url>; takeover is disabled. Set mode: embedded to run
 
 要切走外网登录，必须显式 `takeover: true`（或 `--takeover`）。
 
+官方 Tailscale GUI 和 `tailscale` CLI 不走控制器锁，锁排除不了它们。协调器在 `Start`、`StartLoginInteractive` 和 `EditPrefs`（路由、SSH 也在这条路径上）之前再读一次当前 prefs。控制面已经不是这一轮决定要改的那一台，就中止，不发出这次修改。`takeover: false` 且读到外网登录时，这一轮停在 `blocked-foreign-tailnet`。这把检查和修改之间的窗口收窄了，没有关上。
+
 ## 4. 嵌入式节点能做什么、不能做什么
 
 能做（这次核实过的）：
@@ -239,6 +241,12 @@ iOS / Android 同时只允许一个活动 VPN。这次没有在手机上验证�
 
 启动时发现失败：配置若钉了一条与已保存 URL 不同的 control URL，拒绝启动。否则用钉住的 URL，或已保存的 URL，继续跑，**不**为了探活去 enroll。只有节点确实需要登录时才 enroll。状态里 `enroll_reachable` 为 false，`warnings` 说明注册服务不可达、沿用已保存的控制面和节点身份。静态 auth key、没有 enroll URL 时，不算不可达。发现失败期间，已保存的 `local-ai` / `gateway` 角色仍然生效，不会因为发现失败而掉回 embedded。
 
+以下取代「还没有绑定就接受当前 profile」。绑定在身份确认时写下正在跑的节点：self 的稳定 ID（`tailcfg.StableNodeID`）。系统模式在 LocalAPI 给出非空 profile ID 时一并写入；嵌入式不记 profile。每一轮正在跑的节点或（系统模式）profile 与绑定不一致，身份视为未确认，走和凭证变化同一条重新 enroll。租户、角色、节点、profile 都空的绑定不能把已经在跑的节点静默认证成当前凭证，必须先有一次确认过的 enroll。这一进程刚刚 enroll 成功、第一次看到 Running 的新装机可以写下绑定，不必再铸一把 key。只有指纹变了，tenant、role、节点和 profile 都没变，仍然不重新 enroll，只更新指纹。
+
+发现失败时，已保存的角色只有在该绑定的令牌指纹与当前凭证指纹相同才采用。指纹缺失或不一致，配置里的角色不动。配置明确是 `local-ai` 或 `gateway` 时，不会被已保存的 `member` 或 `admin` 换下去，因此不会在发现失败时掉进 embedded、把旧成员节点报成 connected。注册服务恢复之后，下一次铸 key 之前先再 discover 一次，刷新身份和角色；discover 仍失败就不铸 key。
+
+登录退避写在同一状态文件：下一次允许铸 key 的时间，以及连续未收敛的次数。请求 key 之前先落盘。写失败就不铸 key，内存也不提前记成已经退避。新进程遵守这个时间。没有存过身份的新节点允许立刻试一次。`SetIdentity` 和 `RememberControl` 只在文件替换成功之后改内存，写失败的下一轮仍是旧绑定。状态目录用 `EnsurePrivateDir`（拒绝符号链接、非属主、group 或 other 可写）。替换用独占临时文件再 rename，不写 `路径.tmp`，预置在旧临时名上的符号链接不会被跟着写出去。
+
 ### 环境变量与 flag
 
 每个 JSON 键都有环境变量 `IDORIS_VPN_` + 键名的大写（`accept_routes` → `IDORIS_VPN_ACCEPT_ROUTES`）。未知的 `IDORIS_VPN_*` 让进程退出，错误里带这个变量名。布尔接受 `1` / `0` / `true` / `false` / `yes` / `no`。字符串列表用逗号。`forwards` 是 JSON 数组。
@@ -306,5 +314,9 @@ Unix 上，令牌文件、auth key 文件、状态文件、SOCKS5 凭据文件�
 每个监听单独限制。`max_connections` 默认 64，满了就立刻关掉新连接，不排队。`dial_timeout` 默认 10 秒。客户端在拨号期间断开，拨号的 goroutine 会跟着结束。`Accept` 遇到暂时错误会退避重试；致命错误把该监听的 `state` 写成 `failed`，并把错误放进状态的 `error` 字段。
 
 系统模式如果还没有连上本组织的控制面，Gate 关闭。状态是 `suspended`（`failed` 和 `closed` 优先，只改写 `listening`）。新连接马上关掉，不会向外拨号。启动时 `accessOptions` 把 `AccessOpen` 接成 Gate。嵌入式模式始终打开。系统模式只在协调器快照的 `current_control_url` 与本进程的控制 URL 被 `SameControlURL` 判成同一台（忽略大小写、末尾斜杠、默认端口；Tailscale SaaS 的同义地址也算），并且 phase 是 `connected` 或 `routes-pending-approval` 时打开。状态里的 `control_url` 永远是本进程想要的地址，不拿来做这比较。其他模式关闭。
+
+以下取代「嵌入式模式始终打开」和「只看协调器快照」。嵌入式和系统模式都要同时满足：身份已确认（不在 identity-mismatch，也不是 enrollment 失败），phase 是 `connected` 或 `routes-pending-approval`，并且 LocalAPI 当前的 control URL 与本进程是同一台。Gate 自己读 prefs 和 status，缓存不超过 1 秒；读失败按关闭。系统模式再对绑定里的节点 ID 和 profile ID，两边都非空且不同则关闭。协调器在 phase、控制面、profile 或身份变化时把所有权加一代。每个已接受的连接记下接受时的代；代变了且门已关闭，这条连接被关掉，包括还没返回的拨号。门仍然开着的代变化（例如 `connected` 到 `routes-pending-approval`）不拆已建立的流。
+
+已知限制：官方 GUI 和 `tailscale` CLI 仍可能在两次 prefs 读取之间切走 profile，控制器锁排除不了它们。回环上的 TCP 转发让这台机器的每个本地用户都借用本节点身份；要收紧监听，用 `unix:`。
 
 `tailscale.com/net/socks5` 的 `Server` 能做用户名密码，但它自己 `Accept`、用固定 5 秒和 `context.Background` 拨号、不限连接数，第一次 `Accept` 失败就退出。所以这里没有用它的 `Serve`，CONNECT 和认证是一层薄实现。
