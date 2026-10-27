@@ -121,9 +121,8 @@ func (c *Config) Validate() error {
 		if t.HeadscaleUserID == "" {
 			return fmt.Errorf("tenant %q: headscale_user_id is required", t.Name)
 		}
-		if len(t.TokenHashes) == 0 {
-			return fmt.Errorf("tenant %q: at least one token hash is required", t.Name)
-		}
+		// An empty list is a deliberate lockout from revoke --allow-empty.
+		// A missing token_hashes field is rejected while decoding JSON.
 		for _, h := range t.TokenHashes {
 			if b, err := hex.DecodeString(h); err != nil || len(b) != sha256.Size {
 				return fmt.Errorf("tenant %q: token hash %q is not a hex SHA-256", t.Name, h)
@@ -210,6 +209,16 @@ type Server struct {
 	authScans int
 	// prober is optional. /readyz answers 503 until SetControlProber is called.
 	prober ControlProber
+
+	// /readyz keeps one cached probe. readyFlight is closed when the probe
+	// that is in progress finishes. Waiters share that result.
+	readyMu      sync.Mutex
+	readyBody    readyBody
+	readyCode    int
+	readyExp     time.Time
+	readyHave    bool
+	readyFlight  chan struct{}
+	readyWaiters int
 }
 
 type bucket struct {
@@ -372,6 +381,41 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (Tenant, s
 	return tenant, remote, label, true
 }
 
+func bearerToken(r *http.Request) string {
+	auth := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if len(auth) <= len(prefix) || !strings.HasPrefix(auth, prefix) {
+		return ""
+	}
+	return strings.TrimSpace(auth[len(prefix):])
+}
+
+// credentialStillAccepted reports whether token is still a hash of tenantName
+// in the config loaded now. It walks every hash, like lookupLocked, so the
+// match does not stop early.
+func (s *Server) credentialStillAccepted(tenantName, token string) bool {
+	if token == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	want := sha256.Sum256([]byte(token))
+	matched := ""
+	for i := range s.cfg.Tenants {
+		t := &s.cfg.Tenants[i]
+		for _, h := range t.TokenHashes {
+			b, err := hex.DecodeString(h)
+			if err != nil || len(b) != sha256.Size {
+				continue
+			}
+			if subtle.ConstantTimeCompare(b, want[:]) == 1 && matched == "" {
+				matched = t.Name
+			}
+		}
+	}
+	return matched != "" && matched == tenantName
+}
+
 func auditLabel(label string) string {
 	if label == "" {
 		return "-"
@@ -405,6 +449,16 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	var req Request
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
+		return
+	}
+	// Authentication ran before the body was read. A slow body can outlive
+	// a revoke and a reload. Refuse unless this hash is still accepted for
+	// this tenant by the config that is current now. Do this before the
+	// per-tenant enroll bucket and before minting, so a revoked credential
+	// does not spend that budget or receive a key.
+	if !s.credentialStillAccepted(tenant.Name, bearerToken(r)) {
+		s.sampleWarn("rejected: unknown token", "path", r.URL.Path, "remote", remote)
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid token"})
 		return
 	}
 	if !s.allowKeyed("enroll:"+tenant.Name, tenantRate(tenant)) {
