@@ -16,7 +16,7 @@ func acquireConfigLock(path string) (func(), error) {
 	lockPath := path + ".lock"
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // lock sits beside the operator-chosen config
 	if err != nil {
-		return nil, err
+		return nil, lockUnavailable(lockPath, err)
 	}
 	if err := f.Chmod(0o600); err != nil {
 		_ = f.Close()
