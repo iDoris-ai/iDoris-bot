@@ -12,3 +12,6 @@ linters:
         linters: [gosec, errcheck]
       - path: cmd/
         text: "G204|G304"   # service installer execs launchctl/systemctl and reads user-chosen config paths by design
+formatters:
+  enable:
+    - gofmt
