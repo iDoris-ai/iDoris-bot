@@ -382,6 +382,15 @@ func (r *Reconciler) Step(ctx context.Context) (Snapshot, error) {
 	}
 }
 
+// noteLocalFailure starts the login grace. It covers a CheckPrefs rejection
+// (no key minted) and a Start or StartLoginInteractive error after a mint,
+// as well as a login call that was accepted but has not reached Running.
+// The next attempt waits graceFor(unconverged) instead of minting again.
+func (r *Reconciler) noteLocalFailure() {
+	r.loginStarted = r.now()
+	r.unconverged++
+}
+
 // recentLogin reports whether the last login was issued within the current
 // grace period and tailscaled should be given time to converge before another
 // single-use key is burnt.
@@ -462,10 +471,23 @@ func (r *Reconciler) stepForeign(ctx context.Context, st *ipnstate.Status, prefs
 }
 
 func (r *Reconciler) login(ctx context.Context, reason string, base *ipn.Prefs) (Snapshot, error) {
+	if r.recentLogin() {
+		return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil
+	}
 	r.mu.Lock()
 	r.attempts++
 	r.mu.Unlock()
 	r.set(func(s *Snapshot) { s.Phase = PhaseEnrolling })
+	prefs := r.managedPrefs(base)
+	if len(r.opt.AdvertiseTags) > 0 {
+		r.log.Info("not sending advertise tags; the pre-auth key's acl tags are applied by Headscale")
+	}
+	// CheckPrefs rejects a prefs set the local client will not apply. Doing
+	// it before AuthKey avoids burning a single-use key on a local mistake.
+	if err := r.be.CheckPrefs(ctx, prefs); err != nil {
+		r.noteLocalFailure()
+		return r.fail(fmt.Errorf("check prefs: %w", err)), err
+	}
 	key, err := r.keys.AuthKey(ctx)
 	if err != nil {
 		return r.fail(fmt.Errorf("obtain auth key: %w", err)), err
@@ -473,26 +495,20 @@ func (r *Reconciler) login(ctx context.Context, reason string, base *ipn.Prefs) 
 	// A key was issued, so the enrollment service answered. Drop the startup
 	// degraded flag. Static keys never set it.
 	r.opt.EnrollUnreachable = false
-	prefs := r.managedPrefs(base)
-	if len(r.opt.AdvertiseTags) > 0 {
-		r.log.Info("not sending advertise tags; the pre-auth key's acl tags are applied by Headscale")
-	}
-	if err := r.be.CheckPrefs(ctx, prefs); err != nil {
-		return r.fail(fmt.Errorf("check prefs: %w", err)), err
-	}
 	r.log.Info("logging tailscaled into iDoris control server", "reason", reason, "control_url", r.opt.ControlURL, "os", runtime.GOOS,
 		"unconverged_attempts", r.unconverged+1, "grace", r.graceFor(r.unconverged+1))
 	if err := r.be.Start(ctx, ipn.Options{AuthKey: key, UpdatePrefs: prefs}); err != nil {
+		r.noteLocalFailure()
 		return r.fail(fmt.Errorf("start: %w", err)), err
 	}
 	// Mirror `tailscale up --auth-key`: Start resets the control client (and any
 	// stale browser auth URL); login-interactive then registers with the key and
 	// forces a fresh node key, which is also what re-enrollment after expiry needs.
 	if err := r.be.StartLoginInteractive(ctx); err != nil {
+		r.noteLocalFailure()
 		return r.fail(fmt.Errorf("login: %w", err)), err
 	}
-	r.loginStarted = r.now()
-	r.unconverged++
+	r.noteLocalFailure()
 	if r.awaitingIdentity {
 		r.identityLoginOK = true
 	}
