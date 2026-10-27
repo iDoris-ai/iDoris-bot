@@ -31,6 +31,10 @@ type ApplyOptions struct {
 	Token     string
 	NoService bool
 	PlanPath  string
+	// ReplaceExisting allows Apply to overwrite a config (and its token) that
+	// belongs to a different enrollment URL. Without it that case is an error,
+	// so one organisation's credential is never replaced by another's by accident.
+	ReplaceExisting bool
 }
 
 // ApplyResult is what the CLI and the local page show after Apply.
