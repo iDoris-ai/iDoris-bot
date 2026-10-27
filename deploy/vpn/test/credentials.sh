@@ -4,8 +4,9 @@
 # Required in the environment: COMPOSE_PROJECT_NAME, ENROLL_PORT, ENROLL_DIR,
 # PROJ. ENROLL_UID and ENROLL_GID are read by ctl.sh. ENROLL_DIR holds
 # config.json, which is the file the running enroll container has mounted.
-# ctl.sh writes that file and SIGHUPs the service. Tokens stay in shell
-# variables and in ENROLL_DIR/minted-tokens.txt (removed with the lab).
+# ctl.sh writes that file and restarts enroll. A file bind does not follow
+# the CLI's rename, so SIGHUP would keep the previous config. Tokens stay
+# in shell variables and in ENROLL_DIR/minted-tokens.txt (removed with the lab).
 set -euo pipefail
 umask 077
 
@@ -71,8 +72,10 @@ raise SystemExit(1)
 }
 
 post_enroll() {
-  local token="$1" hostname="$2" expect="$3" keyfile="${4:-}"
-  for _ in 1 2 3 4 5 6 7 8; do
+  local token="$1" hostname="$2" expect="$3" keyfile="${4:-}" try
+  try=0
+  while [[ "$try" -lt 30 ]]; do
+    try=$((try + 1))
     if python3 - "$token" "$enroll_url" "$hostname" "$expect" "$keyfile" <<'PY'
 import json, sys, urllib.error, urllib.request
 token, url, hostname, expect, keyfile = sys.argv[1:]
