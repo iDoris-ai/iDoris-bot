@@ -28,7 +28,7 @@ docker compose version >/dev/null 2>&1 || die "docker compose v2 is required"
 command -v python3 >/dev/null || die "python3 is required"
 command -v rsync >/dev/null || die "rsync is required"
 
-PROJ="idorisdr$(python3 -c 'import random; print(random.randint(100000, 999999))')"
+PROJ="idoris-vpn-ctl-$(python3 -c 'import random; print(random.randint(100000, 999999))')"
 export COMPOSE_PROJECT_NAME="$PROJ"
 ENROLL_UID="$(id -u)"
 ENROLL_GID="$(id -g)"
@@ -58,6 +58,8 @@ copy_tree() {
     --exclude '.env' \
     --exclude 'enroll/config.json' \
     --exclude 'enroll/headscale.apikey' \
+    --exclude 'enroll/token-labels.json' \
+    --exclude 'enroll/minted-tokens.txt' \
     --exclude 'headplane/cookie_secret' \
     --exclude 'headscale/managed.json' \
     "$from/" "$to/"
@@ -158,6 +160,55 @@ chmod 600 "$src/enroll/headscale.apikey"
 unset api_key
 
 image="$(docker compose config --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["enroll"]["image"])')"
+
+echo "drill: list-credentials reads a legacy hash and a labelled object"
+mkdir -p "$bundle_root/shape"
+python3 - "$bundle_root/shape/config.json" <<'PY'
+import json, sys
+cfg = {
+    "control_url": "http://headscale:8080",
+    "headscale_url": "http://headscale:8080",
+    "headscale_api_key_file": "/etc/idoris/headscale.apikey",
+    "tenants": [{
+        "name": "acme",
+        "headscale_user_id": "1",
+        "token_hashes": [
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            {
+                "hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "label": "bootstrap-acme",
+                "created_at": "2026-10-27T00:00:00Z",
+            },
+        ],
+        "preauth_ttl": "10m",
+    }],
+}
+with open(sys.argv[1], "w") as fh:
+    json.dump(cfg, fh)
+    fh.write("\n")
+PY
+shape_list="$(docker run --rm --network none -v "$bundle_root/shape:/work:ro" --entrypoint idoris-vpn-enroll "$image" list-credentials --config /work/config.json --entry acme)"
+printf '%s\n' "$shape_list" | python3 -c '
+import sys
+text = sys.stdin.read()
+if "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in text:
+    raise SystemExit("list printed a full hash")
+if "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" in text:
+    raise SystemExit("list printed a full hash")
+rows = {}
+for line in text.splitlines():
+    parts = line.split("\t")
+    if len(parts) != 3:
+        raise SystemExit("expected 3 tab fields, got %r" % line)
+    rows[parts[0]] = parts
+if rows.get("-") != ["-", "aaaaaaaaaaaa", "-"]:
+    raise SystemExit("legacy hash was not listed as -")
+if rows.get("bootstrap-acme") != ["bootstrap-acme", "bbbbbbbbbbbb", "2026-10-27T00:00:00Z"]:
+    raise SystemExit("labelled object was not listed")
+print("credential shapes ok")
+'
+rm -rf "$bundle_root/shape"
+
 mint_out="$(docker run --rm --network none --entrypoint idoris-vpn-enroll "$image" token new)"
 TOKEN="$(grep -oE 'idv1_[0-9a-f]{64}' <<<"$mint_out" | head -n1 || true)"
 HASH="$(grep -oE '^[[:space:]]*[0-9a-f]{64}[[:space:]]*$' <<<"$mint_out" | tr -d '[:space:]' | head -n1 || true)"
@@ -335,6 +386,9 @@ for needle in ("idv1_", "hskey-", "ENROLL_TOKEN"):
         raise SystemExit("manifest contains %s" % needle)
 if "headscale" not in text:
     raise SystemExit("manifest has no headscale image")
+sidecar = os.path.join(root, "state/enroll/token-labels.json")
+if os.path.lexists(sidecar):
+    raise SystemExit("fresh backup must not contain token-labels.json")
 print("bundle layout ok")
 PY
 
@@ -358,7 +412,14 @@ python3 - "$dst/enroll/config.json" "$TOKEN" <<'PY'
 import hashlib, json, sys
 cfg = json.load(open(sys.argv[1]))
 want = hashlib.sha256(sys.argv[2].encode()).hexdigest()
-got = cfg["tenants"][0]["token_hashes"]
+got = []
+for item in cfg["tenants"][0]["token_hashes"]:
+    if isinstance(item, str):
+        got.append(item.lower())
+    elif isinstance(item, dict) and isinstance(item.get("hash"), str):
+        got.append(item["hash"].lower())
+    else:
+        raise SystemExit("token_hashes entry is not a hex string or an object")
 if want not in got:
     raise SystemExit("restored enroll config does not contain the original token hash")
 print("restored token hash matches")
@@ -375,6 +436,21 @@ done
 docker compose exec -T headscale headscale health >/dev/null
 nodes_have drill-member || die "restored database lost drill-member"
 
+echo "drill: token list shows the restored legacy credential as -"
+listed="$(bash "$dst/ctl.sh" token list --entry acme)"
+prefix="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:12])' "$TOKEN")"
+printf '%s\n' "$listed" | python3 -c '
+import sys
+prefix = sys.argv[1]
+rows = [line.rstrip("\n").split("\t") for line in sys.stdin if line.strip()]
+hits = [r for r in rows if len(r) == 3 and r[0] == "-" and r[1].lower() == prefix]
+if len(hits) != 1:
+    raise SystemExit("token list did not show one unlabeled credential")
+if any(len(part) == 64 for row in rows for part in row):
+    raise SystemExit("token list printed a full hash")
+print("token list ok")
+' "$prefix"
+
 echo "drill: same token enrolls a new node"
 start_member "${PROJ}-member2" drill-member-2
 ready=0
@@ -386,5 +462,39 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27
   sleep 3
 done
 [[ "$ready" == 1 ]] || die "restored token did not enroll drill-member-2 beside the original node"
+
+echo "drill: restore ignores an obsolete token-labels.json"
+mkdir -p "$bundle/state/enroll"
+printf '%s\n' '{"version":1,"entries":{}}' > "$bundle/state/enroll/token-labels.json"
+chmod 600 "$bundle/state/enroll/token-labels.json"
+set +e
+second="$(bash "$dst/ctl.sh" restore "$bundle" --force 2>&1)"
+second_ec=$?
+set -e
+if [[ "$second_ec" -ne 0 ]]; then
+  printf '%s\n' "$second" | redact >&2
+  die "restore failed when token-labels.json was present"
+fi
+grep -q 'ignoring obsolete' <<<"$second" || die "restore did not ignore token-labels.json"
+[[ ! -e "$dst/enroll/token-labels.json" && ! -L "$dst/enroll/token-labels.json" ]] || die "restore copied token-labels.json"
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+  if docker compose exec -T headscale headscale health >/dev/null 2>&1 \
+    && docker compose exec -T enroll idoris-vpn-enroll check --config /etc/idoris/enroll.json >/dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+done
+docker compose exec -T headscale headscale health >/dev/null
+nodes_have drill-member || die "restore with a sidecar file lost drill-member"
+listed="$(bash "$dst/ctl.sh" token list --entry acme)"
+printf '%s\n' "$listed" | python3 -c '
+import sys
+prefix = sys.argv[1]
+rows = [line.rstrip("\n").split("\t") for line in sys.stdin if line.strip()]
+hits = [r for r in rows if len(r) == 3 and r[0] == "-" and r[1].lower() == prefix]
+if len(hits) != 1:
+    raise SystemExit("token list changed after ignoring token-labels.json")
+print("obsolete sidecar ignored")
+' "$prefix"
 echo "drill: ok"
 unset TOKEN
