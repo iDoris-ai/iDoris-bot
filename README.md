@@ -6,7 +6,7 @@ iDoris Bridge is a proposed **open-source, local-first communications bridge** l
 
 It is **not** another Agent framework, inference service, or AI SaaS. A public Relay supplies reliable webhook reception and delivery; the customer's Connector and Agent remain under the customer's control. The Relay can be operated by the project or self-hosted.
 
-> **Project status: design/planning only.** The current three-stage P1–P3 roadmap (LINE first, three steps) is a proposal, not an implemented product. The earlier G0–G5 plan is archived for traceability.
+> **Project status: P1-F0 has started.** `bridge-protocol` admits one verified event per bot and platform event id. Relay, Connector, LINE send, and the rest of P1-P3 are not implemented. The earlier G0-G5 plan is archived for traceability.
 
 ## Documentation / 规划文档
 

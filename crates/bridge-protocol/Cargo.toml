@@ -1,0 +1,9 @@
+[package]
+name = "bridge-protocol"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "Event envelope, branded ids, and delivery admission for iDoris Bridge."
+
+[dependencies]
