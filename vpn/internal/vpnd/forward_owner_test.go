@@ -111,10 +111,9 @@ func TestR3c2OwnerOnlyPlatformGate(t *testing.T) {
 
 func TestR3c2OwnerOnlyRejectsOtherUID(t *testing.T) {
 	prevSupported := ownerOnlySupported
-	prevLookup := peerUIDFunc
 	t.Cleanup(func() {
 		ownerOnlySupported = prevSupported
-		peerUIDFunc = prevLookup
+		setPeerUIDFunc(nil)
 		setOwnerOnlyListens(nil)
 	})
 	ownerOnlySupported = true
@@ -123,11 +122,11 @@ func TestR3c2OwnerOnlyRejectsOtherUID(t *testing.T) {
 
 	var mu sync.Mutex
 	uid := os.Getuid() + 1
-	peerUIDFunc = func(net.Conn) (int, error) {
+	setPeerUIDFunc(func(net.Conn) (int, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		return uid, nil
-	}
+	})
 
 	var buf bytes.Buffer
 	restore := r3c2CaptureDefaultLog(t, &buf)
@@ -178,9 +177,9 @@ func TestR3c2OwnerOnlyRejectsOtherUID(t *testing.T) {
 	}
 
 	// A lookup error is fail-closed: the connection is closed and Accept waits.
-	peerUIDFunc = func(net.Conn) (int, error) {
+	setPeerUIDFunc(func(net.Conn) (int, error) {
 		return 0, fmt.Errorf("proc unreadable")
-	}
+	})
 	bad, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
