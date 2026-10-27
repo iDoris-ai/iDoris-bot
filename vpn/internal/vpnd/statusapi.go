@@ -298,22 +298,44 @@ func ServeStatus(ctx context.Context, ln net.Listener, h http.Handler) error {
 	}
 }
 
+type statusDial struct {
+	network string
+	addr    string
+}
+
+type statusDialKey struct{}
+
+// statusClient is shared by every QueryStatus call. Keep-alives are off
+// because the URL host is constant while the dial address comes from the
+// request: a cached connection would be for the wrong socket. The dial
+// address is stored on the request context.
+var statusClient = &http.Client{
+	Timeout: 5 * time.Second,
+	Transport: &http.Transport{
+		DisableKeepAlives: true,
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			spec, ok := ctx.Value(statusDialKey{}).(statusDial)
+			if !ok || spec.network == "" || spec.addr == "" {
+				return nil, errors.New("vpnd: status query has no dial address")
+			}
+			var d net.Dialer
+			return d.DialContext(ctx, spec.network, spec.addr)
+		},
+	},
+}
+
 // QueryStatus fetches /v1/status from a running daemon at listen spec.
 func QueryStatus(ctx context.Context, spec string) (map[string]any, error) {
 	network, addr, err := ParseListen(spec)
 	if err != nil {
 		return nil, err
 	}
-	tr := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		var d net.Dialer
-		return d.DialContext(ctx, network, addr)
-	}}
-	hc := &http.Client{Transport: tr, Timeout: 5 * time.Second}
+	ctx = context.WithValue(ctx, statusDialKey{}, statusDial{network: network, addr: addr})
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://idoris-vpnd/v1/status", nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := hc.Do(req)
+	resp, err := statusClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
