@@ -308,20 +308,22 @@ func runCmd(args []string) error {
 		hostname = node.Hostname
 	}
 	rec, err := vpnd.New(node.Backend, keys, vpnd.Options{
-		ControlURL:         controlURL,
-		Hostname:           hostname,
-		AcceptRoutes:       cfg.AcceptRoutes,
-		AcceptDNS:          cfg.AcceptDNSValue(),
-		AdvertiseTags:      cfg.AdvertiseTags,
-		AdvertiseRoutes:    routes,
-		RunSSH:             cfg.SSH,
-		Takeover:           cfg.TakeoverValue(),
-		LoginWhileStarting: node.LoginWhileStarting,
-		Role:               cfg.Role,
-		Identity:           ident,
-		State:              binding,
-		EnrollUnreachable:  !enrollReachable,
-		Interval:           cfg.IntervalDuration(),
+		ControlURL:          controlURL,
+		Hostname:            hostname,
+		AcceptRoutes:        cfg.AcceptRoutes,
+		AcceptDNS:           cfg.AcceptDNSValue(),
+		AdvertiseTags:       cfg.AdvertiseTags,
+		AdvertiseRoutes:     routes,
+		RunSSH:              cfg.SSH,
+		Takeover:            cfg.TakeoverValue(),
+		LoginWhileStarting:  node.LoginWhileStarting,
+		RecoverUnregistered: node.RecoverUnregistered,
+		MarkRegistered:      node.markRegistered,
+		Role:                cfg.Role,
+		Identity:            ident,
+		State:               binding,
+		EnrollUnreachable:   !enrollReachable,
+		Interval:            cfg.IntervalDuration(),
 	}, log)
 	if err != nil {
 		return err
@@ -485,14 +487,16 @@ func (f *forwardList) Set(s string) error {
 // local forwards use. System mode dials with the kernel; embedded mode dials
 // through tsnet so MagicDNS names resolve without a TUN device.
 type runningNode struct {
-	Mode               string
-	Reason             string
-	Backend            vpnd.Backend
-	Dialer             vpnd.Dialer
-	Hostname           string
-	LoginWhileStarting bool
-	lock               *vpnd.ControllerLock
-	close              func() error
+	Mode                string
+	Reason              string
+	Backend             vpnd.Backend
+	Dialer              vpnd.Dialer
+	Hostname            string
+	LoginWhileStarting  bool
+	RecoverUnregistered bool
+	markRegistered      func() error
+	lock                *vpnd.ControllerLock
+	close               func() error
 }
 
 func (n *runningNode) Close() error {
@@ -569,6 +573,10 @@ func openNode(ctx context.Context, cfg *vpnd.Config, controlURL string, log *slo
 				return nil, err
 			}
 		}
+		loginNow, recover, merr := vpnd.EmbeddedLoginMode(dir)
+		if merr != nil {
+			return nil, merr
+		}
 		if ctrl != nil {
 			_ = ctrl.Release()
 			ctrl = nil
@@ -588,14 +596,16 @@ func openNode(ctx context.Context, cfg *vpnd.Config, controlURL string, log *slo
 		}
 		keepLock = true
 		return &runningNode{
-			Mode:               d.Mode,
-			Reason:             d.Reason,
-			Backend:            emb.Backend(),
-			Dialer:             emb,
-			Hostname:           emb.Hostname(),
-			LoginWhileStarting: emb.Fresh(),
-			lock:               ctrl,
-			close:              emb.Close,
+			Mode:                d.Mode,
+			Reason:              d.Reason,
+			Backend:             emb.Backend(),
+			Dialer:              emb,
+			Hostname:            emb.Hostname(),
+			LoginWhileStarting:  loginNow,
+			RecoverUnregistered: recover,
+			markRegistered:      func() error { return vpnd.MarkRegistrationComplete(dir) },
+			lock:                ctrl,
+			close:               emb.Close,
 		}, nil
 	}
 	if ctrl == nil {
