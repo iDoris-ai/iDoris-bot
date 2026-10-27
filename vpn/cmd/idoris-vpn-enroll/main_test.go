@@ -8,9 +8,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/enroll"
 	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/headscale"
@@ -425,6 +427,54 @@ func TestReloadFromDiskRotatesHeadscaleAPIKey(t *testing.T) {
 		t.Fatalf("probe warning missing:\n%s", text)
 	}
 	assertLogHasNoKey(t, text, oldKey, newKey, badKey)
+}
+
+func TestR2GReloadLogsFileIdentity(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "enroll.json")
+	alpha := "alpha-token-value"
+	beta := "beta-token-value"
+	h1 := enroll.HashToken(alpha)
+	h2 := enroll.HashToken(beta)
+	body := `{
+  "control_url": "https://vpn.example.org",
+  "tenants": [{
+    "name": "acme",
+    "headscale_user_id": "1",
+    "token_hashes": ["` + h1 + `", "` + h2 + `"]
+  }]
+}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := enroll.NewServer(*cfg, stubMinter{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	if err := reloadFromDisk(srv, path, log); err != nil {
+		t.Fatal(err)
+	}
+	text := buf.String()
+	mtime := st.ModTime().UTC().Format(time.RFC3339Nano)
+	if !strings.Contains(text, "config reloaded") || !strings.Contains(text, "size=") || !strings.Contains(text, mtime) || !strings.Contains(text, "credentials=2") {
+		t.Fatalf("log %q", text)
+	}
+	if !strings.Contains(text, "size="+strconv.FormatInt(st.Size(), 10)) {
+		t.Fatalf("size missing from %q", text)
+	}
+	if strings.Contains(text, alpha) || strings.Contains(text, beta) || strings.Contains(text, h1) || strings.Contains(text, h2) {
+		t.Fatalf("log contains a credential: %q", text)
+	}
 }
 
 func TestR2GRevokeAllowEmptyCLI(t *testing.T) {
