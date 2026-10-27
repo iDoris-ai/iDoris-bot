@@ -32,8 +32,11 @@ type Config struct {
 	AuthKeyFile string `json:"auth_key_file,omitempty"`
 
 	Hostname     string `json:"hostname,omitempty"`
-	AcceptRoutes bool   `json:"accept_routes,omitempty"`
-	AcceptDNS    *bool  `json:"accept_dns,omitempty"`
+	AcceptRoutes bool `json:"accept_routes,omitempty"`
+	AcceptDNS    *bool `json:"accept_dns,omitempty"`
+	// SSH is Tailscale SSH (RunSSH). Nil means the daemon does not touch it.
+	// An ACL that allows tcp/22 does not turn this on.
+	SSH *bool `json:"ssh,omitempty"`
 	// AdvertiseTags is the tag the operator expects on this node. The daemon
 	// does not send it at login: Headscale v0.29.6 rejects a pre-auth-key
 	// registration that also requests tags. Put the same tag in the
@@ -146,8 +149,32 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.EnrollAllowInsecure = v == "1" || strings.EqualFold(v, "true")
 	}
 	if v, ok := os.LookupEnv("IDORIS_VPN_TAKEOVER"); ok {
-		b := v == "1" || strings.EqualFold(v, "true")
+		b, err := ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("IDORIS_VPN_TAKEOVER: %w", err)
+		}
 		cfg.Takeover = &b
+	}
+	if v, ok := os.LookupEnv("IDORIS_VPN_ACCEPT_ROUTES"); ok {
+		b, err := ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("IDORIS_VPN_ACCEPT_ROUTES: %w", err)
+		}
+		cfg.AcceptRoutes = b
+	}
+	if v, ok := os.LookupEnv("IDORIS_VPN_ACCEPT_DNS"); ok {
+		b, err := ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("IDORIS_VPN_ACCEPT_DNS: %w", err)
+		}
+		cfg.AcceptDNS = &b
+	}
+	if v, ok := os.LookupEnv("IDORIS_VPN_SSH"); ok {
+		b, err := ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("IDORIS_VPN_SSH: %w", err)
+		}
+		cfg.SSH = &b
 	}
 	if v, ok := os.LookupEnv("IDORIS_VPN_ADVERTISE_ROUTES"); ok {
 		cfg.AdvertiseRoutes = splitList(v)
@@ -323,6 +350,19 @@ func (c *Config) IntervalDuration() time.Duration {
 
 // AcceptDNSValue defaults to true (MagicDNS is how members find the Local AI host).
 func (c *Config) AcceptDNSValue() bool { return c.AcceptDNS == nil || *c.AcceptDNS }
+
+// ParseBool accepts 1/0, true/false, yes/no. Empty is an error so an unset
+// variable (which is not looked up) stays distinct from an explicit value.
+func ParseBool(s string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes", "y":
+		return true, nil
+	case "0", "false", "no", "n":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid boolean %q", s)
+	}
+}
 
 // TakeoverValue is true only when the operator explicitly enabled takeover.
 // The default is false: never switch a system tailscaled that is logged into
