@@ -47,6 +47,8 @@ type Tenant struct {
 	// Ephemeral marks enrolled nodes as ephemeral (removed when offline).
 	Ephemeral bool `json:"ephemeral,omitempty"`
 	// RatePerMinute caps successful enrollments per minute. Zero means 30.
+	// It is applied only after the token has authenticated, and it does not
+	// cover /v1/discover (that route has its own bucket of the same size).
 	RatePerMinute int `json:"rate_per_minute,omitempty"`
 }
 
@@ -59,6 +61,18 @@ type Config struct {
 	// HeadscaleAPIKeyFile holds the API key (one line). Can also be given via env.
 	HeadscaleAPIKeyFile string   `json:"headscale_api_key_file,omitempty"`
 	Tenants             []Tenant `json:"tenants"`
+	// GlobalRatePerMinute caps /v1/enroll and /v1/discover before any token
+	// hash is scanned. Zero means defaultGlobalRatePerMinute (600).
+	GlobalRatePerMinute int `json:"global_rate_per_minute,omitempty"`
+	// PerIPRatePerMinute is the same pre-authentication cap per client IP.
+	// Zero means defaultPerIPRatePerMinute (60).
+	PerIPRatePerMinute int `json:"per_ip_rate_per_minute,omitempty"`
+	// TrustedProxies are CIDRs of reverse proxies. X-Forwarded-For is honored
+	// only when the TCP peer is inside this list; otherwise the peer is the
+	// client and a spoofed header cannot choose the rate-limit key.
+	TrustedProxies []string `json:"trusted_proxies,omitempty"`
+	// trusted is the parsed form of TrustedProxies. It is not serialized.
+	trusted []netip.Prefix
 }
 
 // Duration is a time.Duration that JSON-encodes as "10m".
@@ -122,6 +136,17 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	if c.GlobalRatePerMinute < 0 {
+		return errors.New("global_rate_per_minute must be >= 0")
+	}
+	if c.PerIPRatePerMinute < 0 {
+		return errors.New("per_ip_rate_per_minute must be >= 0")
+	}
+	prefixes, err := parseTrusted(c.TrustedProxies)
+	if err != nil {
+		return err
+	}
+	c.trusted = prefixes
 	return nil
 }
 
@@ -165,7 +190,15 @@ type Server struct {
 	now    func() time.Time
 
 	mu      sync.Mutex
+	trusted []netip.Prefix
 	buckets map[string]*bucket
+	// authLogNext is the earliest time another failed-auth warning may be logged.
+	authLogNext time.Time
+	// authLogSkipped counts warnings dropped since the last one that was logged.
+	authLogSkipped int
+	// authScans counts token-hash walks. Tests use it to prove the pre-auth
+	// limiter runs before the scan. It is not a metric.
+	authScans int
 }
 
 type bucket struct {
@@ -184,7 +217,14 @@ func NewServer(cfg Config, minter Minter, log *slog.Logger) (*Server, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{cfg: cfg, minter: minter, log: log, now: time.Now, buckets: map[string]*bucket{}}, nil
+	return &Server{
+		cfg:     cfg,
+		minter:  minter,
+		log:     log,
+		now:     time.Now,
+		trusted: append([]netip.Prefix(nil), cfg.trusted...),
+		buckets: map[string]*bucket{},
+	}, nil
 }
 
 // Handler returns the HTTP mux for the service.
@@ -222,6 +262,7 @@ func (s *Server) Reload(cfg Config) error {
 	}
 	s.mu.Lock()
 	s.cfg = cfg
+	s.trusted = append([]netip.Prefix(nil), cfg.trusted...)
 	s.mu.Unlock()
 	return nil
 }
@@ -229,6 +270,7 @@ func (s *Server) Reload(cfg Config) error {
 // lookupLocked finds the tenant owning token. The caller holds s.mu. It always
 // walks every hash so the match does not leak which entry succeeded.
 func (s *Server) lookupLocked(token string) (Tenant, bool) {
+	s.authScans++
 	want := sha256.Sum256([]byte(token))
 	found := -1
 	for i := range s.cfg.Tenants {
@@ -262,31 +304,6 @@ func (s *Server) controlURL() string {
 	return s.cfg.ControlURL
 }
 
-func (s *Server) allow(t *Tenant) bool {
-	rate := float64(t.RatePerMinute)
-	if rate <= 0 {
-		rate = 30
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := s.now()
-	b := s.buckets[t.Name]
-	if b == nil {
-		b = &bucket{tokens: rate, last: now}
-		s.buckets[t.Name] = b
-	}
-	b.tokens += now.Sub(b.last).Minutes() * rate
-	if b.tokens > rate {
-		b.tokens = rate
-	}
-	b.last = now
-	if b.tokens < 1 {
-		return false
-	}
-	b.tokens--
-	return true
-}
-
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
@@ -294,29 +311,39 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// authenticate resolves the bearer token to a tenant or writes a 401.
-// The returned tenant is a copy, safe to use after a concurrent Reload.
-func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (Tenant, bool) {
+// authenticate applies the pre-authentication limiters, then resolves the
+// bearer token. remote is the client IP used for the per-IP bucket. The
+// returned tenant is a copy, safe to use after a concurrent Reload.
+func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (Tenant, string, bool) {
+	remote, ok := s.admit(w, r)
+	if !ok {
+		return Tenant{}, remote, false
+	}
 	auth := r.Header.Get("Authorization")
 	const prefix = "Bearer "
 	if !strings.HasPrefix(auth, prefix) || len(auth) <= len(prefix) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing bearer token"})
-		return Tenant{}, false
+		return Tenant{}, remote, false
 	}
 	s.mu.Lock()
 	tenant, ok := s.lookupLocked(strings.TrimSpace(auth[len(prefix):]))
 	s.mu.Unlock()
 	if !ok {
-		s.log.Warn("rejected: unknown token", "path", r.URL.Path, "remote", r.RemoteAddr)
+		s.sampleWarn("rejected: unknown token", "path", r.URL.Path, "remote", remote)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid token"})
-		return Tenant{}, false
+		return Tenant{}, remote, false
 	}
-	return tenant, true
+	return tenant, remote, true
 }
 
 func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
-	tenant, ok := s.authenticate(w, r)
+	tenant, remote, ok := s.authenticate(w, r)
 	if !ok {
+		return
+	}
+	if !s.allowKeyed("discover:"+tenant.Name, tenantRate(tenant)) {
+		s.sampleWarn("discover rate limited", "tenant", tenant.Name, "remote", remote)
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limited"})
 		return
 	}
 	writeJSON(w, http.StatusOK, Discovery{
@@ -328,7 +355,7 @@ func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
-	tenant, ok := s.authenticate(w, r)
+	tenant, remote, ok := s.authenticate(w, r)
 	if !ok {
 		return
 	}
@@ -337,8 +364,8 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
 		return
 	}
-	if !s.allow(&tenant) {
-		s.log.Warn("enroll rate limited", "tenant", tenant.Name, "remote", r.RemoteAddr)
+	if !s.allowKeyed("enroll:"+tenant.Name, tenantRate(tenant)) {
+		s.log.Warn("enroll rate limited", "tenant", tenant.Name, "remote", remote)
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limited"})
 		return
 	}
@@ -361,7 +388,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "control server unavailable"})
 		return
 	}
-	s.log.Info("enrolled", "tenant", tenant.Name, "hostname", req.Hostname, "os", req.OS, "key_id", key.ID, "expires_at", exp.UTC().Format(time.RFC3339))
+	s.log.Info("enrolled", "tenant", tenant.Name, "remote", remote, "hostname", req.Hostname, "os", req.OS, "key_id", key.ID, "expires_at", exp.UTC().Format(time.RFC3339))
 	writeJSON(w, http.StatusOK, Response{
 		ControlURL: s.controlURL(),
 		AuthKey:    key.Key,

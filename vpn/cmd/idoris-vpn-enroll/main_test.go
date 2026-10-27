@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -122,6 +123,65 @@ func TestReloadFromDiskKeepsPreviousConfig(t *testing.T) {
 	}
 	if _, err := (&enroll.Client{URL: ts.URL, Token: tok, AllowInsecure: true}).Discover(context.Background()); err == nil {
 		t.Fatal("old token still accepted after reload")
+	}
+}
+
+func TestReloadFromDiskAppliesLimitFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "enroll.json")
+	tok := "idv1_seedseedseedseedseedseedseedseed"
+	hash := enroll.HashToken(tok)
+	body := func(extra string) {
+		t.Helper()
+		raw := `{
+  "control_url": "https://vpn.example.org",
+  ` + extra + `
+  "tenants": [{
+    "name": "acme",
+    "headscale_user_id": "1",
+    "token_hashes": ["` + hash + `"]
+  }]
+}`
+		if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	body(`"global_rate_per_minute": 100, "per_ip_rate_per_minute": 1, "trusted_proxies": ["10.0.0.0/8"],`)
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := enroll.NewServer(*cfg, stubMinter{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body(`"trusted_proxies": ["not-a-cidr"],`)
+	if err := reloadFromDisk(srv, path); err == nil {
+		t.Fatal("invalid trusted_proxies was accepted")
+	}
+	call := func(remote, xff string) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, "/v1/discover", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.RemoteAddr = remote
+		req.Header.Set("Authorization", "Bearer "+tok)
+		if xff != "" {
+			req.Header.Set("X-Forwarded-For", xff)
+		}
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		return rr.Code
+	}
+	// The rejected reload must leave the trusted-proxy list in place: the
+	// bucket key is the forwarded client, so a later direct connection from
+	// that client is already spent.
+	if call("10.1.1.1:443", "203.0.113.9") != http.StatusOK {
+		t.Fatal("trusted proxy request failed")
+	}
+	if call("203.0.113.9:9", "") != http.StatusTooManyRequests {
+		t.Fatal("X-Forwarded-For was not honored after the rejected reload")
 	}
 }
 
