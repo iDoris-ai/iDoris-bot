@@ -1,0 +1,7 @@
+# Clean-host restore drill (deploy/vpn/test/restore-drill.sh). Holds a
+# database, API key and enrollment token hashes. Never commit.
+.drill-src/
+.drill-dst/
+.drill-backup/
+# Headplane login proof (deploy/vpn/test/headplane-login.sh).
+.hp-src/

@@ -63,10 +63,27 @@ cleanup() {
   done
   docker network rm "${PROJ}-lan" >/dev/null 2>&1 || true
   dc --profile tailnet-admin down -v >/dev/null 2>&1 || true
+  if [[ -f "$lab/staged-files" ]]; then
+    while IFS= read -r staged; do
+      [[ -n "$staged" ]] || continue
+      rm -f "$staged"
+    done < "$lab/staged-files"
+  fi
+  if [[ -f "$lab/file-modes" ]]; then
+    python3 - "$lab/file-modes" <<'PY' || true
+import os, sys
+for line in open(sys.argv[1]):
+    mode, path = line.split(" ", 1)
+    path = path.rstrip("\n")
+    if os.path.isfile(path) and not os.path.islink(path):
+        os.chmod(path, int(mode, 8))
+PY
+  fi
   rm -rf "$lab"
   if [[ "$cookie_created" == 1 ]]; then
     rm -f "$root/headplane/cookie_secret"
   fi
+  rm -f "$root/.admin-mode" "$root/.admin-mode."* "$root/.running."*
   exit "$ec"
 }
 trap cleanup EXIT
@@ -402,12 +419,12 @@ MATRIX=(
   "globex-member acme-ai 22 deny"
   "globex-member acme-member 22 deny"
   "globex-member acme-member 8740 deny"
-  "acme-ai acme-member 22 allow"
-  "acme-ai acme-member 8740 allow"
+  "acme-ai acme-member 22 deny"
+  "acme-ai acme-member 8740 deny"
   "acme-ai globex-member 22 deny"
   "acme-ai globex-ai 8740 deny"
-  "globex-ai globex-member 22 allow"
-  "globex-ai globex-member 8740 allow"
+  "globex-ai globex-member 22 deny"
+  "globex-ai globex-member 8740 deny"
   "globex-ai acme-member 22 deny"
   "globex-ai acme-ai 8740 deny"
   "admin-node acme-ai 22 allow"
@@ -600,6 +617,101 @@ else
   pass=$((pass + 1))
   echo "  ok   globex-member denied Headplane on ${vip}:3000"
 fi
+
+echo "probe: backup/restore keeps the published Headplane stopped"
+printf 'mode=tailnet-admin\n' > "$root/.admin-mode"
+chmod 600 "$root/.admin-mode"
+# ctl.sh backup reads host files. The lab keeps the live copies under test/.lab
+# so a developer tree without secrets can still take the bundle. Only paths
+# this probe created are deleted on the way out.
+stage_secret() {
+  local dest="$1" src="$2"
+  if [[ -e "$dest" || -L "$dest" ]]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$dest")"
+  cp "$src" "$dest"
+  chmod 600 "$dest"
+  printf '%s\n' "$dest" >> "$lab/staged-files"
+}
+if [[ ! -e "$root/.env" && ! -L "$root/.env" ]]; then
+  cat > "$root/.env" <<EOF
+COMPOSE_PROJECT_NAME=${PROJ}
+ENROLL_UID=${ENROLL_UID}
+ENROLL_GID=${ENROLL_GID}
+HEADSCALE_PORT=${HEADSCALE_PORT}
+HEADPLANE_PORT=${HEADPLANE_PORT}
+ENROLL_PORT=${ENROLL_PORT}
+DERP_STUN_PORT=${DERP_STUN_PORT}
+EOF
+  chmod 600 "$root/.env"
+  printf '%s\n' "$root/.env" >> "$lab/staged-files"
+fi
+stage_secret "$root/enroll/config.json" "$lab/enroll.json"
+stage_secret "$root/enroll/headscale.apikey" "$lab/headscale.apikey"
+stage_secret "$root/headscale/managed.json" "$lab/managed.json"
+python3 - "$lab/file-modes" \
+  "$root/headscale/config.yaml" "$root/headscale/policy.hujson" \
+  "$root/headplane/config.yaml" "$root/compose.yaml" <<'PY'
+import os, sys
+out = sys.argv[1]
+with open(out, "w") as fh:
+    for path in sys.argv[2:]:
+        fh.write("%o %s\n" % (os.stat(path).st_mode & 0o777, path))
+PY
+bash "$root/ctl.sh" backup "$lab/mode-backup"
+[[ -f "$lab/mode-backup/state/enroll/config.json" ]] || die "backup missed enroll config"
+[[ -f "$lab/mode-backup/state/dotenv" ]] || die "backup missed .env"
+[[ -f "$lab/mode-backup/manifest.json" ]] || die "backup missed manifest"
+if grep -qE 'idv1_|hskey-|ENROLL_TOKEN' "$lab/mode-backup/manifest.json"; then
+  die "backup manifest contains a secret"
+fi
+pub_running="$(docker compose --project-name "$PROJ" ps --status running -q headplane || true)"
+tail_running="$(docker compose --project-name "$PROJ" --profile tailnet-admin ps --status running -q headplane-tailnet || true)"
+if [[ -z "$pub_running" && -n "$tail_running" ]]; then
+  pass=$((pass + 1))
+  echo "  ok   after backup, published headplane is stopped and headplane-tailnet is running"
+else
+  fail=$((fail + 1))
+  echo "  FAIL after backup published='$pub_running' tailnet='$tail_running'" >&2
+fi
+if python3 -c 'import socket,sys
+s=socket.socket(); s.settimeout(1)
+try:
+    s.connect(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(0)
+sys.exit(1)' "$HEADPLANE_PORT"; then
+  pass=$((pass + 1))
+  echo "  ok   after backup, 127.0.0.1:${HEADPLANE_PORT} is closed"
+else
+  fail=$((fail + 1))
+  echo "  FAIL after backup, 127.0.0.1:${HEADPLANE_PORT} accepted a connection" >&2
+fi
+bash "$root/ctl.sh" restore "$lab/mode-backup" --force
+pub_running="$(docker compose --project-name "$PROJ" ps --status running -q headplane || true)"
+tail_running="$(docker compose --project-name "$PROJ" --profile tailnet-admin ps --status running -q headplane-tailnet || true)"
+if [[ -z "$pub_running" && -n "$tail_running" ]]; then
+  pass=$((pass + 1))
+  echo "  ok   after restore, published headplane is stopped and headplane-tailnet is running"
+else
+  fail=$((fail + 1))
+  echo "  FAIL after restore published='$pub_running' tailnet='$tail_running'" >&2
+fi
+if python3 -c 'import socket,sys
+s=socket.socket(); s.settimeout(1)
+try:
+    s.connect(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(0)
+sys.exit(1)' "$HEADPLANE_PORT"; then
+  pass=$((pass + 1))
+  echo "  ok   after restore, 127.0.0.1:${HEADPLANE_PORT} is closed"
+else
+  fail=$((fail + 1))
+  echo "  FAIL after restore, 127.0.0.1:${HEADPLANE_PORT} accepted a connection" >&2
+fi
+rm -f "$root/.admin-mode"
 
 echo "probe: ${pass} passed, ${fail} failed"
 [[ "$fail" == 0 ]] || die "${fail} probe(s) failed"
