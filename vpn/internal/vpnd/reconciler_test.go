@@ -30,6 +30,11 @@ type fakeBackend struct {
 	statusErr error
 
 	calls []string
+	checkPrefsErr error
+	startErr      error
+	loginErr      error
+	// onCheck runs at the start of CheckPrefs, before the error return.
+	onCheck func()
 	// starts records auth keys passed to Start.
 	starts []string
 	// pendingKey is the auth key handed to Start, consumed by StartLoginInteractive.
@@ -87,7 +92,13 @@ func (f *fakeBackend) EditPrefs(_ context.Context, mp *ipn.MaskedPrefs) (*ipn.Pr
 	p := f.prefs
 	return &p, nil
 }
-func (f *fakeBackend) CheckPrefs(context.Context, *ipn.Prefs) error { f.rec("CheckPrefs"); return nil }
+func (f *fakeBackend) CheckPrefs(context.Context, *ipn.Prefs) error {
+	f.rec("CheckPrefs")
+	if f.onCheck != nil {
+		f.onCheck()
+	}
+	return f.checkPrefsErr
+}
 func (f *fakeBackend) ProfileStatus(context.Context) (ipn.LoginProfile, []ipn.LoginProfile, error) {
 	f.rec("ProfileStatus")
 	return f.current, f.profiles, nil
@@ -113,6 +124,9 @@ func (f *fakeBackend) SwitchToEmptyProfile(context.Context) error {
 }
 func (f *fakeBackend) Start(_ context.Context, o ipn.Options) error {
 	f.rec("Start")
+	if f.startErr != nil {
+		return f.startErr
+	}
 	f.starts = append(f.starts, o.AuthKey)
 	f.prefs = *o.UpdatePrefs
 	f.pendingKey = o.AuthKey
@@ -123,6 +137,9 @@ func (f *fakeBackend) Start(_ context.Context, o ipn.Options) error {
 }
 func (f *fakeBackend) StartLoginInteractive(context.Context) error {
 	f.rec("StartLoginInteractive")
+	if f.loginErr != nil {
+		return f.loginErr
+	}
 	if f.pendingKey != "" {
 		f.state = ipn.Starting
 		f.pendingKey = ""
@@ -302,6 +319,76 @@ func TestLoginGraceResetsOnceRunning(t *testing.T) {
 	now = now.Add(21 * time.Second)
 	if _, err := r.Step(ctx); err != nil || keys.n != 4 {
 		t.Fatalf("grace should have restarted at 20s: keys=%d err=%v", keys.n, err)
+	}
+}
+
+func TestLocalFailureDoesNotMintTwiceWithinGrace(t *testing.T) {
+	now := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+
+	be := &fakeBackend{state: ipn.NeedsLogin, checkPrefsErr: errors.New("prefs rejected")}
+	keys := &countingKeys{}
+	be.onCheck = func() {
+		if keys.n != 0 {
+			t.Fatalf("CheckPrefs ran after a key was minted: %d", keys.n)
+		}
+	}
+	r := newR(t, be, keys, nil)
+	r.now = func() time.Time { return now }
+	if _, err := r.Step(ctx); err == nil || keys.n != 0 || len(be.starts) != 0 {
+		t.Fatalf("check prefs must fail closed with no key: keys=%d err=%v", keys.n, err)
+	}
+	now = now.Add(5 * time.Second)
+	if _, err := r.Step(ctx); err != nil || keys.n != 0 {
+		t.Fatalf("grace after CheckPrefs must not mint: keys=%d err=%v", keys.n, err)
+	}
+
+	be2 := &fakeBackend{state: ipn.NeedsLogin, startErr: errors.New("local api refused")}
+	keys2 := &countingKeys{}
+	be2.onCheck = func() {
+		if keys2.n != 0 && keys2.n != 1 {
+			t.Fatalf("unexpected mint count at CheckPrefs: %d", keys2.n)
+		}
+	}
+	r2 := newR(t, be2, keys2, nil)
+	r2.now = func() time.Time { return now }
+	if _, err := r2.Step(ctx); err == nil || keys2.n != 1 || len(be2.starts) != 0 {
+		t.Fatalf("start failure still mints once: keys=%d starts=%v err=%v", keys2.n, be2.starts, err)
+	}
+	starts := 0
+	for _, c := range be2.calls {
+		if c == "Start" {
+			starts++
+		}
+	}
+	if starts != 1 {
+		t.Fatalf("calls %v", be2.calls)
+	}
+	now = now.Add(5 * time.Second)
+	if _, err := r2.Step(ctx); err != nil || keys2.n != 1 {
+		t.Fatalf("grace after Start must not mint again: keys=%d err=%v", keys2.n, err)
+	}
+	now = now.Add(20 * time.Second)
+	before := keys2.n
+	be2.onCheck = func() {
+		if keys2.n != before {
+			t.Fatalf("second attempt minted before CheckPrefs: %d", keys2.n)
+		}
+	}
+	if _, err := r2.Step(ctx); err == nil || keys2.n != 2 {
+		t.Fatalf("after grace a new key is allowed: keys=%d err=%v", keys2.n, err)
+	}
+
+	be3 := &fakeBackend{state: ipn.NeedsLogin, loginErr: errors.New("login interactive failed")}
+	keys3 := &countingKeys{}
+	r3 := newR(t, be3, keys3, nil)
+	r3.now = func() time.Time { return now }
+	if _, err := r3.Step(ctx); err == nil || keys3.n != 1 {
+		t.Fatalf("login interactive failure: keys=%d err=%v", keys3.n, err)
+	}
+	now = now.Add(5 * time.Second)
+	if _, err := r3.Step(ctx); err != nil || keys3.n != 1 {
+		t.Fatalf("grace after login interactive must not mint: keys=%d err=%v", keys3.n, err)
 	}
 }
 
