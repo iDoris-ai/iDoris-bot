@@ -279,6 +279,24 @@ func (s *Server) Reload(cfg Config) error {
 	return nil
 }
 
+// SetMinter replaces the client that mints pre-auth keys. Nil is ignored so
+// a failed key rotation cannot clear the client that is still serving.
+// handleEnroll reads it under the same lock.
+func (s *Server) SetMinter(m Minter) {
+	if m == nil {
+		return
+	}
+	s.mu.Lock()
+	s.minter = m
+	s.mu.Unlock()
+}
+
+func (s *Server) minterNow() Minter {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.minter
+}
+
 // lookupLocked finds the tenant owning token. The caller holds s.mu. It always
 // walks every hash so the match does not leak which entry succeeded.
 func (s *Server) lookupLocked(token string) (Tenant, string, bool) {
@@ -401,7 +419,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	exp := s.now().Add(ttl)
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	key, err := s.minter.CreatePreAuthKey(ctx, headscale.CreatePreAuthKeyRequest{
+	key, err := s.minterNow().CreatePreAuthKey(ctx, headscale.CreatePreAuthKeyRequest{
 		UserID:     tenant.HeadscaleUserID,
 		Reusable:   false,
 		Ephemeral:  tenant.Ephemeral,
