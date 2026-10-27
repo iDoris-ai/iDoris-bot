@@ -221,6 +221,8 @@ iOS / Android 同时只允许一个活动 VPN。这次没有在手机上验证�
 
 结束后 `docker ps -a`、`docker volume ls`、`docker network ls` 里没有 `idoris-vpn-*` 容器、卷或网络。
 
+接线这一轮在 `work/vpn-wiring` 上又跑了一次门禁，数字如下。`make test` 退出码 0：`cmd/idoris-vpn-enroll` 1.422s，`cmd/idoris-vpnd` 1.691s，`internal/enroll` 3.452s，`internal/gateway` 5.102s，`internal/headscale` 2.635s，`internal/join` 2.113s，`internal/netdetect` 4.477s，`internal/ui` 4.331s，`internal/vpnd` 4.510s。两次 `golangci-lint`（第二次带 `--build-tags integration`）都是 `0 issues`。`make licenses` 扫完 linux、darwin、windows 的 amd64 与 arm64，输出 `THIRD_PARTY_NOTICES.md is up to date`。`make build-linux` 版本串是 `5797c87`（gosec 修正在这次编译之后才提交）。`make integration` 退出码 0，包耗时 275.545s。`TestWireAccessForwardsAndSOCKS5` 16.23s，日志是 `max_connections refusal in 0s` 和 `wire access ok: tcp, unix mode 0600, socks5 auth, cap refusal 0s`。这一项开始编译 `wireclient` 时，gosec 修正已经在磁盘上。同轮其余项：`TestEmbeddedAutoLeavesForeignTailscale` 48.73s，`TestHardAAwaitTailscaled` 3.37s，`TestHardAClientCore` 53.43s（`foreign-stays` 15.94s，`unmanaged-prefs` 25.51s，`enroll-down` 5.22s），`TestEnrollConnectAndReauth` 36.14s，`TestLanDirect` 28.95s，`TestLanAwayRelay` 22.59s，`TestGatewaySubnetRoute` 34.16s，`TestWizardGatewayJoin` 30.89s。结束后 `docker ps -a` 没有 `wire-*` 或 `idoris-vpn-*` 容器。
+
 ## 11. 身份绑定、环境变量、锁
 
 ### 身份与控制面
