@@ -160,6 +160,7 @@
   }
 
   var confirmBox = document.getElementById("confirm-authority");
+  var replaceBox = document.getElementById("replace-existing");
   var enableBtn = document.getElementById("enable");
   function syncEnable() {
     enableBtn.disabled = !confirmBox.checked;
@@ -272,7 +273,9 @@
 
   document.getElementById("enable").addEventListener("click", function () {
     showError("");
-    post("/api/apply", answers()).then(function (res) {
+    var body = answers();
+    body.replace_existing = !!(replaceBox && replaceBox.checked);
+    post("/api/apply", body).then(function (res) {
       var lines = ["配置已写入 " + (res.config_path || "")];
       if (res.sudo_command) {
         lines.push("当前不是 root，没有改系统转发。请原样执行：");
@@ -281,6 +284,9 @@
       if (res.ip_forward_applied) {
         lines.push("已打开 IPv4 转发。");
       }
+      (res.access_info || []).forEach(function (line) {
+        lines.push(line);
+      });
       document.getElementById("result").textContent = lines.join("\n");
       poll();
     }).catch(showError);
