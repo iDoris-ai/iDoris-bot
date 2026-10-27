@@ -194,19 +194,27 @@ Error: invalid argument "wiz-gw-wait" for "-i, --identifier" flag: strconv.Parse
 
 ## 9. 本地页面的安全模型
 
-`idoris-vpnd ui` 只听 `127.0.0.1` 的随机端口。stdout 打出带一次性秘密的 URL（`?k=`）。浏览器是否被打开：macOS 用 `open`，Linux 用 `xdg-open`，`--no-open` 则不打开。这些约束由 `httptest` 和真实回环监听测过，没有在图形浏览器里点过。本轮对照 `vpn/internal/ui/server.go` 核对过，下面的约束没有改。
+`idoris-vpnd ui` 只听 `127.0.0.1` 的随机端口。页面本身是静态的，HTML / JS / CSS 里没有秘密。自动打开时，先在用户缓存目录下的 `idoris/ui-launch`（目录 `0700`）写一个 `0600` 的启动页，该页向 `http://127.0.0.1:端口/bootstrap` 用 POST 提交一次性引导秘密；`open` / `xdg-open` 的参数只有这个文件路径。stdout 打出的是不带秘密的页面 URL。`--no-open` 不启动浏览器，stdout 打出的 URL 把引导秘密放在片段 `#k=` 里（浏览器不会把片段发给服务器）。`app.js` 读到片段后向 `/api/bootstrap` POST 一次，再用 `history.replaceState` 清掉片段。成功交换后，引导秘密作废，启动页在交换成功时和进程退出时删除。
+
+引导秘密两分钟过期，且只能用一次。换到的会话能力放在 `sessionStorage`（按源隔离，包含端口），之后每个 API 请求带请求头 `X-Idoris-UI`。CSRF 令牌同一次交换发出，放在 `sessionStorage`，不写进 HTML。响应不设 cookie。查询参数 `?k=` 和 cookie 都不参与认证，所以旧的 `idoris_ui` cookie 既不能登录，也不会让下一次启动的正确引导失败。另一个听在 `127.0.0.1` 上的服务器收不到这个会话能力。
+
+保存加入码只解码，不联系登记服务。页面显示登记 URL 的 `host[:port]`，并写明加入码不能证明签发者，必须来自组织管理员、经用户信任的渠道。未勾选「这是我组织的服务器」时，「使用建议」和「启用」都被拒绝，`Discover` 不会发出。计划绑定它生成时的加入码版本和检测版本；加入码、检测、答案或角色再变，旧计划作废。第二次并发的「启用」被拒绝。角色与加入码不一致时，页面拿到 `gateway.ValidateRoleChoice` 的原文，不会生成那份计划。配置路径用 `gateway.PathsFor(home, "")` 的默认名。「替换另一组织的现有配置」默认不勾；勾选才把 `replace_existing` 交给 `Apply`。`Apply` 的错误原文放在响应的 `error` 里，成功时响应带上 `AccessInfo`（若有）。这两项由 Go 测试核对。页面脚本把 `error` 写到错误区，并把 `access_info` 逐行写到结果区；脚本这一跳没有在图形浏览器里点过。不是 root 时，「启用」返回 `sudo` 命令，不提权。之后页面轮询状态，直到已连接或等待批准。
+
+这些由真实回环监听上的 `net/http` 客户端（带 cookie jar）测过，`app.js` 的引导交换另有 Node 假 `fetch` / `sessionStorage` 冒烟。没有在图形浏览器里点过。
 
 | 约束 | 行为 |
 |---|---|
 | Host | 必须等于绑定的 `127.0.0.1:端口`，挡 DNS 重绑定 |
-| 秘密 | 首次用查询参数 `k`，之后用 cookie `idoris_ui`（HttpOnly、SameSite=Strict）或头 `X-Idoris-UI-Secret`。回环是 HTTP，cookie **不**设 Secure |
-| 改状态的 POST | 要有 `Origin: http://<绑定地址>` 或 `Sec-Fetch-Site: same-origin`，再加页面注入的 `X-CSRF-Token`。两个来源信号都缺则拒绝 |
-| 缓存与 CSP | `Cache-Control: no-store`。CSP 为 `default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`。页面是内嵌的 HTML / JS / CSS，没有外链 |
+| 引导秘密 | 只在启动页的 POST 正文，或手开 URL 的 `#k=` 片段里。两分钟、一次。不进 argv，不进 cookie，查询参数 `?k=` 无效 |
+| 会话 | 头 `X-Idoris-UI`。没有这个头，或值不对，API 为 401。静态页 `GET /`、`/app.js`、`/app.css` 只查 Host，正文没有秘密 |
+| 改状态的 POST | 引导交换之外：要有 `Origin: http://<绑定地址>` 或 `Sec-Fetch-Site: same-origin`（两个都缺则拒绝），再加 `X-CSRF-Token`。来源不对不会消耗引导秘密 |
+| 缓存与 CSP | `Cache-Control: no-store`。CSP 为 `default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`。页面没有外链 |
 | 请求体 | 超过 64KiB 拒绝 |
-| 空闲 | 默认 15 分钟没有请求就自己退出 |
+| 空闲 | 默认 15 分钟。计时只在成功的引导交换和已通过会话头的请求上更新 |
 | 会话用户 | Linux 上若 `/proc/self/loginuid` 是别的用户，拒绝启动。读不到或是 `4294967295` 则放行 |
+| 加入码 | 只留在该进程的内存里，响应不回显令牌。未确认登记服务器之前不发送凭证 |
 
-加入码只留在该进程的内存里，响应不回显令牌。页面用 `history.replaceState` 去掉 URL 里的 `k`。不是 root 时，「启用」返回上面的 `sudo` 命令，不提权。之后页面轮询状态，直到已连接或等待批准。
+加入码在页面里填写。页面不提示把加入码贴到命令行。
 
 ## 10. 部署侧要补的改动（本轮没有改 `deploy/`）
 
