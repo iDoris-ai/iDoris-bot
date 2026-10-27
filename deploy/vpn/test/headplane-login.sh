@@ -70,6 +70,8 @@ cleanup() {
 trap cleanup EXIT
 
 rm -rf "$src"
+# token-labels.json is an obsolete sidecar. Ignore it when a tree still has
+# one. The copy must not require the file, and must not fail when it is absent.
 python3 - "$root" "$src" <<'PY'
 import shutil, sys
 shutil.copytree(

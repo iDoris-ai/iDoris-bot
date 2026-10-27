@@ -612,6 +612,12 @@ EOF
     do
       [[ -f "$dest/$rel" && ! -L "$dest/$rel" ]] || die "backup is missing $rel"
     done
+    # Bundles taken while labels lived in a sidecar may still contain this
+    # file. It is not a credential store anymore. Missing is fine; present
+    # is ignored and not copied back.
+    if [[ -e "$dest/state/enroll/token-labels.json" || -L "$dest/state/enroll/token-labels.json" ]]; then
+      echo "restore: ignoring obsolete state/enroll/token-labels.json" >&2
+    fi
     mode="$(read_admin_mode)"
     if [[ -f "$dest/admin-mode" ]]; then
       saved="$(sed -n 's/^mode=//p' "$dest/admin-mode" | head -n1 | tr -d '[:space:]')"
