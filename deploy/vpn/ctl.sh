@@ -82,16 +82,22 @@ Usage: bash deploy/vpn/ctl.sh <command> [args]
                                  that shows a secret). Use it to log into Headplane.
   apikeys expire --prefix PFX | --id ID
   token new --entry NAME --label LABEL [--enroll-url URL]
-                                 add one enrollment token. The label is stored
-                                 beside the config (the enroll CLI has no
-                                 --label). Plaintext is appended to
-                                 enroll/minted-tokens.txt before reload.
+                                 [--hostname-hint H]
+                                 pass --label to idoris-vpn-enroll invite.
+                                 Plaintext is appended to enroll/minted-tokens.txt
+                                 before any later check. Prints the token, the
+                                 join code, and the 12-character hash prefix.
+  token list --entry NAME        label, hash prefix, created_at. No tokens
+                                 and no full hashes. An unlabeled credential
+                                 is listed as "-".
   token revoke --entry NAME (--label LABEL | --hash-prefix HEX)
-                                 remove that one hash, then SIGHUP enroll.
-                                 Refuses to remove the last hash.
-  offboard --entry NAME --hash-prefix HEX [--node-id N]
+                                 exactly one selector, passed to the enroll
+                                 CLI. Then restart enroll. Refuses to remove
+                                 the last credential.
+  offboard --entry NAME (--label LABEL | --hash-prefix HEX) [--node-id N]
                                  revoke that credential first. Only if revoke
                                  succeeds, expire and delete the node.
+                                 --node-id is optional.
   logs [service] [--tail N]      service: headscale, headplane, enroll,
                                  vpn-sidecar, headplane-tailnet
   backup [DIR]                   stop the running Headplane writer and headscale,
@@ -142,20 +148,36 @@ enroll_run_user() {
   printf '%s:%s' "$uid" "$gid"
 }
 
-# Writable mount of enroll/: invite writes a temp file next to config.json.
-# The image rootfs is read-only; this directory is not.
+# ENROLL_DIR is an absolute directory for tests. Unset means ./enroll.
+enroll_dir() {
+  local dir
+  if [[ -n "${ENROLL_DIR:-}" ]]; then
+    dir="$ENROLL_DIR"
+    [[ "$dir" == /* ]] || die "ENROLL_DIR must be an absolute path"
+    [[ -d "$dir" && ! -L "$dir" ]] || die "ENROLL_DIR must be a real directory"
+  else
+    dir="$here/enroll"
+  fi
+  printf '%s' "$dir"
+}
+
+# Writable mount of the enroll directory: invite writes a temp file next to
+# config.json. The image rootfs is read-only; this directory is not.
 enroll_cli() {
   docker compose run --rm --no-deps -T \
     --user "$(enroll_run_user)" \
     --entrypoint idoris-vpn-enroll \
-    -v "$here/enroll:/work" \
+    -v "$(enroll_dir):/work" \
     enroll "$@"
 }
 
 reload_enroll() {
   if service_running enroll; then
-    docker compose kill -s HUP enroll >/dev/null
-    echo "sent SIGHUP to enroll so it reloads config.json"
+    # invite and revoke replace config.json by rename. A file bind keeps the
+    # old inode, so SIGHUP does not see the new file. Restart re-binds the
+    # path. bootstrap.sh does the same after it renames this file.
+    docker compose restart enroll >/dev/null
+    echo "restarted enroll so it reloads config.json"
   else
     echo "enroll is not running; the next start reads config.json"
   fi
@@ -169,75 +191,71 @@ require_hash_prefix() {
   [[ "${1:-}" =~ ^[0-9a-fA-F]{4,64}$ ]] || die "hash prefix must be 4 to 64 hex digits"
 }
 
-# Sidecar: the enroll config rejects unknown fields, and invite/revoke have
-# no --label. Hash -> label lives here until the Go CLI grows one.
-label_file() { printf '%s/enroll/token-labels.json' "$here"; }
-
-record_token_label() {
-  python3 - "$(label_file)" "$1" "$2" "$3" <<'PY'
-import json, os, sys, tempfile
-path, entry, digest, label = sys.argv[1:]
-doc = {"version": 1, "entries": {}}
-if os.path.isfile(path) and not os.path.islink(path):
-    doc = json.load(open(path))
-entries = doc.setdefault("entries", {})
-bucket = entries.setdefault(entry, {})
-for have, existing in bucket.items():
-    if existing == label and have != digest:
-        sys.exit("label %s is already used by another token on %s" % (label, entry))
-bucket[digest] = label
-fd, tmp = tempfile.mkstemp(prefix=".labels.", dir=os.path.dirname(path) or ".")
-os.close(fd)
-try:
-    with open(tmp, "w") as fh:
-        json.dump(doc, fh, indent=2)
-        fh.write("\n")
-    os.chmod(tmp, 0o600)
-    os.rename(tmp, path)
-except Exception:
-    os.unlink(tmp)
-    raise
-os.chmod(path, 0o600)
-PY
+require_one_selector() {
+  local label="$1" prefix="$2" usage="$3"
+  if [[ -n "$label" && -n "$prefix" ]]; then
+    die "$usage"
+  fi
+  if [[ -z "$label" && -z "$prefix" ]]; then
+    die "$usage"
+  fi
+  if [[ -n "$label" ]]; then
+    require_label "$label"
+  else
+    require_hash_prefix "$prefix"
+  fi
 }
 
-forget_token_hash() {
-  python3 - "$(label_file)" "$1" "$2" <<'PY'
-import json, os, sys, tempfile
-path, entry, digest = sys.argv[1:]
-if not os.path.isfile(path) or os.path.islink(path):
-    raise SystemExit(0)
-doc = json.load(open(path))
-bucket = doc.get("entries", {}).get(entry, {})
-bucket.pop(digest, None)
-fd, tmp = tempfile.mkstemp(prefix=".labels.", dir=os.path.dirname(path) or ".")
-os.close(fd)
-try:
-    with open(tmp, "w") as fh:
-        json.dump(doc, fh, indent=2)
-        fh.write("\n")
-    os.chmod(tmp, 0o600)
-    os.rename(tmp, path)
-except Exception:
-    os.unlink(tmp)
-    raise
-os.chmod(path, 0o600)
-PY
-}
-
-hash_for_label() {
-  python3 - "$(label_file)" "$1" "$2" <<'PY'
-import json, os, sys
-path, entry, label = sys.argv[1:]
-if not os.path.isfile(path):
-    sys.exit("no label file; revoke with --hash-prefix")
-doc = json.load(open(path))
-bucket = doc.get("entries", {}).get(entry, {})
-hits = [h for h, lab in bucket.items() if lab == label]
-if len(hits) != 1:
-    sys.exit("label %s on %s matched %d tokens" % (label, entry, len(hits)))
-sys.stdout.write(hits[0])
-PY
+# Print the CLI success line (revoked, entry, label-or-dash, 12-hex prefix).
+# Return 2 when the CLI refuses to remove the last credential, 1 on any
+# other failure. This function does not expire or delete a node.
+revoke_one() {
+  local entry="$1" label="$2" prefix="$3"
+  local revoked line got_cmd got_entry got_label got_prefix extra
+  local want shown
+  local -a args
+  args=(revoke --config /work/config.json --entry "$entry")
+  if [[ -n "$label" ]]; then
+    args+=(--label "$label")
+  else
+    args+=(--hash-prefix "$prefix")
+  fi
+  if ! revoked="$(enroll_cli "${args[@]}" 2>&1)"; then
+    printf '%s\n' "$revoked" >&2
+    if [[ "$revoked" == *"refusing to remove the last token hash"* ]]; then
+      return 2
+    fi
+    return 1
+  fi
+  line="$(printf '%s\n' "$revoked" | tr -d '\r' | sed -n '/^revoked[[:space:]]/p' | head -n1)"
+  if [[ -z "$line" ]]; then
+    echo "ctl: revoke did not print a revoked line" >&2
+    return 1
+  fi
+  extra=""
+  IFS=' ' read -r got_cmd got_entry got_label got_prefix extra <<< "$line"
+  if [[ "$got_cmd" != "revoked" || "$got_entry" != "$entry" || -z "$got_label" || -n "${extra:-}" ]]; then
+    echo "ctl: revoke line does not have 4 fields: $line" >&2
+    return 1
+  fi
+  if [[ ! "$got_prefix" =~ ^[0-9a-fA-F]{12}$ ]]; then
+    echo "ctl: revoke line prefix is not 12 hex digits" >&2
+    return 1
+  fi
+  if [[ -n "$label" && "$got_label" != "$label" ]]; then
+    echo "ctl: revoke line label is '$got_label', expected '$label'" >&2
+    return 1
+  fi
+  if [[ -z "$label" ]]; then
+    want="$(printf '%s' "$prefix" | tr '[:upper:]' '[:lower:]')"
+    shown="$(printf '%s' "$got_prefix" | tr '[:upper:]' '[:lower:]')"
+    if [[ "${#want}" -le 12 ]]; then
+      [[ "$shown" == "$want"* ]] || { echo "ctl: revoke line prefix does not match" >&2; return 1; }
+    else
+      [[ "$want" == "$shown"* ]] || { echo "ctl: revoke line prefix does not match" >&2; return 1; }
+    fi
+  fi
+  printf '%s\n' "$line"
 }
 
 parse_identifier() {
@@ -597,6 +615,12 @@ EOF
     do
       [[ -f "$dest/$rel" && ! -L "$dest/$rel" ]] || die "backup is missing $rel"
     done
+    # Bundles taken while labels lived in a sidecar may still contain this
+    # file. It is not a credential store anymore. Missing is fine; present
+    # is ignored and not copied back.
+    if [[ -e "$dest/state/enroll/token-labels.json" || -L "$dest/state/enroll/token-labels.json" ]]; then
+      echo "restore: ignoring obsolete state/enroll/token-labels.json" >&2
+    fi
     mode="$(read_admin_mode)"
     if [[ -f "$dest/admin-mode" ]]; then
       saved="$(sed -n 's/^mode=//p' "$dest/admin-mode" | head -n1 | tr -d '[:space:]')"
@@ -798,35 +822,32 @@ EOF
         done
         [[ -n "$entry" && -n "$label" ]] || die "usage: ctl.sh token new --entry NAME --label LABEL [--enroll-url URL]"
         require_label "$label"
-        [[ -f "$here/enroll/config.json" && ! -L "$here/enroll/config.json" ]] || die "enroll/config.json is missing"
+        [[ -f "$(enroll_dir)/config.json" && ! -L "$(enroll_dir)/config.json" ]] || die "enroll/config.json is missing"
         if [[ -z "$url" && -f "$here/.env" ]]; then
           url="$(sed -n 's/^ENROLL_PUBLIC_URL=//p' "$here/.env" | head -n1 | tr -d "\"'" | tr -d '[:space:]')"
         fi
         [[ -n "$url" ]] || die "pass --enroll-url or set ENROLL_PUBLIC_URL in .env"
         [[ "$url" == http://* || "$url" == https://* ]] || die "enroll URL must start with http:// or https://"
-        args=(invite --config /work/config.json --entry "$entry" --enroll-url "$url")
+        args=(invite --config /work/config.json --entry "$entry" --enroll-url "$url" --label "$label")
         if [[ "$url" == http://* ]]; then
           args+=(--allow-insecure)
         fi
         if [[ -n "$hint" ]]; then
           args+=(--hostname-hint "$hint")
         fi
-        if [[ -f "$(label_file)" ]]; then
-          python3 -c '
-import json, sys
-doc = json.load(open(sys.argv[1]))
-bucket = doc.get("entries", {}).get(sys.argv[2], {})
-if sys.argv[3] in bucket.values():
-    sys.exit("label %s is already used on %s" % (sys.argv[3], sys.argv[2]))
-' "$(label_file)" "$entry" "$label"
+        # stdout is the join code. stderr stays on the terminal so a refused
+        # label is visible. A failed invite has nothing to persist.
+        if ! raw="$(enroll_cli "${args[@]}")"; then
+          die "invite failed"
         fi
-        raw="$(enroll_cli "${args[@]}")" || die "invite failed"
-        # Keep the raw stdout before decoding. It is the only copy of the token.
-        printf '# minted %s\n%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$raw" >> "$here/enroll/minted-tokens.txt"
-        chmod 600 "$here/enroll/minted-tokens.txt"
+        # Persist before decode or list-credentials. Either of those can fail
+        # after the credential is already on disk.
+        minted="$(enroll_dir)/minted-tokens.txt"
+        printf '# minted %s\n%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$raw" >> "$minted"
+        chmod 600 "$minted"
         code="$(printf '%s\n' "$raw" | tr -d '\r' | grep -oE 'idoris-join-v1\.[A-Za-z0-9_-]+\.[0-9a-fA-F]+' | head -n1 || true)"
-        [[ -n "$code" ]] || die "invite output had no join code; the raw output is in enroll/minted-tokens.txt"
-        token="$(python3 -c '
+        [[ -n "$code" ]] || die "invite output had no join code; the raw output is in $minted"
+        if ! token="$(python3 -c '
 import base64, json, sys
 code = sys.argv[1].strip()
 parts = code.split(".")
@@ -834,25 +855,47 @@ if len(parts) != 3 or parts[0] != "idoris-join-v1":
     sys.exit("invite did not print a join code")
 raw = base64.urlsafe_b64decode(parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4))
 sys.stdout.write(json.loads(raw)["token"])
-' "$code")"
-        digest="$(python3 -c 'import hashlib,sys; sys.stdout.write(hashlib.sha256(sys.argv[1].encode()).hexdigest())' "$token")"
-        python3 -c '
-import json, sys
-cfg, entry, digest = sys.argv[1:]
-tenants = json.load(open(cfg)).get("tenants", [])
-for t in tenants:
-    if t.get("name") == entry and digest in t.get("token_hashes", []):
-        raise SystemExit(0)
-raise SystemExit("invited hash is not in enroll/config.json")
-' "$here/enroll/config.json" "$entry" "$digest"
-        record_token_label "$entry" "$digest" "$label"
+' "$code")"; then
+          die "invite output had no token; the raw output is in $minted"
+        fi
+        prefix="$(python3 -c 'import hashlib,sys; sys.stdout.write(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:12])' "$token")"
+        if ! listed="$(enroll_cli list-credentials --config /work/config.json --entry "$entry")"; then
+          die "list-credentials failed; the raw invite output is in $minted"
+        fi
+        if ! printf '%s\n' "$listed" | python3 -c '
+import sys
+label, prefix = sys.argv[1], sys.argv[2].lower()
+found = 0
+for line in sys.stdin:
+    parts = line.rstrip("\n").split("\t")
+    if len(parts) != 3 or parts[0] != label:
+        continue
+    found += 1
+    if parts[1].lower() != prefix:
+        sys.exit("label %s is listed with prefix %s, expected %s" % (label, parts[1], prefix))
+if found != 1:
+    sys.exit("label %s was listed %d times after invite" % (label, found))
+' "$label" "$prefix"; then
+          die "credential $label was not listed; the raw invite output is in $minted"
+        fi
         reload_enroll
         echo "entry:  $entry"
         echo "label:  $label"
-        echo "hash:   $digest"
+        echo "hash:   $prefix"
         echo "token:  $token"
         echo "join:   $code"
-        echo "Labels are in enroll/token-labels.json. The enroll CLI has no --label flag."
+        ;;
+      list)
+        entry=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --entry) entry="${2:-}"; shift 2 ;;
+            *) die "unknown argument: $1" ;;
+          esac
+        done
+        [[ -n "$entry" ]] || die "usage: ctl.sh token list --entry NAME"
+        [[ -f "$(enroll_dir)/config.json" && ! -L "$(enroll_dir)/config.json" ]] || die "enroll/config.json is missing"
+        enroll_cli list-credentials --config /work/config.json --entry "$entry"
         ;;
       revoke)
         entry="" label="" prefix=""
@@ -864,60 +907,59 @@ raise SystemExit("invited hash is not in enroll/config.json")
             *) die "unknown argument: $1" ;;
           esac
         done
-        [[ -n "$entry" ]] || die "usage: ctl.sh token revoke --entry NAME (--label LABEL | --hash-prefix HEX)"
-        if [[ -n "$label" ]]; then
-          require_label "$label"
-          prefix="$(hash_for_label "$entry" "$label")"
+        [[ -n "$entry" ]] || die "usage: ctl.sh token revoke --entry NAME (--label LABEL | --hash-prefix HEX); exactly one of --label or --hash-prefix"
+        require_one_selector "$label" "$prefix" "usage: ctl.sh token revoke --entry NAME (--label LABEL | --hash-prefix HEX); exactly one of --label or --hash-prefix"
+        echo "revoking $entry ${label:-${prefix:0:8}}..."
+        set +e
+        line="$(revoke_one "$entry" "$label" "$prefix")"
+        rc=$?
+        set -e
+        if [[ "$rc" -eq 2 ]]; then
+          die "refusing to remove the last token for $entry; run ctl.sh token new first, then revoke this one"
         fi
-        require_hash_prefix "$prefix"
-        echo "revoking $entry ${prefix:0:8}..."
-        if ! revoked="$(enroll_cli revoke --config /work/config.json --entry "$entry" --hash-prefix "$prefix" 2>&1)"; then
-          printf '%s\n' "$revoked" >&2
-          if [[ "$revoked" == *"last token hash"* ]]; then
-            die "refusing to remove the last token for $entry; run ctl.sh token new first, then revoke this one"
-          fi
+        if [[ "$rc" -ne 0 ]]; then
           die "revoke failed; the node was not changed"
         fi
-        printf '%s\n' "$revoked"
-        removed="$(printf '%s\n' "$revoked" | awk '{print $3}' | head -n1)"
-        if [[ "$removed" =~ ^[0-9a-fA-F]{64}$ ]]; then
-          forget_token_hash "$entry" "$removed"
-        fi
+        printf '%s\n' "$line"
         reload_enroll
         ;;
       *)
-        die "usage: ctl.sh token new|revoke"
+        die "usage: ctl.sh token new|list|revoke"
         ;;
     esac
     ;;
   offboard)
-    entry="" prefix="" node=""
+    entry="" label="" prefix="" node=""
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --entry) entry="${2:-}"; shift 2 ;;
+        --label) label="${2:-}"; shift 2 ;;
         --hash-prefix) prefix="${2:-}"; shift 2 ;;
         --node-id) node="${2:-}"; shift 2 ;;
         *) die "unknown argument: $1" ;;
       esac
     done
-    [[ -n "$entry" && -n "$prefix" ]] || die "usage: ctl.sh offboard --entry NAME --hash-prefix HEX [--node-id N]"
-    require_hash_prefix "$prefix"
+    [[ -n "$entry" ]] || die "usage: ctl.sh offboard --entry NAME (--label LABEL | --hash-prefix HEX) [--node-id N]; exactly one of --label or --hash-prefix"
+    require_one_selector "$label" "$prefix" "usage: ctl.sh offboard --entry NAME (--label LABEL | --hash-prefix HEX) [--node-id N]; exactly one of --label or --hash-prefix"
     if [[ -n "$node" ]]; then
       node="$(require_id "$node")"
     fi
-    echo "step 1: revoke $entry hash prefix ${prefix:0:8} (stop here if this fails)"
-    if ! revoked="$(enroll_cli revoke --config /work/config.json --entry "$entry" --hash-prefix "$prefix" 2>&1)"; then
-      printf '%s\n' "$revoked" >&2
-      if [[ "$revoked" == *"last token hash"* ]]; then
-        die "refusing to remove the last token for $entry; the node was not expired or deleted"
-      fi
+    if [[ -n "$label" ]]; then
+      echo "step 1: revoke $entry label $label (stop here if this fails)"
+    else
+      echo "step 1: revoke $entry hash prefix ${prefix:0:8} (stop here if this fails)"
+    fi
+    set +e
+    line="$(revoke_one "$entry" "$label" "$prefix")"
+    rc=$?
+    set -e
+    if [[ "$rc" -eq 2 ]]; then
+      die "refusing to remove the last token for $entry; the node was not expired or deleted"
+    fi
+    if [[ "$rc" -ne 0 ]]; then
       die "revoke failed; the node was not expired or deleted"
     fi
-    printf '%s\n' "$revoked"
-    removed="$(printf '%s\n' "$revoked" | awk '{print $3}' | head -n1)"
-    if [[ "$removed" =~ ^[0-9a-fA-F]{64}$ ]]; then
-      forget_token_hash "$entry" "$removed"
-    fi
+    printf '%s\n' "$line"
     echo "step 2: reload enroll"
     reload_enroll
     if [[ -n "$node" ]]; then

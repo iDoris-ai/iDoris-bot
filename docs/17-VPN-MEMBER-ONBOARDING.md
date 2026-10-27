@@ -189,21 +189,29 @@ sudo sysctl -w net.ipv4.ip_forward=1
 
 ## 9. token 丢了
 
-操作员在服务器上补一枚。标签是 `ctl.sh` 的，注册 CLI 没有 `--label`：
+操作员在服务器上补一枚。`--label` 传给 `idoris-vpn-enroll invite`，写进该项的 `token_hashes` 对象：
 
 ```bash
 bash deploy/vpn/ctl.sh token new --entry office --label laptop-2 --enroll-url https://enroll.example.org
 ```
 
-输出里有 token、加入码和哈希。明文同时追加在 `enroll/minted-tokens.txt`（0600，gitignore）。标签在 `enroll/token-labels.json`。然后把新 token 写进那台电脑的 `enroll.token`，重启 `idoris-vpnd`。
+输出里有 token、加入码和 12 位哈希前缀。明文在后续检查之前追加到 `enroll/minted-tokens.txt`（0600，gitignore）。`ctl.sh` 再用 `list-credentials` 核对这个标签，然后重启注册服务。把新 token 写进那台电脑的 `enroll.token`，重启 `idoris-vpnd`。
 
-吊销某一枚：
+查看这一项已有的凭证。不打印 token，也不打印完整哈希：
+
+```bash
+bash deploy/vpn/ctl.sh token list --entry office
+```
+
+每行是标签、12 位前缀、`created_at`，用制表符分开。没有标签或时间时是 `-`。
+
+吊销某一枚。`--label` 和 `--hash-prefix` 恰好给一个，原样交给 CLI：
 
 ```bash
 bash deploy/vpn/ctl.sh token revoke --entry office --label laptop-2
 ```
 
-或 `--hash-prefix` 加至少 4 位十六进制，并且只能命中一条。最后一枚删不掉，要先 `token new`。
+`--hash-prefix` 是 4 到 64 位十六进制，必须唯一命中一条。成功行是 `revoked office laptop-2 <12位前缀>`。同一项上重复的标签会被拒绝。最后一枚删不掉，错误里有 `refusing to remove the last token hash`；先 `token new` 留下一把，再吊销要废的那把。
 
 ## 10. 节点过期
 
@@ -221,14 +229,14 @@ Headscale v0.29.6 的帮助写明：expire 保留节点，并要求它重新认�
 
 ## 11. 设备被偷
 
-在服务器上先废掉这枚凭证，再处理节点。顺序写死在 `ctl.sh offboard` 里：吊销失败时不会 expire，也不会 delete。
+在服务器上先废掉这枚凭证，再处理节点。顺序写死在 `ctl.sh offboard` 里：先 `revoke`，再重启注册服务，然后 `nodes expire`，最后 `nodes delete`。吊销失败时不会 expire，也不会 delete，stderr 里有 `the node was not expired or deleted`。单独执行 `nodes expire` 或 `nodes delete` 不会吊销凭证；设备上的 token 还能再要一把预授权 key。
 
 ```bash
 bash deploy/vpn/ctl.sh nodes list
-bash deploy/vpn/ctl.sh offboard --entry office --hash-prefix <至少4位> --node-id <数字id>
+bash deploy/vpn/ctl.sh offboard --entry office --label laptop-2 --node-id <数字id>
 ```
 
-不给 `--node-id` 时只吊销凭证，节点还在。最后一枚 token 会被拒绝，节点保持不动；先给该项 `token new` 一把留下，再 offboard 被偷的那把。
+`--hash-prefix` 可以代替 `--label`，两者恰好一个。不给 `--node-id` 时只吊销凭证，节点还在。最后一枚 token 会被拒绝，节点保持不动；先给该项 `token new` 一把留下，再 offboard 被偷的那把。
 
 被偷的电脑上如果还有加入码或 `minted-tokens.txt` 的副本，那枚凭证已经作废。给用户一台新设备时发新 token，不要把旧的文件拷过去。
 
