@@ -28,7 +28,9 @@ var (
 	procNetTCP  = "/proc/net/tcp"
 	procNetTCP6 = "/proc/net/tcp6"
 	// peerUIDFunc, when set, replaces the /proc lookup. Tests use it.
-	// Production leaves it nil.
+	// Production leaves it nil. The mutex covers the swap; the Accept
+	// goroutine reads it while a test installs the next lookup.
+	peerUIDMu   sync.Mutex
 	peerUIDFunc func(net.Conn) (int, error)
 
 	ownerOnlyMu  sync.Mutex
@@ -86,9 +88,18 @@ func (l *ownerFilter) Accept() (net.Conn, error) {
 	}
 }
 
+func setPeerUIDFunc(fn func(net.Conn) (int, error)) {
+	peerUIDMu.Lock()
+	peerUIDFunc = fn
+	peerUIDMu.Unlock()
+}
+
 func lookupPeerUID(c net.Conn) (int, error) {
-	if peerUIDFunc != nil {
-		return peerUIDFunc(c)
+	peerUIDMu.Lock()
+	fn := peerUIDFunc
+	peerUIDMu.Unlock()
+	if fn != nil {
+		return fn(c)
 	}
 	return peerUIDFromProc(c)
 }
