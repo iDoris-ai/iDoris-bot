@@ -45,7 +45,7 @@ idoris-vpnd ui [--no-open]
 
 `gateway setup --yes` 的意思是：这台机器**不是** Local AI，并且已经用 `--device` 或 `--whole-subnet` 说清要广告什么。两者不能同时给。
 
-本地页面（中文）三步：识别网络 → 使用建议 → 启用。第一问原文是「这台机器就是 Local AI 吗？」。页面上选「是」会按 `local-ai` 加入，即使加入码写的是成员；选「否」会走网关。成员加入仍用命令行。
+本地页面（中文）三步：识别网络 → 使用建议 → 启用。第一问原文是「这台机器就是 Local AI 吗？」。页面上选「是」只在加入码本身是 `local-ai` 时生效，选「否」只在加入码是 `gateway` 时生效；不符会被 `ValidateRoleChoice` 拒绝并提示向管理员要对应角色的码（加入码绑定一个角色，页面改不了它）。成员加入仍用命令行。
 
 ## 3. 加入码的生命周期
 
@@ -250,7 +250,7 @@ idoris-vpn-enroll list-credentials --config F --entry E
 - 守护进程的 `/healthz` 在等待批准时是 503。登记服务的 `/healthz` 不探 Headscale；那要看 `/readyz`。
 - 嵌入式模式不能当网关。macOS / Windows 不推荐网关；本轮没有在那两个系统上跑网关。
 - `join` 默认安装的是用户级服务，登录前不跑。开机即跑用第 12 节的 `--system`。
-- 本地页面的 cookie 故意不设 Secure。页面「否」会强制走网关，「是」会强制走 local-ai，即使用加入码写的是成员。
+- 本地页面已不使用 cookie，认证方式见第 9 节；回环地址上的页面也不使用 HTTPS。角色以加入码为准：页面回答和加入码角色不符时拒绝，不再强行改角色。
 - 更宽的 `autoApprovers` 前缀是否覆盖更窄的 `/32`，本轮没有验证。
 - 没有在图形浏览器里点本地页面。
 - 第 8 节的数字来自项目 `idoris-vpn-wizard-1e19b7`。本轮没有另起同名 compose 项目重跑那一节。
