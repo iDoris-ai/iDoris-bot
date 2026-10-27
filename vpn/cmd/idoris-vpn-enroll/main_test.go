@@ -68,6 +68,83 @@ func TestInviteStdoutIsOnlyTheCode(t *testing.T) {
 	if !strings.Contains(revokeOut.String(), "revoked acme ") {
 		t.Fatalf("revoke stdout %q", revokeOut.String())
 	}
+	if strings.Contains(revokeOut.String(), enroll.HashToken(got.Token)) {
+		t.Fatalf("revoke printed the full hash: %q", revokeOut.String())
+	}
+}
+
+func TestListCredentialsAndRevokeByLabel(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "enroll.json")
+	seed := "idv1_seedseedseedseedseedseedseedseed"
+	body := `{
+  "control_url": "https://vpn.example.org",
+  "tenants": [{
+    "name": "acme",
+    "headscale_user_id": "1",
+    "token_hashes": ["` + enroll.HashToken(seed) + `"]
+  }]
+}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	if err := inviteCmd([]string{"--config", path, "--entry", "acme", "--label", "laptop", "--enroll-url", "https://enroll.example.org"}, &stdout); err != nil {
+		t.Fatal(err)
+	}
+	got, err := join.Decode(strings.TrimSpace(stdout.String()), join.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := enroll.HashToken(got.Token)
+	var list bytes.Buffer
+	if err := listCredentialsCmd([]string{"--config", path, "--entry", "acme"}, &list); err != nil {
+		t.Fatal(err)
+	}
+	text := list.String()
+	if strings.Contains(text, full) || strings.Contains(text, got.Token) || strings.Contains(text, "LABEL") {
+		t.Fatalf("list leaked a secret or added a header:\n%s", text)
+	}
+	if !strings.Contains(text, "laptop\t"+enroll.HashPrefix(full)+"\t") {
+		t.Fatalf("list:\n%s", text)
+	}
+	var sink bytes.Buffer
+	if err := revokeCmd([]string{"--config", path, "--entry", "acme", "--label", "laptop", "--hash-prefix", full[:8]}, &sink); err == nil {
+		t.Fatal("both selectors were accepted")
+	}
+	if err := revokeCmd([]string{"--config", path, "--entry", "acme"}, &sink); err == nil {
+		t.Fatal("missing selector was accepted")
+	}
+
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := enroll.NewServer(*cfg, stubMinter{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	if _, err := (&enroll.Client{URL: ts.URL, Token: got.Token, AllowInsecure: true}).Discover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var revoked bytes.Buffer
+	if err := revokeCmd([]string{"--config", path, "--entry", "acme", "--label", "laptop"}, &revoked); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(revoked.String(), "revoked acme laptop "+enroll.HashPrefix(full)) || strings.Contains(revoked.String(), full) {
+		t.Fatalf("revoke stdout %q", revoked.String())
+	}
+	if err := reloadFromDisk(srv, path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&enroll.Client{URL: ts.URL, Token: got.Token, AllowInsecure: true}).Discover(context.Background()); err == nil {
+		t.Fatal("revoked credential accepted after reload")
+	}
+	if _, err := (&enroll.Client{URL: ts.URL, Token: seed, AllowInsecure: true}).Discover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestReloadFromDiskKeepsPreviousConfig(t *testing.T) {
