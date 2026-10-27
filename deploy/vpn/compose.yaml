@@ -21,7 +21,23 @@
 # DERP_STUN_PORT must stay 3478 in production: clients learn the STUN port from
 # the DERP map, which advertises headscale's stun_listen_addr port.
 #
-# First run:  bash deploy/vpn/bootstrap.sh
+# HEADPLANE_BIND is the host address Headplane is published on (default
+# 127.0.0.1). Keep the default and use an SSH tunnel. Set a LAN address or
+# 0.0.0.0 only on a trusted office network, and read the cookie_secure note
+# in headplane/config.yaml and docs/14-VPN-OPERATIONS.md before you do.
+# Do not publish Headplane or enroll on a public interface.
+#
+# Profile tailnet-admin (optional): a tailscale sidecar joins as tag:vpn-server
+# and Headplane shares its network namespace, so the UI is reachable only on
+# the tailnet by group:admins. It uses the same Headplane data volume as the
+# published service; do not run both at once. ctl.sh up --tailnet-admin
+# stops the published one first. The sidecar needs /dev/net/tun and
+# VPN_SERVER_ENROLL_TOKEN (the vpn-server enrollment token).
+#
+# First run (one organisation; default name "office"):
+#   bash deploy/vpn/bootstrap.sh init --org office
+# Another organisation (advanced):
+#   bash deploy/vpn/bootstrap.sh add-tenant globex
 name: idoris-vpn
 
 services:
@@ -72,7 +88,8 @@ services:
     # web UI. The integration would only let Headplane restart Headscale after
     # editing the config, which this deployment does not allow anyway.
     ports:
-      - "127.0.0.1:${HEADPLANE_PORT:-3000}:3000"
+      # HEADPLANE_BIND default 127.0.0.1: SSH tunnel. See the file header.
+      - "${HEADPLANE_BIND:-127.0.0.1}:${HEADPLANE_PORT:-3000}:3000"
     security_opt:
       - no-new-privileges:true
 
@@ -112,7 +129,67 @@ services:
     ports:
       - "127.0.0.1:${ENROLL_PORT:-8787}:8787"
 
+  # Optional. Started only with: docker compose --profile tailnet-admin up
+  # Headplane below shares this network namespace; do not also run `headplane`.
+  vpn-sidecar:
+    profiles: ["tailnet-admin"]
+    image: tailscale/tailscale:v1.104.2
+    hostname: vpn-server
+    restart: unless-stopped
+    depends_on:
+      headscale:
+        condition: service_healthy
+      enroll:
+        condition: service_healthy
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      ENROLL_URL: http://enroll:8787
+      ENROLL_TOKEN: ${VPN_SERVER_ENROLL_TOKEN:-}
+      TS_USERSPACE: "false"
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_AUTH_ONCE: "true"
+      TS_HOSTNAME: vpn-server
+      TS_ACCEPT_DNS: "false"
+    volumes:
+      - ./tailnet-admin/entrypoint.sh:/usr/local/bin/idoris-tailnet-entrypoint.sh:ro
+      - vpn-sidecar-state:/var/lib/tailscale
+    entrypoint: ["/bin/sh", "/usr/local/bin/idoris-tailnet-entrypoint.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "tailscale status --json | grep -q '\"BackendState\":\"Running\"' || tailscale status --json | grep -q '\"BackendState\": \"Running\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # Same image and config as headplane, but no host port. Listeners in this
+  # namespace are the sidecar's tailnet address.
+  headplane-tailnet:
+    profiles: ["tailnet-admin"]
+    image: ghcr.io/tale/headplane:0.8.2
+    restart: unless-stopped
+    network_mode: "service:vpn-sidecar"
+    depends_on:
+      vpn-sidecar:
+        condition: service_healthy
+    volumes:
+      - ./headplane/config.yaml:/etc/headplane/config.yaml:ro
+      - ./headscale/config.yaml:/etc/headscale/config.yaml:ro
+      - headplane-data:/var/lib/headplane
+      - type: bind
+        source: ./headplane/cookie_secret
+        target: /run/secrets/headplane_cookie_secret
+        read_only: true
+        bind:
+          create_host_path: false
+    security_opt:
+      - no-new-privileges:true
+
 volumes:
   headscale-data:
   headscale-run:
   headplane-data:
+  vpn-sidecar-state:

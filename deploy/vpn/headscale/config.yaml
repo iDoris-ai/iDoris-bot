@@ -1,8 +1,11 @@
 # Headscale v0.29.x configuration for the iDoris VPN control plane.
 # Reference: https://headscale.net/stable/ref/configuration/
 # Replace vpn.example.org with your public hostname before first start.
+# bootstrap.sh refuses to run while this placeholder is still here.
 # server_url must be https on port 443 (no ":port"): Tailscale clients re-dial
 # the control server on 443, so the TLS proxy in front must serve it there.
+# A local lab can register once over plain HTTP; re-login after that still
+# needs this https:443 URL. See docs/14-VPN-OPERATIONS.md.
 
 server_url: https://vpn.example.org
 listen_addr: 0.0.0.0:8080
