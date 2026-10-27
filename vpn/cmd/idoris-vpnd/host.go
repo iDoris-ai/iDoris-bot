@@ -28,11 +28,11 @@ func (osHost) MkdirAll(path string, mode os.FileMode) error {
 	}
 	return os.MkdirAll(path, mode)
 }
-func (osHost) Stat(path string) (os.FileInfo, error)        { return os.Stat(path) }
-func (osHost) Chmod(path string, mode os.FileMode) error    { return os.Chmod(path, mode) }
-func (osHost) ReadFile(path string) ([]byte, error)         { return os.ReadFile(path) }
-func (osHost) IsRoot() bool                                 { return os.Geteuid() == 0 }
-func (osHost) GOOS() string                                 { return runtime.GOOS }
+func (osHost) Stat(path string) (os.FileInfo, error)     { return os.Stat(path) }
+func (osHost) Chmod(path string, mode os.FileMode) error { return os.Chmod(path, mode) }
+func (osHost) ReadFile(path string) ([]byte, error)      { return os.ReadFile(path) }
+func (osHost) IsRoot() bool                              { return os.Geteuid() == 0 }
+func (osHost) GOOS() string                              { return runtime.GOOS }
 
 // EnableIPForward writes the sysctl drop-in and applies it. If forwarding is
 // already on, a failing sysctl (some container runtimes mark the knob

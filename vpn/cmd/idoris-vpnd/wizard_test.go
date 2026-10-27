@@ -335,7 +335,7 @@ func TestR3W2JoinCodeInputsMatchAndWarn(t *testing.T) {
 		"enrollment-authority: enroll.example.org",
 		"access: SOCKS5 127.0.0.1:1080",
 		"access: SOCKS5 credential file /home/acme/.idoris/vpn-state/socks5.auth",
-		"access: Reach the Local AI through this proxy by its MagicDNS name office-gw.idoris.internal",
+		"access: Reach the Local AI through this proxy by its MagicDNS name <local-ai-hostname>.idoris.internal (your administrator gives you the exact name)",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("missing %q in\n%s", want, out)
