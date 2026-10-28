@@ -205,7 +205,13 @@ bash deploy/vpn/ctl.sh token list --entry office
 bash deploy/vpn/ctl.sh token revoke --entry office --label laptop-2
 ```
 
-`--hash-prefix` 是 4 到 64 位十六进制，必须唯一命中一条。成功行是 `revoked office laptop-2 <12位前缀>`。同一项上重复的标签会被拒绝。最后一枚删不掉，错误里有 `refusing to remove the last token hash`；先 `token new` 留下一把，再吊销要废的那把。
+`--hash-prefix` 是 4 到 64 位十六进制，必须唯一命中一条。成功行是 `revoked office laptop-2 <12位前缀>`。同一项上重复的标签会被拒绝。不带 `--allow-empty` 时最后一枚删不掉，`ctl.sh` 拒绝并提示 pass `--allow-empty`；先 `token new` 留下一把，再吊销要废的那把。确定这一项以后不再注册时：
+
+```bash
+bash deploy/vpn/ctl.sh token revoke --entry office --label laptop-2 --allow-empty
+```
+
+`--allow-empty` 原样交给凭证事务。`deploy/vpn/test/test_allow_empty.sh` 看过转发，没有连上一台活的 Headscale。
 
 ## 10. 节点过期
 
@@ -230,7 +236,7 @@ bash deploy/vpn/ctl.sh nodes list
 bash deploy/vpn/ctl.sh offboard --entry office --label laptop-2 --node-id <数字id>
 ```
 
-`--hash-prefix` 可以代替 `--label`，两者恰好一个。不给 `--node-id` 时只吊销凭证，节点还在。最后一枚 token 会被拒绝，节点保持不动；先给该项 `token new` 一把留下，再 offboard 被偷的那把。
+`--hash-prefix` 可以代替 `--label`，两者恰好一个。不给 `--node-id` 时只吊销凭证，节点还在。不带 `--allow-empty` 时最后一枚 token 会被拒绝，节点保持不动；先给该项 `token new` 一把留下，再 offboard 被偷的那把。确定连最后一枚也要废掉、并且节点也要处理时，加上 `--allow-empty`。不带这个旗标时，拒绝发生在 expire 和 delete 之前。
 
 被偷的电脑上如果还有加入码或 `minted-tokens.txt` 的副本，那枚凭证已经作废。给用户一台新设备时发新 token，不要把旧的文件拷过去。
 
