@@ -1054,6 +1054,56 @@ normalize_admin_choice() {
   headplane_access="$access"
 }
 
+# select_enroll_runtime prints "uid gid" on stdout. A non-root operator keeps
+# their own ids. Root is rewritten to the image USER 65532. prefix is the
+# program name on the stderr notice.
+select_enroll_runtime() {
+  local prefix="${1:-enroll}" uid gid
+  uid="$(id -u)"
+  gid="$(id -g)"
+  if [[ "$uid" == 0 ]]; then
+    echo "${prefix}: refusing to run enroll as root; using uid 65532 (the image USER)" >&2
+    uid=65532
+    gid=65532
+  fi
+  printf '%s %s\n' "$uid" "$gid"
+}
+
+# listing_fixture_owner prints uid:gid for a read-only credential fixture.
+# The owner stays different from the enrollment runtime uid. Root chowns the
+# file. Anyone else prints the owner the file already has.
+listing_fixture_owner() {
+  local path="$1" runtime_uid="$2" owner
+  if [[ "$runtime_uid" == 65534 ]]; then
+    owner=65531
+  else
+    owner=65534
+  fi
+  if [[ "$(id -u)" == 0 ]]; then
+    chown "${owner}:${owner}" "$path"
+    printf '%s:%s\n' "$owner" "$owner"
+    return 0
+  fi
+  python3 - "$path" <<'PY'
+import os, sys
+st = os.stat(sys.argv[1])
+print("%d:%d" % (st.st_uid, st.st_gid))
+PY
+}
+
+# provision_enroll_tree gives the enrollment directory to the runtime ids.
+# Root sets directories to 0700 and files to 0600. A non-root caller already
+# owns the files and returns without changing them. Pass the enroll directory
+# only: headplane/cookie_secret belongs to the Headplane image user.
+provision_enroll_tree() {
+  local uid="$1" gid="$2" tree="$3"
+  [[ "$(id -u)" == 0 ]] || return 0
+  [[ "$uid" =~ ^[1-9][0-9]{0,9}$ && "$gid" =~ ^[1-9][0-9]{0,9}$ ]] || die "ENROLL_UID and ENROLL_GID must be non-zero numeric ids"
+  chown -R "${uid}:${gid}" "$tree"
+  find "$tree" -type d -exec chmod 700 {} +
+  find "$tree" -type f -exec chmod 600 {} +
+}
+
 # Same ownership bootstrap uses, but the uid comes from the deployment's
 # ENROLL_UID/GID. Root may chown. Anyone else can only chmod when the ids
 # already match; a different id has to be repaired by root.
