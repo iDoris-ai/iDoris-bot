@@ -80,14 +80,15 @@ enforce_headplane_exclusion() {
 }
 
 # Start headscale+enroll and exactly one Headplane, matching the mode file.
-# Tailnet mode starts the profile only when VPN_SERVER_ENROLL_TOKEN is set.
+# Tailnet mode starts the profile when there is a token or the sidecar
+# volume already holds tailscaled.state.
 start_stack_for_mode() {
   local mode="$1"
   enforce_headplane_exclusion "$mode"
   assert_compose_bindings "$mode"
   if [[ "$mode" == "tailnet-admin" ]]; then
     compose up -d --wait --wait-timeout 180 headscale enroll
-    if [[ -n "${VPN_SERVER_ENROLL_TOKEN:-}" ]]; then
+    if [[ -n "${VPN_SERVER_ENROLL_TOKEN:-}" ]] || sidecar_has_identity; then
       compose --profile tailnet-admin up -d --wait --wait-timeout 180 vpn-sidecar headplane-tailnet
       verify_published_bindings "$mode"
       echo "tailnet-admin profile is up. Published Headplane is stopped."
@@ -238,6 +239,37 @@ PY
   mkdir -p "$parent"
   cp -P "$src" "$dest"
   chmod 600 "$dest"
+}
+
+# Compose volume for this project, by label or by the conventional name.
+# Empty output means the volume does not exist. A down stack keeps the volume.
+_project_volume_name() {
+  local short="$1" project labeled name
+  project="${COMPOSE_PROJECT_LOCK:-}"
+  if [[ -z "$project" ]]; then
+    project="$(current_project_name)"
+  fi
+  labeled="$(docker volume ls -q --filter "label=com.docker.compose.project=${project}" --filter "label=com.docker.compose.volume=${short}" 2>/dev/null | head -n1 || true)"
+  if [[ -n "$labeled" ]]; then
+    printf '%s' "$labeled"
+    return 0
+  fi
+  name="${project}_${short}"
+  if docker volume inspect "$name" >/dev/null 2>&1; then
+    printf '%s' "$name"
+    return 0
+  fi
+  return 1
+}
+
+# The sidecar already has a node key when tailscaled.state is non-empty.
+# ctl.sh up must not demand a new enrollment token in that case.
+sidecar_has_identity() {
+  local vol
+  vol="$(_project_volume_name vpn-sidecar-state 2>/dev/null || true)"
+  [[ -n "$vol" ]] || return 1
+  docker run --rm --network none -v "${vol}:/state:ro" "$ALPINE_VOLUME_IMAGE" \
+    sh -c 'test -s /state/tailscaled.state'
 }
 
 # Named volume mounted at a container path. Bind mounts have an empty Name.
