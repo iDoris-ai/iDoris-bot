@@ -153,6 +153,12 @@ type Snapshot struct {
 	AdminHint string `json:"admin_hint,omitempty"`
 	// Role is the enrollment role this daemon is holding the node to.
 	Role string `json:"role,omitempty"`
+	// Tenant and TokenFingerprint name the enrollment identity this daemon is
+	// configured with. The fingerprint is a truncated hash, never the token.
+	// They let the local wizard tell a daemon that already runs the credential
+	// it just applied from one that still runs the previous credential.
+	Tenant           string `json:"tenant,omitempty"`
+	TokenFingerprint string `json:"token_fingerprint,omitempty"`
 	// Warnings are operator-facing notices that do not by themselves change
 	// phase. Missing tags uses both a phase and a warning.
 	Warnings []string `json:"warnings,omitempty"`
@@ -391,6 +397,8 @@ func (r *Reconciler) set(mutate func(s *Snapshot)) Snapshot {
 	r.snap.EnrollReachable = !r.opt.EnrollUnreachable
 	r.snap.ControlURL = r.opt.ControlURL
 	r.snap.Role = r.opt.Role
+	r.snap.Tenant = r.opt.Identity.Tenant
+	r.snap.TokenFingerprint = r.opt.Identity.TokenFingerprint
 	r.snap.Attempts = r.attempts
 	r.snap.PreviousProfile = string(r.previousProfile)
 	r.snap.UpdatedAt = r.now()
