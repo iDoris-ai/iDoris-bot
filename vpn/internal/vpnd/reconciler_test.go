@@ -5,12 +5,14 @@ import (
 	"errors"
 	"log/slog"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/types/key"
+	"tailscale.com/types/persist"
 )
 
 const ours = "https://vpn.idoris.example"
@@ -28,6 +30,11 @@ type fakeBackend struct {
 	starts []string
 	// pendingKey is the auth key handed to Start, consumed by StartLoginInteractive.
 	pendingKey string
+	// self, when set, is copied onto Status.Self (overrides the Running fixture).
+	self *ipnstate.PeerStatus
+	// haveNodeKey is copied onto Status.HaveNodeKey. LocalAPI reports this
+	// even after it strips the private key from GetPrefs.
+	haveNodeKey bool
 }
 
 func (f *fakeBackend) rec(s string) { f.calls = append(f.calls, s) }
@@ -36,13 +43,16 @@ func (f *fakeBackend) Status(context.Context) (*ipnstate.Status, error) {
 	if f.statusErr != nil {
 		return nil, f.statusErr
 	}
-	st := &ipnstate.Status{BackendState: f.state.String(), Peer: map[key.NodePublic]*ipnstate.PeerStatus{}}
+	st := &ipnstate.Status{BackendState: f.state.String(), HaveNodeKey: f.haveNodeKey, Peer: map[key.NodePublic]*ipnstate.PeerStatus{}}
 	if f.state == ipn.Running {
 		st.TailscaleIPs = []netip.Addr{netip.MustParseAddr("100.64.0.7")}
 		exp := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
 		st.Self = &ipnstate.PeerStatus{DNSName: "mbp.acme.idoris.internal.", KeyExpiry: &exp}
 		st.Peer[key.NewNode().Public()] = &ipnstate.PeerStatus{Online: true}
 		st.Peer[key.NewNode().Public()] = &ipnstate.PeerStatus{Online: false}
+	}
+	if f.self != nil {
+		st.Self = f.self
 	}
 	return st, nil
 }
@@ -54,6 +64,9 @@ func (f *fakeBackend) EditPrefs(_ context.Context, mp *ipn.MaskedPrefs) (*ipn.Pr
 		if mp.WantRunning && f.state == ipn.Stopped {
 			f.state = ipn.Starting
 		}
+	}
+	if mp.AdvertiseRoutesSet {
+		f.prefs.AdvertiseRoutes = append([]netip.Prefix(nil), mp.AdvertiseRoutes...)
 	}
 	p := f.prefs
 	return &p, nil
@@ -331,6 +344,9 @@ func TestForeignTailnetBlockedWithoutTakeover(t *testing.T) {
 	if snap.Phase != PhaseBlocked || keys.n != 0 || len(be.starts) != 0 {
 		t.Fatalf("expected blocked: %+v", snap)
 	}
+	if !strings.Contains(snap.LastError, "mode: embedded") {
+		t.Fatalf("blocked message should point at mode: embedded: %q", snap.LastError)
+	}
 }
 
 func TestExistingProfileIsSwitchedNotReenrolled(t *testing.T) {
@@ -389,6 +405,137 @@ func TestBackoffIsBoundedAndJittered(t *testing.T) {
 		if d < time.Second || d > 36*time.Second {
 			t.Fatalf("backoff(%d)=%v out of bounds", i, d)
 		}
+	}
+}
+
+func TestLoginAdvertisesRoutes(t *testing.T) {
+	want := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("192.168.1.0/24")}
+	be := &fakeBackend{state: ipn.NeedsLogin}
+	r := newR(t, be, &countingKeys{}, func(o *Options) { o.AdvertiseRoutes = want })
+	if _, err := r.Step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !sameRoutes(be.prefs.AdvertiseRoutes, want) {
+		t.Fatalf("login prefs routes %+v", be.prefs.AdvertiseRoutes)
+	}
+}
+
+func TestAdvertisedRoutesReconcileDrift(t *testing.T) {
+	want := []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")}
+	be := &fakeBackend{state: ipn.Running, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true}}
+	r := newR(t, be, &countingKeys{}, func(o *Options) { o.AdvertiseRoutes = want })
+	snap, err := r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseConnected {
+		t.Fatalf("step: %+v %v", snap, err)
+	}
+	if !sameRoutes(be.prefs.AdvertiseRoutes, want) {
+		t.Fatalf("routes %+v", be.prefs.AdvertiseRoutes)
+	}
+	be.calls = nil
+	if _, err := r.Step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range be.calls {
+		if c == "EditPrefs" {
+			t.Fatal("second pass edited unchanged routes")
+		}
+	}
+}
+
+func TestHaveNodeKeyWaitsOutBriefNeedsLogin(t *testing.T) {
+	// LocalAPI shape: private key stripped from prefs, HaveNodeKey still set.
+	be := &fakeBackend{
+		state:       ipn.NeedsLogin,
+		haveNodeKey: true,
+		prefs:       ipn.Prefs{ControlURL: ours, Persist: &persist.Persist{}},
+	}
+	keys := &countingKeys{}
+	r := newR(t, be, keys, nil)
+	now := time.Now()
+	r.now = func() time.Time { return now }
+
+	snap, err := r.Step(context.Background())
+	if err != nil || keys.n != 0 || snap.Phase != PhaseStarting {
+		t.Fatalf("HaveNodeKey NeedsLogin must not mint: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+	now = now.Add(persistedLoginSettle)
+	snap, err = r.Step(context.Background())
+	if err != nil || keys.n != 1 || snap.Phase != PhaseStarting {
+		t.Fatalf("HaveNodeKey that outlasts the settle window must mint: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+}
+
+func TestPersistedNodeKeyWaitsOutBriefNeedsLogin(t *testing.T) {
+	be := &fakeBackend{
+		state: ipn.NeedsLogin,
+		prefs: ipn.Prefs{
+			ControlURL: ours,
+			Persist:    &persist.Persist{PrivateNodeKey: key.NewNode()},
+		},
+	}
+	keys := &countingKeys{}
+	r := newR(t, be, keys, nil)
+	now := time.Now()
+	r.now = func() time.Time { return now }
+
+	snap, err := r.Step(context.Background())
+	if err != nil || keys.n != 0 || snap.Phase != PhaseStarting {
+		t.Fatalf("brief NeedsLogin must not mint: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+	now = now.Add(persistedLoginSettle - time.Second)
+	if _, err := r.Step(context.Background()); err != nil || keys.n != 0 {
+		t.Fatalf("still inside the settle window: keys=%d err=%v", keys.n, err)
+	}
+
+	be.state = ipn.Running
+	snap, err = r.Step(context.Background())
+	if err != nil || keys.n != 0 || snap.Phase != PhaseConnected {
+		t.Fatalf("resume should reach Running with no key: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+
+	be.state = ipn.NeedsLogin
+	now = now.Add(time.Second)
+	if _, err := r.Step(context.Background()); err != nil || keys.n != 0 {
+		t.Fatalf("a new NeedsLogin after Running starts the clock over: keys=%d err=%v", keys.n, err)
+	}
+	now = now.Add(persistedLoginSettle)
+	snap, err = r.Step(context.Background())
+	if err != nil || keys.n != 1 || snap.Phase != PhaseStarting {
+		t.Fatalf("NeedsLogin that outlasts the settle window must mint: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+}
+
+func TestStartingWithoutLoginFlagDoesNotMint(t *testing.T) {
+	be := &fakeBackend{state: ipn.Starting, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true}}
+	keys := &countingKeys{}
+	r := newR(t, be, keys, nil)
+	snap, err := r.Step(context.Background())
+	if err != nil || keys.n != 0 || snap.Phase != PhaseStarting {
+		t.Fatalf("Starting without LoginWhileStarting must not mint: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+}
+
+func TestLoginWhileStartingMintsOnceUntilRunning(t *testing.T) {
+	be := &fakeBackend{state: ipn.Starting, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true}}
+	keys := &countingKeys{}
+	r := newR(t, be, keys, func(o *Options) { o.LoginWhileStarting = true })
+	if _, err := r.Step(context.Background()); err != nil || keys.n != 1 {
+		t.Fatalf("fresh Starting must login once: keys=%d err=%v", keys.n, err)
+	}
+	if _, err := r.Step(context.Background()); err != nil || keys.n != 1 {
+		t.Fatalf("grace must hold: keys=%d err=%v", keys.n, err)
+	}
+
+	identified := &fakeBackend{
+		state: ipn.Starting,
+		prefs: ipn.Prefs{ControlURL: ours, WantRunning: true},
+		self:  &ipnstate.PeerStatus{PublicKey: key.NewNode().Public()},
+	}
+	keys2 := &countingKeys{}
+	r2 := newR(t, identified, keys2, func(o *Options) { o.LoginWhileStarting = true })
+	snap, err := r2.Step(context.Background())
+	if err != nil || keys2.n != 0 || snap.Phase != PhaseStarting {
+		t.Fatalf("a Starting node that already has an identity must not mint: %+v keys=%d err=%v", snap, keys2.n, err)
 	}
 }
 

@@ -1,0 +1,16 @@
+# Headscale refuses to start with an empty DERP map. This region is a
+# placeholder so the foreign control plane boots. The test does not relay
+# traffic through it.
+regions:
+  901:
+    regionid: 901
+    regioncode: foreign
+    regionname: foreign-placeholder
+    nodes:
+      - name: 901a
+        regionid: 901
+        hostname: headscale-foreign
+        ipv4: 127.0.0.1
+        stunport: 0
+        stunonly: false
+        derpport: 0

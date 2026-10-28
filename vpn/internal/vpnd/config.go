@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -32,7 +35,27 @@ type Config struct {
 	AcceptRoutes  bool     `json:"accept_routes,omitempty"`
 	AcceptDNS     *bool    `json:"accept_dns,omitempty"`
 	AdvertiseTags []string `json:"advertise_tags,omitempty"`
-	Takeover      *bool    `json:"takeover,omitempty"`
+	// Takeover, when true, allows system mode to switch a tailscaled that is
+	// logged into some other control server. The default (nil or false) is to
+	// leave that login alone. Pointer so an explicit false is distinct from
+	// "unset" in older configs; both mean off.
+	Takeover *bool `json:"takeover,omitempty"`
+
+	// Mode is auto (default), system, or embedded.
+	Mode string `json:"mode,omitempty"`
+	// StateDir is the embedded node's private state directory (0700). Empty
+	// uses ~/.idoris/vpn-state.
+	StateDir string `json:"state_dir,omitempty"`
+	// Forwards are loopback TCP listeners dialed through the tailnet. In
+	// embedded mode that is the only way other processes on the machine can
+	// reach tailnet addresses.
+	Forwards []Forward `json:"forwards,omitempty"`
+	// SOCKS5Listen, if set, is a loopback address for a SOCKS5 proxy into the
+	// tailnet (embedded: via tsnet; system: via the kernel route).
+	SOCKS5Listen string `json:"socks5_listen,omitempty"`
+	// AdvertiseRoutes are CIDRs this node advertises (subnet router). Valid
+	// only in system mode; embedded mode has no TUN and rejects them.
+	AdvertiseRoutes []string `json:"advertise_routes,omitempty"`
 
 	// TailscaleSocket overrides the LocalAPI socket (Linux containers, tests).
 	TailscaleSocket string `json:"tailscale_socket,omitempty"`
@@ -57,6 +80,22 @@ func DefaultListen() string {
 		}
 	}
 	return "unix:" + filepath.Join(base, "vpnd.sock")
+}
+
+// Forward is one loopback TCP listener and the tailnet target it dials.
+type Forward struct {
+	Listen string `json:"listen"`
+	Target string `json:"target"`
+}
+
+// DefaultStateDir is the embedded node's state directory, under the user's
+// ~/.idoris and created mode 0700 by the daemon.
+func DefaultStateDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "", fmt.Errorf("state_dir: home directory: %w", err)
+	}
+	return filepath.Join(home, ".idoris", "vpn-state"), nil
 }
 
 // LoadConfig reads a JSON file (optional) then applies IDORIS_VPN_* env vars.
@@ -88,10 +127,42 @@ func LoadConfig(path string) (*Config, error) {
 	env("TAILSCALE_SOCKET", &cfg.TailscaleSocket)
 	env("LISTEN", &cfg.Listen)
 	env("LOG_LEVEL", &cfg.LogLevel)
+	env("MODE", &cfg.Mode)
+	env("STATE_DIR", &cfg.StateDir)
+	env("SOCKS5_LISTEN", &cfg.SOCKS5Listen)
 	if v, ok := os.LookupEnv("IDORIS_VPN_ENROLL_ALLOW_INSECURE"); ok {
 		cfg.EnrollAllowInsecure = v == "1" || strings.EqualFold(v, "true")
 	}
+	if v, ok := os.LookupEnv("IDORIS_VPN_TAKEOVER"); ok {
+		b := v == "1" || strings.EqualFold(v, "true")
+		cfg.Takeover = &b
+	}
+	if v, ok := os.LookupEnv("IDORIS_VPN_ADVERTISE_ROUTES"); ok {
+		cfg.AdvertiseRoutes = splitList(v)
+	}
+	if v, ok := os.LookupEnv("IDORIS_VPN_FORWARDS"); ok {
+		if strings.TrimSpace(v) == "" {
+			cfg.Forwards = nil
+		} else if err := json.Unmarshal([]byte(v), &cfg.Forwards); err != nil {
+			return nil, fmt.Errorf("IDORIS_VPN_FORWARDS: %w", err)
+		}
+	}
 	return cfg, nil
+}
+
+func splitList(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func readSecretFile(path string) (string, error) {
@@ -139,6 +210,96 @@ func (c *Config) Resolve() error {
 			return fmt.Errorf("interval: %w", err)
 		}
 	}
+	c.Mode = strings.ToLower(strings.TrimSpace(c.Mode))
+	if c.Mode == "" {
+		c.Mode = ModeAuto
+	}
+	switch c.Mode {
+	case ModeAuto, ModeSystem, ModeEmbedded:
+	default:
+		return fmt.Errorf("mode %q: want auto, system, or embedded", c.Mode)
+	}
+	if err := c.validateForwards(); err != nil {
+		return err
+	}
+	if _, err := c.RoutePrefixes(); err != nil {
+		return err
+	}
+	if err := c.RejectEmbeddedRoutes(c.Mode); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Config) validateForwards() error {
+	for i, f := range c.Forwards {
+		if err := ValidateLoopback(f.Listen); err != nil {
+			return fmt.Errorf("forwards[%d].listen: %w", i, err)
+		}
+		if _, _, err := net.SplitHostPort(f.Target); err != nil {
+			return fmt.Errorf("forwards[%d].target %q: %w", i, f.Target, err)
+		}
+	}
+	if c.SOCKS5Listen != "" {
+		if err := ValidateLoopback(c.SOCKS5Listen); err != nil {
+			return fmt.Errorf("socks5_listen: %w", err)
+		}
+	}
+	return nil
+}
+
+// RoutePrefixes parses advertise_routes. An empty list returns nil.
+func (c *Config) RoutePrefixes() ([]netip.Prefix, error) {
+	if len(c.AdvertiseRoutes) == 0 {
+		return nil, nil
+	}
+	out := make([]netip.Prefix, 0, len(c.AdvertiseRoutes))
+	seen := map[netip.Prefix]struct{}{}
+	for _, s := range c.AdvertiseRoutes {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		p, err := netip.ParsePrefix(s)
+		if err != nil {
+			return nil, fmt.Errorf("advertise_routes %q: %w", s, err)
+		}
+		if masked := p.Masked(); !masked.IsValid() || masked != p {
+			return nil, fmt.Errorf("advertise_routes %q: has host bits set", s)
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// RejectEmbeddedRoutes reports an error when mode is embedded and the config
+// asks this node to advertise subnet routes. Embedded mode has no TUN, so it
+// cannot route a LAN. mode "auto" is not rejected here; the daemon checks
+// again after it has decided.
+func (c *Config) RejectEmbeddedRoutes(mode string) error {
+	if mode == ModeEmbedded && len(c.AdvertiseRoutes) > 0 {
+		return errors.New("advertise_routes is not supported in embedded mode (no TUN): set mode to system to advertise LAN routes; on Linux also set net.ipv4.ip_forward=1 and approve the routes in Headscale")
+	}
+	return nil
+}
+
+// ValidateLoopback accepts host:port where host is a loopback IP.
+func ValidateLoopback(addr string) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("%q: %w", addr, err)
+	}
+	if _, err := strconv.Atoi(port); err != nil || port == "" {
+		return fmt.Errorf("%q: invalid port", addr)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("%q: must bind a loopback address", addr)
+	}
 	return nil
 }
 
@@ -151,6 +312,7 @@ func (c *Config) IntervalDuration() time.Duration {
 // AcceptDNSValue defaults to true (MagicDNS is how members find the Local AI host).
 func (c *Config) AcceptDNSValue() bool { return c.AcceptDNS == nil || *c.AcceptDNS }
 
-// TakeoverValue defaults to true: the daemon's job is to make this machine a
-// member of the iDoris tailnet.
-func (c *Config) TakeoverValue() bool { return c.Takeover == nil || *c.Takeover }
+// TakeoverValue is true only when the operator explicitly enabled takeover.
+// The default is false: never switch a system tailscaled that is logged into
+// some other control server unless asked.
+func (c *Config) TakeoverValue() bool { return c.Takeover != nil && *c.Takeover }

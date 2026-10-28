@@ -1,0 +1,16 @@
+// Minimal policy for the embedded-mode fixture.
+// Default deny. The enrolled member (user acme) may open TCP 11434 on the
+// tagged Local AI node. Nothing else is admitted.
+// Unknown users at startup are fine: Headscale resolves them to nobody.
+{
+  "tagOwners": {
+    "tag:acme-local-ai": ["acme@"],
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["acme@"],
+      "dst": ["tag:acme-local-ai:11434"],
+    },
+  ],
+}

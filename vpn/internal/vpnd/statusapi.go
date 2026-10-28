@@ -18,6 +18,73 @@ type StatusSource interface {
 	Snapshot() Snapshot
 }
 
+// View is the status API's source. It overlays the process-wide mode and the
+// loopback listeners onto the reconciler snapshot. The reconciler does not
+// know which mode it was started in, and its own set() would otherwise drop
+// fields it does not own.
+type View struct {
+	Source     StatusSource
+	Mode       string
+	ModeReason string
+	Access     *LocalAccess
+}
+
+// Snapshot implements StatusSource.
+func (v View) Snapshot() Snapshot {
+	var snap Snapshot
+	if v.Source != nil {
+		snap = v.Source.Snapshot()
+	}
+	snap.Mode = v.Mode
+	snap.ModeReason = v.ModeReason
+	if v.Access != nil {
+		snap.Forwards = v.Access.ForwardStatus()
+		snap.SOCKS5 = v.Access.SOCKS5Status()
+	}
+	return snap
+}
+
+// FormatStatus renders /v1/status for `idoris-vpnd status`.
+func FormatStatus(st map[string]any) string {
+	var b strings.Builder
+	line := func(key string, val any) {
+		fmt.Fprintf(&b, "%-13s %v\n", key+":", val)
+	}
+	line("phase", st["phase"])
+	if st["mode"] != nil && st["mode"] != "" {
+		line("mode", st["mode"])
+	}
+	if reason, _ := st["mode_reason"].(string); reason != "" {
+		line("mode_reason", reason)
+	}
+	line("control_url", st["control_url"])
+	line("backend", st["backend_state"])
+	if ips, ok := st["tailnet_ips"].([]any); ok && len(ips) > 0 {
+		line("tailnet_ips", ips)
+	}
+	if v, _ := st["self_dns_name"].(string); v != "" {
+		line("self", v)
+	}
+	if fw, ok := st["forwards"].([]any); ok {
+		for _, item := range fw {
+			m, _ := item.(map[string]any)
+			if m == nil {
+				continue
+			}
+			fmt.Fprintf(&b, "%-13s %v -> %v (%v)\n", "forward:", m["listen"], m["target"], m["state"])
+		}
+	}
+	if s5, ok := st["socks5"].(map[string]any); ok && s5["listen"] != "" {
+		fmt.Fprintf(&b, "%-13s %v (%v)\n", "socks5:", s5["listen"], s5["state"])
+	}
+	if v, _ := st["last_error"].(string); v != "" {
+		line("last_error", v)
+	}
+	line("attempts", st["login_attempts"])
+	line("daemon", st["daemon_version"])
+	return b.String()
+}
+
 // StatusHandler serves /healthz and /v1/status for the Bridge Connector and
 // for `idoris-vpnd status`.
 func StatusHandler(src StatusSource, version string) http.Handler {
