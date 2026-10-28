@@ -629,6 +629,10 @@ open(path, "w").writelines(out)
 PY
   write_env_var HEADPLANE_ACCESS "$mode"
   write_env_var HEADPLANE_BIND "$bind"
+  write_env_var HEADPLANE_PORT "$port"
+  if [[ "$mode" == "lan" ]]; then
+    write_env_var HEADPLANE_LAN_HOST "$host_url"
+  fi
   if [[ "$mode" == "proxy" ]]; then
     write_env_var HEADPLANE_BASE_URL "$base"
   fi
