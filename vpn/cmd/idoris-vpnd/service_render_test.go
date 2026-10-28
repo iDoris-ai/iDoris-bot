@@ -18,6 +18,7 @@ func TestUserServiceNotice(t *testing.T) {
 func TestRenderServiceDefinitions(t *testing.T) {
 	const userExe = "/usr/local/bin/idoris-vpnd"
 	_, systemExe := systemExecutable("linux", "")
+	_, darwinExe := systemExecutable("darwin", "")
 	_, winExe := systemExecutable("windows", `C:\Program Files`)
 	const cfgPath = "/etc/idoris/vpn.json"
 	cfg := []byte(`{
@@ -31,13 +32,13 @@ func TestRenderServiceDefinitions(t *testing.T) {
 	}
 	assertGolden(t, "testdata/idoris-vpnd.system.service", unit)
 	assertGolden(t, "testdata/idoris-vpnd.user.service", renderSystemdUserUnit(userExe, cfgPath))
-	assertGolden(t, "testdata/ai.idoris.vpnd.daemon.plist", renderSystemLaunchdPlist(systemExe, cfgPath, "/var/log/idoris"))
+	assertGolden(t, "testdata/ai.idoris.vpnd.daemon.plist", renderSystemLaunchdPlist(darwinExe, cfgPath, "/var/log/idoris"))
 	if strings.Contains(renderLaunchdPlist(userExe, cfgPath, "/var/log/idoris"), "STATE_DIRECTORY") {
 		t.Fatal("user LaunchAgent must not set STATE_DIRECTORY")
 	}
 	assertGolden(t, "testdata/idoris-vpnd.task.txt", strings.Join(renderSchtasksCreate(winExe, windowsConfigPath), "\n")+"\n")
-	if systemExe != "/usr/local/lib/idoris/idoris-vpnd" || winExe != `C:\Program Files\iDoris\idoris-vpnd.exe` {
-		t.Fatalf("protected paths linux %s windows %s", systemExe, winExe)
+	if systemExe != "/usr/local/lib/idoris/idoris-vpnd" || darwinExe != "/Library/PrivilegedHelperTools/idoris/idoris-vpnd" || winExe != `C:\Program Files\iDoris\idoris-vpnd.exe` {
+		t.Fatalf("protected paths linux %s darwin %s windows %s", systemExe, darwinExe, winExe)
 	}
 
 	quoted, err := renderSystemdSystemUnit("/opt/iDoris VPN/idoris-vpnd", "/etc/idoris/my vpn.json", cfg)
