@@ -2,7 +2,10 @@ package vpnd
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,6 +13,29 @@ import (
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/types/key"
 )
+
+// r6cDiscoverKeys fails discovery the first fails times, then returns ident.
+// AuthKey counts a certification login.
+type r6cDiscoverKeys struct {
+	fails int
+	calls int
+	auth  int
+	ident Identity
+	role  string
+}
+
+func (k *r6cDiscoverKeys) RefreshIdentity(context.Context) (Identity, string, error) {
+	k.calls++
+	if k.calls <= k.fails {
+		return Identity{}, "", errors.New("discovery down")
+	}
+	return k.ident, k.role, nil
+}
+
+func (k *r6cDiscoverKeys) AuthKey(context.Context) (string, error) {
+	k.auth++
+	return "key-r6c", nil
+}
 
 // TestR6CDiscardMismatchedPendingClearsCommittedBinding is the case the
 // empty-binding C1 test misses. Credential A is committed for node N.
@@ -111,5 +137,87 @@ func TestR6CDiscardMismatchedPendingClearsCommittedBinding(t *testing.T) {
 	}
 	if _, ok := st3.Pending(); ok {
 		t.Fatalf("pending left after certification: %+v", st3.Get())
+	}
+}
+
+// TestR6CSnapshotIdentityUnconfirmed reports identity_unconfirmed while
+// enrollment is unreachable and the identity is unknown, and drops the key
+// once discovery has certified the binding.
+func TestR6CSnapshotIdentityUnconfirmed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vpnd-state.json")
+	st, err := OpenState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp := TokenFingerprint("credential-a")
+	ident := Identity{Tenant: "acme", Role: "member", TokenFingerprint: fp, Known: true}
+	oldKey := key.NewNode().Public()
+	newKey := key.NewNode().Public()
+	be := &fakeBackend{
+		state: ipn.Running,
+		prefs: ipn.Prefs{ControlURL: ours, WantRunning: true, CorpDNS: true},
+		self:  &ipnstate.PeerStatus{ID: "node-n", PublicKey: oldKey},
+	}
+	keys := &r6cDiscoverKeys{fails: 1, ident: ident, role: "member"}
+	r := newR(t, be, keys, func(o *Options) {
+		o.State = st
+		o.Mode = ModeEmbedded
+		o.Role = "member"
+		o.EnrollUnreachable = true
+		o.Identity = Identity{TokenFingerprint: fp, Known: false}
+	})
+	now := time.Now()
+	r.now = func() time.Time { return now }
+	ctx := context.Background()
+
+	snap, err := r.Step(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.IdentityUnconfirmed {
+		t.Fatalf("unknown identity was confirmed: %+v", snap)
+	}
+	raw, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !json.Valid(raw) || !strings.Contains(string(raw), `"identity_unconfirmed":true`) {
+		t.Fatalf("status JSON: %s", raw)
+	}
+
+	now = now.Add(discoveryRetryInterval)
+	snap, err = r.Step(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keys.calls != 2 || keys.auth != 1 {
+		t.Fatalf("discovery calls %d auth %d snap %+v", keys.calls, keys.auth, snap)
+	}
+	if snap.Phase == PhaseConnected || r.AccessIdentityOK("node-n", "") {
+		t.Fatalf("certified before the new key was visible: %+v", snap)
+	}
+
+	be.self = &ipnstate.PeerStatus{ID: "node-n", PublicKey: newKey}
+	be.state = ipn.Running
+	snap, err = r.Step(ctx)
+	if err != nil || snap.Phase != PhaseConnected {
+		t.Fatalf("certify: %+v err=%v", snap, err)
+	}
+	if snap.IdentityUnconfirmed {
+		t.Fatalf("confirmed identity still unconfirmed: %+v", snap)
+	}
+	raw, err = json.Marshal(r.Snapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "identity_unconfirmed") {
+		t.Fatalf("confirmed status still has the key: %s", raw)
+	}
+	got := st.Get()
+	if got.Tenant != "acme" || got.Role != "member" || got.TokenFingerprint != fp || got.NodeID != "node-n" {
+		t.Fatalf("binding %+v", got)
+	}
+	if !r.AccessIdentityOK("node-n", "") {
+		t.Fatal("access stayed closed after certification")
 	}
 }

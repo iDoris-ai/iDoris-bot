@@ -159,6 +159,9 @@ type Snapshot struct {
 	// it just applied from one that still runs the previous credential.
 	Tenant           string `json:"tenant,omitempty"`
 	TokenFingerprint string `json:"token_fingerprint,omitempty"`
+	// IdentityUnconfirmed is true only while discovery has not confirmed the
+	// identity for the token now in hand. The wizard reads this key.
+	IdentityUnconfirmed bool `json:"identity_unconfirmed,omitempty"`
 	// Warnings are operator-facing notices that do not by themselves change
 	// phase. Missing tags uses both a phase and a warning.
 	Warnings []string `json:"warnings,omitempty"`
@@ -401,6 +404,7 @@ func (r *Reconciler) set(mutate func(s *Snapshot)) Snapshot {
 	r.snap.Role = r.opt.Role
 	r.snap.Tenant = r.opt.Identity.Tenant
 	r.snap.TokenFingerprint = r.opt.Identity.TokenFingerprint
+	r.snap.IdentityUnconfirmed = r.unconfirmedLocked()
 	r.snap.Attempts = r.attempts
 	r.snap.PreviousProfile = string(r.previousProfile)
 	r.snap.UpdatedAt = r.now()
