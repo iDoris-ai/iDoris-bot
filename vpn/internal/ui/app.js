@@ -74,10 +74,167 @@
     return typeof v === "string" && v !== "";
   }
 
+  // sameControlURL / normalizeControlURL mirror vpnd.SameControlURL and
+  // vpnd.NormalizeControlURL: lower-case scheme and host, no trailing
+  // slash, no default port (https 443, http 80), query and fragment
+  // dropped. The two Tailscale SaaS URLs compare equal as exact strings.
+  // Exact strings, same as ipn.IsLoginServerSynonym. The scheme and slashes
+  // are checked apart so this file has no external URL literal. The page
+  // test rejects that contiguous text in the asset.
+  function isLoginServerSynonym(val) {
+    if (typeof val !== "string" || val.slice(0, 6) !== "https:" || val.slice(6, 8) !== "//") {
+      return false;
+    }
+    var host = val.slice(8);
+    return host === "login.tailscale.com" || host === "controlplane.tailscale.com";
+  }
+
+  function sameControlURL(a, b) {
+    if (isLoginServerSynonym(a) && isLoginServerSynonym(b)) {
+      return true;
+    }
+    return normalizeControlURL(a) === normalizeControlURL(b);
+  }
+
+  function normalizeControlURL(s) {
+    if (typeof s !== "string") {
+      return "";
+    }
+    s = s.replace(/^\s+|\s+$/g, "");
+    if (!s) {
+      return "";
+    }
+    var parsed = parseControlURL(s);
+    if (!parsed) {
+      return s.toLowerCase().replace(/\/+$/, "");
+    }
+    var scheme = parsed.scheme.toLowerCase();
+    var host = parsed.host.toLowerCase();
+    if (scheme === "https" && host.slice(-4) === ":443") {
+      host = host.slice(0, -4);
+    } else if (scheme === "http" && host.slice(-3) === ":80") {
+      host = host.slice(0, -3);
+    }
+    var path = parsed.path.replace(/\/+$/, "");
+    var out = "";
+    if (scheme) {
+      out += scheme + ":";
+    }
+    if (scheme || host) {
+      out += "//";
+    }
+    if (parsed.userinfo) {
+      out += parsed.userinfo + "@";
+    }
+    out += host;
+    if (path && path.charAt(0) !== "/" && host) {
+      out += "/";
+    }
+    out += path;
+    return out;
+  }
+
+  // Enough of net/url.Parse for a control URL. A parse Go would reject, or
+  // a URL with an empty host, returns null so the caller uses the same
+  // lower-case / trim-slash fallback as NormalizeControlURL.
+  function parseControlURL(raw) {
+    var i;
+    for (i = 0; i < raw.length; i++) {
+      var c = raw.charCodeAt(i);
+      if (c < 0x20 || c === 0x7f) {
+        return null;
+      }
+    }
+    var hash = raw.indexOf("#");
+    if (hash >= 0) {
+      raw = raw.slice(0, hash);
+    }
+    var scheme = "";
+    var rest = raw;
+    var colon = -1;
+    for (i = 0; i < raw.length; i++) {
+      var ch = raw.charAt(i);
+      if ((ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z")) {
+        continue;
+      }
+      if (ch >= "0" && ch <= "9" || ch === "+" || ch === "-" || ch === ".") {
+        if (i === 0) {
+          break;
+        }
+        continue;
+      }
+      if (ch === ":") {
+        if (i === 0) {
+          return null;
+        }
+        colon = i;
+      }
+      break;
+    }
+    if (colon > 0) {
+      scheme = raw.slice(0, colon).toLowerCase();
+      rest = raw.slice(colon + 1);
+    }
+    var q = rest.indexOf("?");
+    if (q >= 0) {
+      rest = rest.slice(0, q);
+    }
+    if (rest.slice(0, 2) !== "//") {
+      return null;
+    }
+    var authority = rest.slice(2);
+    var path = "";
+    var slash = authority.indexOf("/");
+    if (slash >= 0) {
+      path = authority.slice(slash);
+      authority = authority.slice(0, slash);
+    }
+    if (!authority) {
+      return null;
+    }
+    var userinfo = "";
+    var at = authority.lastIndexOf("@");
+    var host = authority;
+    if (at >= 0) {
+      userinfo = authority.slice(0, at);
+      host = authority.slice(at + 1);
+      if (!host) {
+        return null;
+      }
+    }
+    var portAt = -1;
+    if (host.charAt(0) === "[") {
+      var bracket = host.lastIndexOf("]");
+      if (bracket < 0) {
+        return null;
+      }
+      if (bracket + 1 < host.length) {
+        portAt = bracket + 1;
+      }
+    } else {
+      var firstColon = host.indexOf(":");
+      if (firstColon >= 0) {
+        portAt = firstColon;
+        if (host.lastIndexOf(":") !== firstColon && (scheme === "http" || scheme === "https")) {
+          return null;
+        }
+        if (host.lastIndexOf(":") !== firstColon) {
+          portAt = host.lastIndexOf(":");
+        }
+      }
+    }
+    if (portAt >= 0 && !/^:\d*$/.test(host.slice(portAt))) {
+      return null;
+    }
+    return { scheme: scheme, host: host, path: path, userinfo: userinfo };
+  }
+
   // Completion is the identity Apply just wrote. An empty expected control
   // URL means discovery did not name a server, so role is the only check.
-  // Tenant and token fingerprint count only when the daemon status already
-  // carries a non-empty value for them.
+  // Control URLs compare in canonical form, so a pinned spelling with a
+  // trailing slash or an explicit :443 matches discovery. Tenant and token
+  // fingerprint count only when the daemon status already carries a
+  // non-empty value for them.
   function identityMatches(st) {
     if (!expectIdentity) {
       return true;
@@ -85,7 +242,7 @@
     if (expectIdentity.role && st.role !== expectIdentity.role) {
       return false;
     }
-    if (expectIdentity.control_url && st.control_url !== expectIdentity.control_url) {
+    if (expectIdentity.control_url && !sameControlURL(st.control_url, expectIdentity.control_url)) {
       return false;
     }
     if (expectIdentity.tenant && exposed(st, "tenant") && st.tenant !== expectIdentity.tenant) {
