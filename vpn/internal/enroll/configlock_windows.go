@@ -25,7 +25,11 @@ func acquireConfigLock(path string) (func(), error) {
 // still does not exclude another process; the split only matches Unix, where
 // a credential listing must not leave a root-owned lock behind.
 func acquireConfigLockRead(path string) (func(), error) {
-	lockPath := path + ".lock"
+	resolved, err := configPath(path)
+	if err != nil {
+		return nil, err
+	}
+	lockPath := resolved + ".lock"
 	f, err := os.OpenFile(lockPath, os.O_RDWR, 0) //nolint:gosec // lock sits beside the operator-chosen config
 	if err != nil {
 		return nil, lockUnavailable(lockPath, err)
