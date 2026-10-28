@@ -217,12 +217,37 @@ func ProtectPrivateDir(dir string, created bool, sid string, run CommandRunner, 
 		if err != nil {
 			return fmt.Errorf("fsutil: read DACL %s: %w", dir, err)
 		}
-		if err := VerifyOwnerDACL(view, []string{sid}); err != nil {
+		if err := VerifyExistingPrivateDir(view, sid); err != nil {
 			return fmt.Errorf("fsutil: %s: %w", dir, err)
 		}
 		return nil
 	}
 	return ApplyOwnerDACL(dir, true, sid, run, read)
+}
+
+// VerifyExistingPrivateDir checks a directory this call did not create.
+// When sid is LOCAL SYSTEM, the DACL may be exactly {SYSTEM} or exactly
+// {SYSTEM, Administrators}. The installer grants both; a directory created
+// by this process as SYSTEM may have only SYSTEM. The owner is SYSTEM or
+// Administrators. Every other current SID must be exactly {sid}. An
+// inherited ACE, a deny ACE, or an unrecognized ACE fails for both policies.
+func VerifyExistingPrivateDir(view ACLView, sid string) error {
+	if !validSID(sid) {
+		return fmt.Errorf("fsutil: owner SID %q is not usable", sid)
+	}
+	if sid != SIDLocalSystem {
+		return VerifyOwnerDACL(view, []string{sid})
+	}
+	// The wider set's error names an unexpected SID. The SYSTEM-only check
+	// would report Administrators itself as unexpected and hide that SID.
+	err := VerifyOwnerDACL(view, []string{SIDLocalSystem, SIDAdministrators})
+	if err == nil {
+		return nil
+	}
+	if sysOnly := VerifyOwnerDACL(view, []string{SIDLocalSystem}); sysOnly == nil {
+		return nil
+	}
+	return err
 }
 
 // WriteSecretAfterDACL applies the file DACL and only then calls write.
