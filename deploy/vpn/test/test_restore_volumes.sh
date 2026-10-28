@@ -160,4 +160,83 @@ _restore_copy_volume_alpine "$snap" || die "alpine restore failed"
 got="$(docker run --rm --network none -v "${vol}:/data:ro" "$alpine" sh -c 'cat /data/db.sqlite')"
 [[ "$got" == "original-bytes" ]] || die "rollback left mutated bytes: $got"
 
+# The volume above has no deploy-directory marker. Restore from another
+# directory must refuse it, proceed only with the adopt flag, and refuse
+# an unreadable marker even with that flag.
+echo "test: markerless volume, restore from another directory"
+other="$tmp/other"
+bundle="$tmp/bundle"
+mkdir -p "$other" \
+  "$bundle/headscale" "$bundle/state/enroll" "$bundle/state/headscale" "$bundle/state/headplane"
+cp "$root/bundle.py" "$other/bundle.py"
+printf 'services: {}\n' > "$other/compose.yaml"
+op_uid="$(id -u)"
+op_gid="$(id -g)"
+printf 'COMPOSE_PROJECT_NAME=%s\nENROLL_UID=%s\nENROLL_GID=%s\n' "$proj" "$op_uid" "$op_gid" > "$other/.env"
+chmod 600 "$other/.env"
+printf '{}\n' > "$bundle/manifest.json"
+printf 'bundle-db\n' > "$bundle/headscale/db.sqlite"
+printf 'bundle-noise\n' > "$bundle/headscale/noise_private.key"
+printf '{}\n' > "$bundle/state/enroll/config.json"
+printf 'key\n' > "$bundle/state/enroll/headscale.apikey"
+printf '0123456789abcdef0123456789abcdef\n' > "$bundle/state/headplane/cookie_secret"
+printf 'COMPOSE_PROJECT_NAME=%s\nENROLL_UID=%s\nENROLL_GID=%s\n' "$proj" "$op_uid" "$op_gid" > "$bundle/state/dotenv"
+printf '{}\n' > "$bundle/state/headscale/managed.json"
+printf 'server_url: https://vpn.example.org\n' > "$bundle/state/headscale/config.yaml"
+printf '{}\n' > "$bundle/state/headscale/policy.hujson"
+printf 'server:\n  base_url: "http://127.0.0.1:3000"\n  cookie_secure: false\n' > "$bundle/state/headplane/config.yaml"
+printf 'services: {}\n' > "$bundle/state/compose.yaml"
+here="$other"
+unset COMPOSE_PROJECT_LOCK
+set +e
+out="$(restore_deployment "$bundle" 0 2>&1)"
+ec=$?
+set -e
+[[ "$ec" -ne 0 ]] || die "markerless restore was accepted: $out"
+grep -q 'no deploy-directory marker' <<<"$out" || die "markerless refusal missing: $out"
+grep -q -- '--adopt-existing-volumes' <<<"$out" || die "flag not named: $out"
+grep -q "$vol" <<<"$out" || die "volume not named: $out"
+got="$(docker run --rm --network none -v "${vol}:/data:ro" "$alpine" sh -c 'cat /data/db.sqlite')"
+[[ "$got" == "original-bytes" ]] || die "refused restore changed the database: $got"
+
+echo "test: --adopt-existing-volumes proceeds and names the volumes"
+set +e
+out="$(restore_deployment "$bundle" 1 2>&1)"
+ec=$?
+set -e
+grep -q 'will overwrite' <<<"$out" || die "adopt did not list volumes: $out"
+grep -q "$vol" <<<"$out" || die "adopt did not name $vol: $out"
+if grep -q 'no deploy-directory marker' <<<"$out"; then
+  die "adopt still refused markerless volumes: $out"
+fi
+# The bundle uid matches this operator, so host install continues into
+# container creation. The empty compose file then fails. That is past the gate.
+grep -q 'creating stopped containers' <<<"$out" || die "adopt did not proceed into restore: $out"
+got="$(docker run --rm --network none -v "${vol}:/data:ro" "$alpine" sh -c 'cat /data/db.sqlite')"
+[[ "$got" == "original-bytes" ]] || die "adopt's failed install changed the database: $got"
+
+echo "test: an unreadable marker is refused, with or without the flag"
+docker run --rm --network none -v "${vol}:/data" "$alpine" \
+  sh -c 'rm -rf /data/.idoris-deploy-dir && mkdir /data/.idoris-deploy-dir'
+set +e
+out="$(restore_deployment "$bundle" 0 2>&1)"
+ec=$?
+set -e
+[[ "$ec" -ne 0 ]] || die "unreadable marker was accepted: $out"
+grep -q 'unreadable marker' <<<"$out" || die "unreadable refusal missing: $out"
+if grep -q 'no deploy-directory marker' <<<"$out"; then
+  die "unreadable marker was treated as absent: $out"
+fi
+set +e
+out="$(restore_deployment "$bundle" 1 2>&1)"
+ec=$?
+set -e
+[[ "$ec" -ne 0 ]] || die "adopt accepted an unreadable marker: $out"
+grep -q 'unreadable marker' <<<"$out" || die "adopt unreadable refusal missing: $out"
+if grep -q 'will overwrite' <<<"$out"; then
+  die "adopt printed overwrite for an unreadable marker: $out"
+fi
+got="$(docker run --rm --network none -v "${vol}:/data:ro" "$alpine" sh -c 'cat /data/db.sqlite')"
+[[ "$got" == "original-bytes" ]] || die "unreadable-marker restore changed the database: $got"
+
 echo "test_restore_volumes: ok"
