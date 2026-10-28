@@ -40,21 +40,37 @@ type DaemonState struct {
 	// was running when the transition began. PendingProfileID is the profile
 	// the login returned under, in system mode. PendingLoginOK is set only
 	// after Start and StartLoginInteractive have both returned.
-	PendingNodeID    string    `json:"pending_node_id,omitempty"`
-	PendingNodeKey   string    `json:"pending_node_key,omitempty"`
-	PendingProfileID string    `json:"pending_profile_id,omitempty"`
-	PendingStarted   time.Time `json:"pending_started,omitzero"`
-	PendingLoginOK   bool      `json:"pending_login_ok,omitempty"`
+	//
+	// The remaining Pending* fields are what that transition was started
+	// for. A later process resumes it only when they still match the
+	// configuration it was given. They are not the committed binding.
+	PendingNodeID           string    `json:"pending_node_id,omitempty"`
+	PendingNodeKey          string    `json:"pending_node_key,omitempty"`
+	PendingProfileID        string    `json:"pending_profile_id,omitempty"`
+	PendingStarted          time.Time `json:"pending_started,omitzero"`
+	PendingLoginOK          bool      `json:"pending_login_ok,omitempty"`
+	PendingTokenFingerprint string    `json:"pending_token_fingerprint,omitempty"`
+	PendingTenant           string    `json:"pending_tenant,omitempty"`
+	PendingRole             string    `json:"pending_role,omitempty"`
+	PendingControlURL       string    `json:"pending_control_url,omitempty"`
+	PendingMode             string    `json:"pending_mode,omitempty"`
 }
 
-// PendingLogin is the on-disk identity transition. It is small on purpose:
-// enough for the next process to recognise the login it already started.
+// PendingLogin is the on-disk identity transition. It records the node the
+// login replaced and the credential, tenant, role, control URL, and backend
+// mode that login was started for. ProfileID is the system-mode profile the
+// login returned under.
 type PendingLogin struct {
-	NodeID    string
-	NodeKey   string
-	ProfileID string
-	Started   time.Time
-	LoginOK   bool
+	NodeID           string
+	NodeKey          string
+	ProfileID        string
+	Started          time.Time
+	LoginOK          bool
+	TokenFingerprint string
+	Tenant           string
+	Role             string
+	ControlURL       string
+	Mode             string
 }
 
 // Identity is the credential the enrollment service just described.
@@ -345,6 +361,11 @@ func (s *StateFile) SetPending(p PendingLogin) error {
 		next.PendingStarted = p.Started.UTC()
 	}
 	next.PendingLoginOK = p.LoginOK
+	next.PendingTokenFingerprint = p.TokenFingerprint
+	next.PendingTenant = p.Tenant
+	next.PendingRole = p.Role
+	next.PendingControlURL = p.ControlURL
+	next.PendingMode = p.Mode
 	if next == s.st {
 		return nil
 	}
@@ -369,13 +390,19 @@ func (s *StateFile) Pending() (PendingLogin, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p := PendingLogin{
-		NodeID:    s.st.PendingNodeID,
-		NodeKey:   s.st.PendingNodeKey,
-		ProfileID: s.st.PendingProfileID,
-		Started:   s.st.PendingStarted,
-		LoginOK:   s.st.PendingLoginOK,
+		NodeID:           s.st.PendingNodeID,
+		NodeKey:          s.st.PendingNodeKey,
+		ProfileID:        s.st.PendingProfileID,
+		Started:          s.st.PendingStarted,
+		LoginOK:          s.st.PendingLoginOK,
+		TokenFingerprint: s.st.PendingTokenFingerprint,
+		Tenant:           s.st.PendingTenant,
+		Role:             s.st.PendingRole,
+		ControlURL:       s.st.PendingControlURL,
+		Mode:             s.st.PendingMode,
 	}
-	return p, p.LoginOK || p.NodeID != "" || p.NodeKey != "" || p.ProfileID != "" || !p.Started.IsZero()
+	return p, p.LoginOK || p.NodeID != "" || p.NodeKey != "" || p.ProfileID != "" || !p.Started.IsZero() ||
+		p.TokenFingerprint != "" || p.Tenant != "" || p.Role != "" || p.ControlURL != "" || p.Mode != ""
 }
 
 // LoginBackoff returns the persisted next-eligible time and failure count.
