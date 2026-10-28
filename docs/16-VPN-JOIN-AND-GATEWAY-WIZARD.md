@@ -61,7 +61,7 @@ idoris-vpn-enroll invite --config F --entry E --label L --enroll-url U
 
 `--hostname-hint` 和 `--allow-insecure` 仍可用。`--label` 可省略。省略时，非空且能放进加入码的 hostname hint 就是标签；hint 为空时标签是 `cred-` 加该哈希的前 8 位十六进制。hint 不是主机名标签（例如含空格）时邀请失败，配置文件不改。合法标签匹配 `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`。同一条目里非空标签不能重复。
 
-它为该条目新造一个令牌，把带标签的凭证追加进去，原子写回并保持原文件权限。条目必须已经存在。`token_hashes` 可以是空数组；字段缺失仍然报 `token_hashes is required`。明文只在这一次出现。旧文件里的纯哈希字符串仍然合法，读入后当成没有标签、没有 `created_at` 的凭证。新写入的是对象 `{hash, label, created_at}`。`created_at` 是 UTC，截到秒。`invite`、`revoke`、`list-credentials` 整段读改写都用同一把文件锁，锁文件是配置路径加上 `.lock`，模式 0600，和配置在同一目录。Unix 上是阻塞的 flock。Windows 上只创建这个文件，重叠的 invite 和 revoke 没有被挡开。
+它为该条目新造一个令牌，把带标签的凭证追加进去，原子写回并保持原文件的权限、属主和属组。root 在换名之前把临时文件 chown 成配置的属主；新建的锁文件也交给配置属主，chown 失败就删掉这把新锁。非 root 且身份和配置属主不一致时，在创建锁之前拒绝，错误里给出 `sudo -u \#<uid> -g \#<gid> -- idoris-vpn-enroll invite --config <path>`。条目必须已经存在。`token_hashes` 可以是空数组；字段缺失仍然报 `token_hashes is required`。明文只在这一次出现。旧文件里的纯哈希字符串仍然合法，读入后当成没有标签、没有 `created_at` 的凭证。新写入的是对象 `{hash, label, created_at}`。`created_at` 是 UTC，截到秒。`invite`、`revoke`、`list-credentials` 整段读改写都用同一把文件锁，锁文件是配置路径加上 `.lock`，模式 0600，和配置在同一目录。Unix 上是阻塞的 flock。Windows 上只创建这个文件，重叠的 invite 和 revoke 没有被挡开。
 
 每张凭证可以单独吊销。`--label` 和 `--hash-prefix` 只能给一个：
 
@@ -244,7 +244,7 @@ idoris-vpn-enroll list-credentials --config F --entry E
 - 加入码放在命令参数里时，进程列表和 shell 历史能读到它。文档上的入口是 `--code-file`、`--code-stdin`，或终端上什么都没给时的不回显提示。位置参数仍接受，并在 stderr 警告。`join` 的 usage 文本在 `main.go`，本轮没有改那个文件。
 - 加入码不证明登记主机属于本组织。核对打印出来的 `enrollment-authority`，或传 `--expect-authority`。
 - 换一份配置的登记 URL 要 `--replace`。不带它时，原文件不动。
-- 同一台 Headscale（相同 `control_url`）、相同角色、不同租户时，页面仍会把正在运行的旧守护进程当成完成。本轮没有改守护进程的状态快照；快照没有 `tenant`，也没有 `token_fingerprint`。
+- 守护进程的状态快照（`/v1/status`）带有它配置的 `tenant` 和 `token_fingerprint`（令牌的截断哈希，不是令牌）。同一台 Headscale、相同角色、不同租户或不同令牌时，页面在旧守护进程重启换上新凭证之前不报完成。身份未知（登记服务暂时连不上）时这两项为空，页面只按角色和控制服务器判断。`TestSnapshotNamesConfiguredIdentity` 覆盖快照字段和 JSON 里没有令牌明文。
 - 成员和管理员的 auto/embedded 配置默认有回环 SOCKS5。网关和 local-ai 没有。2026-10-28 `TestR5WWizardMemberSOCKS`（compose 项目 `idoris-vpn-r5w-64f1d4e0`，15.60s PASS）把向导的 `SimplePlan` / `Apply` 写出的成员配置跑了起来。登记令牌来自宿主机 `idoris-vpn-enroll invite`，条目是租户 `acme`、角色 member、没有 ACL 标签。计划把 `mode` 写成 `embedded`：这套夹具里的 userspace tailscaled 已经在跑且未登录，auto 会选 system。`listen` 写成 `tcp:127.0.0.1:7845`，因为空的 listen 在设了 `HOME` 时变成 unix socket，状态探针读不到。种子配置留下 `state_dir` `/var/lib/idoris/vpn-state`。容器里 `idoris-vpnd run --config` 到达 `connected`，模式 `embedded`，SOCKS5 为 `listening`。`AccessInfo` 给出 `127.0.0.1:1080` 和凭据文件 `/var/lib/idoris/vpn-state/socks5.auth`。匿名连接被拒绝。用该凭据经 SOCKS5 访问 Local AI 节点 `acme-local-ai:11434` 的回声（1024 字节），输出含 `echoed`。没有在宿主机上另起一条 tailnet。同一用例再跑一次：项目 `idoris-vpn-r5w-5b47384e`，15.64s PASS。全套 `make integration` 里又过一次：项目 `idoris-vpn-r5w-1a197d40`，16.35s PASS。计时见第 8 节。
 - 不是整段落在 RFC1918 里的前缀不会被广告。默认路由必须是 /0。隧道网卡不当办公室网。
 - 客户端不能批准自己的路由。
