@@ -1,6 +1,8 @@
 # 12 · 私有接入层：官方 Tailscale 客户端 + 自建 Headscale 控制面 + idoris-vpnd 守护进程
 
-**日期：** 2026-10-27（泰国时区）· **状态：** 方案已确认方向；`vpn/` 目录代码为首个可运行实现（单测 + Docker 集成测试通过）；`deploy/vpn` 已在本地以内部 CA 整套拉起验证；尚未在公网域名与真实 TLS 上验收。
+**日期：** 2026-10-27（泰国时区）· **状态：** 方案已确认方向；`vpn/` 目录代码已实现并通过单测与 Docker 集成测试（含与已有 Tailscale 并存、局域网直连、子网网关）；`deploy/vpn` 已在本地整套拉起并通过 47 项隔离探针；尚未在公网域名与真实 TLS 上验收。
+
+相关文档：[13 客户端模式](13-VPN-CLIENT-MODES.md)（与已有 Tailscale 并存）· [14 运维](14-VPN-OPERATIONS.md)（单组织默认、管理员、Headplane、网关策略）· [15 局域网与网关](15-VPN-LAN-AND-GATEWAY.md)（实测）· [16 加入码与网关向导](16-VPN-JOIN-AND-GATEWAY-WIZARD.md)。
 
 ## 1. 目标与非目标
 
@@ -11,7 +13,10 @@ Bridge 除了把 LINE / Telegram / WhatsApp 等中心化 SNS 桥接到客户本�
 | 客户端零改动 | 成员设备只安装 **官方 Tailscale 客户端**（App Store / Homebrew / apt / MSI / iOS / Android），不分发修改版 |
 | 控制面自建 | 坐标服务器是我们运营的 **Headscale**（官方开源实现，不 fork），不连 Tailscale Inc. 的 SaaS |
 | 无感加入 | 成员机器上跑一个后台守护进程 `idoris-vpnd`，它让 Tailscale 自动登录到我们的服务器地址，断线/过期自动续期 |
-| 服务中小组织 | 每个组织 = 一个 Headscale user + 一个专属 tag `tag:<租户>-local-ai`，ACL 按租户逐条授权；成员互不可达，只能访问本组织 Local AI 主机的指定端口 |
+| 服务中小组织 | **默认一个组织**（十几个人加一台 Local AI）。多组织是显式的进阶选项：每个组织 = 一个 Headscale user + 一个专属 tag `tag:<租户>-local-ai`，ACL 按租户逐条授权；成员互不可达，只能访问本组织 Local AI 主机的指定端口 |
+| 不打扰已有 Tailscale | 成员已经在用 Tailscale 连别的网络时，守护进程默认**不接管**；`auto` 模式改用进程内的用户态节点与它并存（本机回环端口转发或 SOCKS5），见 [13](13-VPN-CLIENT-MODES.md) |
+| 管理员 | 与成员同一套客户端和注册流程；服务器端用 SSH + `ctl.sh`、Headplane（回环 / 局域网 / 仅 VPN 内可达）运维，见 [14](14-VPN-OPERATIONS.md) |
+| 网关 | 不能装 Tailscale 的设备经办公室里一台 Linux 网关被远程成员访问，见 [14](14-VPN-OPERATIONS.md) 与 [15](15-VPN-LAN-AND-GATEWAY.md) |
 | 建于互联网之上 | Headscale + 内嵌 DERP 中继 + STUN 在公网；成员在任何 NAT 后都能连上 |
 | 基于开源方案改 | 直接运行 Headscale、Headplane；我们只新增**胶水**（守护进程、注册服务、ACL 模板、部署脚本） |
 
@@ -81,9 +86,10 @@ flowchart LR
 
 ### 3.2 身份与网络模型
 
+- **默认只有一个组织**（默认名 `office`），`bootstrap.sh init` 一条命令完成。`add-tenant` 才会引入第二个组织；本节后面讲的是每个组织的规则形状，单组织与多组织一致。
 - **租户 = Headscale user + 专属 tag**。以 `acme` 为例：成员设备注册为 user `acme` 的个人节点，ACL 中写作 `acme@`。Local AI 主机通过带 `acl_tags: ["tag:acme-local-ai"]` 的注册条目入网。带 tag 的节点在 Headscale 里归特殊用户 `tagged-devices`，不归租户 user。
 - **每个租户在 ACL 里一组规则**：`acme@` → `tag:acme-local-ai:8740,8742,443`；`tag:acme-local-ai` → `acme@:*`；`group:admins` → `tag:acme-local-ai:22`，外加一条 ssh 规则。新增租户就复制这一组规则。不使用 `autogroup:member` 这类实例级通配，否则一个租户的成员能连到所有租户的 Local AI，本地实测已复现。
-- **管理员**：Headscale 没有 `autogroup:admin`，管理员是 `group:admins` 里列出的 Headscale 用户（写作 `name@`）。管理员设备不属于任何租户，实测只能访问各 Local AI 的 22 端口。只有 `group:admins` 能给节点打 Local AI tag，成员自行 `--advertise-tags` 会被忽略。管理员设备如何入网尚无正式入口，可用网页认证 `headscale auth register --user admin`，或单加一条注册条目。Tailscale SSH 需要 ssh 规则加一条放行 22 端口的 ACL，只有 ssh 段不会开 22 端口。未配 OIDC 时，`check` 模式每次登录要运维在服务器上执行 `headscale auth approve --auth-id <id>`。
+- **管理员**：Headscale 没有 `autogroup:admin`，管理员是 `group:admins` 里列出的 Headscale 用户（写作 `name@`）。管理员设备不属于任何租户，实测只能访问各 Local AI 的 22 端口。只有 `group:admins` 能给节点打 Local AI tag，成员自行 `--advertise-tags` 会被忽略。管理员设备与成员走同一条注册路径：`bootstrap.sh init` 会创建 `admin` 用户和 `admin` 注册项（无 tag、每分钟 5 次、TTL 5 分钟），设备是 `admin` 用户的个人节点。Tailscale SSH 需要 ssh 规则加一条放行 22 端口的 ACL，只有 ssh 段不会开 22 端口。未配 OIDC 时，`check` 模式每次登录要运维在服务器上执行 `headscale auth approve --auth-id <id>`。
 - **MagicDNS**：`base_domain: idoris.internal`，主机名是 `<hostname>.idoris.internal`，**不含租户名**，同名主机会被去重成 `-1` 后缀。所以 Local AI 主机的 hostname 必须带租户前缀，如 `acme-local-ai`，对成员可见为 `acme-local-ai.idoris.internal`。Bridge Connector 与 Agent24 客户端配置这个名字。
 - **中继**：内嵌 DERP + 保留 Tailscale 公共 DERP 作为兜底（可改 `urls: []` 完全自包含，本地已验证可启动）。`verify_clients: true`。
 - **成员间隔离**：ACL 没有任何成员 → 成员的授权。成员的 `tailscale status` 只看得到自己和本租户 Local AI。
@@ -120,7 +126,8 @@ sequenceDiagram
 ## 4. idoris-vpnd 守护进程行为
 
 - **状态机**（`vpn/internal/vpnd/reconciler.go`）：`connected` / `starting` / `switching-profile` / `enrolling` / `needs-admin-approval` / `blocked-foreign-tailnet` / `error`。
-- **与用户已有 Tailscale 账号共存**：若机器已登录别的 tailnet，默认 `takeover: true`，守护进程记录原 profile ID 后切换到我们的 profile（Tailscale 同时只能一个 profile 在线，这是客户端限制）；配置 `--no-takeover` 则停在 `blocked-foreign-tailnet` 等待运维决定。
+- **与用户已有 Tailscale 账号共存**：`mode` 有三档，默认 `auto`。`auto` 只在不会抢占别人登录时才驱动系统客户端（未登录、全新安装、或已经在我们的控制面上）；系统 tailscaled 不可达，或已登录别的控制面而又没有显式 `takeover: true` 时，改用进程内的 `tsnet` 用户态节点：自有状态目录，不碰 TUN，不改系统 DNS，只在回环地址上提供端口转发与 SOCKS5。`takeover` 默认 **false**；显式 `takeover: true` 才会切走系统客户端并记录原 profile。判定表与限制见 [13](13-VPN-CLIENT-MODES.md)。移动端同一时刻只能有一个 VPN，官方 App 只能用多账号快速切换，不能并存。
+- **网关角色**：`advertise_routes` 在 `system` 模式下写入 prefs 并纠正漂移，`embedded` 模式拒绝该配置。路由仍需 Headscale 批准（手动或 `autoApprovers`）；Linux 网关还要 `net.ipv4.ip_forward=1`。见 [14](14-VPN-OPERATIONS.md)、[15](15-VPN-LAN-AND-GATEWAY.md)。
 - **登录调用顺序**：与官方 `tailscale up --auth-key` 完全一致：`CheckPrefs` → `Start` → `StartLoginInteractive`。实测证明只调 `Start` 时，全新节点会一直停在 NeedsLogin，从不联系控制面。`Start` 会重建控制客户端并清掉残留的浏览器登录 URL，所以随后的 login-interactive 一定使用这把 key，不会弹浏览器；它还会强制生成新 node key，过期续期正需要这一点。
 - **一次性 key 的节约**：每次登录只领一把 key。登录后进入观望期，观望期内不再领 key：首次 20s，此后每次未能进入 Running 的连续尝试翻倍，封顶 10 分钟，进入 Running 后清零。健康节点被过期后的第一次续期立即进行。tailscaled 不可达等错误另按 2s→2min 指数退避加 ±20% 抖动。实测对照：修复前持续失败时约 2 分钟铸了 7 把 key，修复后在 +0s、+20s、+60s 各一把。
 - **启动不铸 key**：未固定 `control_url` 时，守护进程启动只调 `GET /v1/discover` 获取地址。已注册节点重启不消耗任何 key，集成测试对此做了断言。
@@ -136,7 +143,7 @@ sequenceDiagram
 | Headscale API key 泄露 = 全网管理权 | 服务用 key 只存在于 `idoris-vpn-enroll` 容器挂载的文件里，容器以非 root、只读根文件系统、`cap_drop: ALL` 运行；客户端拿到的是**一次性、10 分钟**的 preauthkey。运维登录 Headplane 用各自的 API key，需单独保管与轮换 |
 | 租户 token 泄露 | token 服务端只存 SHA-256；可按租户配多把 token 以便轮换；按租户限流（默认 30/min）；每次签发写审计日志（tenant、hostname、key id） |
 | 中间人改写 control_url | 注册 URL 强制 https（`enroll_allow_insecure` 仅限实验室）；客户端若固定了 `control_url`，服务端返回不一致即拒绝 |
-| 守护进程劫持用户私有 tailnet | 默认 takeover 但记录 previous_profile；`--no-takeover` 可禁用；状态 API 明确显示 `blocked-foreign-tailnet` |
+| 守护进程劫持用户私有 tailnet | `takeover` 默认 false；`auto` 发现外部登录时改用独立的嵌入式节点，原登录不动（集成测试断言它全程保持 Running）；只有显式 `takeover: true` 才切换并记录 previous_profile；状态 API 显示 `mode` 与 `mode_reason` |
 | 节点被盗/离职 | 运维在 Headplane 或 API `expire`/`delete`；成员节点 180 天过期来自本部署的 `node.expiry: 4320h`（Headscale 默认 0，即不过期），守护进程会自动续期；**带 tag 的 Local AI 节点永不过期**，失窃只能手动 expire/delete；ephemeral 租户用于临时设备 |
 | 横向移动 / 跨租户 | ACL 按租户授权，只放行 `<租户>@` → 本租户 Local AI 指定端口；Tailscale SSH 仅 `group:admins` 且 `check` 模式，不允许以 root 登录 |
 | 中继被蹭 | DERP `verify_clients: true` |
@@ -150,6 +157,11 @@ sequenceDiagram
 | VPN-C 客户端守护进程 | LocalAPI Backend 抽象、Reconciler 状态机、状态 API、配置、launchd/systemd 安装 | `vpn/internal/vpnd`、`vpn/cmd/idoris-vpnd` | ✅ 已完成，单测覆盖；Windows 安装器待做 |
 | VPN-T 测试 | 单测（假 tailscaled、假 Headscale）、Docker 集成测试（真 Headscale + 真 tailscaled：首次注册、运维过期后自动续期、重启幂等）、CI | `vpn/internal/*/*_test.go`、`vpn/integration/`、`.github/workflows/vpn-ci.yml` | ✅ 本地通过；CI 待首次运行 |
 | VPN-D 文档运维 | 本文、ADR-0005、README、vendor 锁定 | `docs/12-VPN-HEADSCALE.md`、`docs/adr/0005-*`、`vendors/references.lock.tsv` | ✅ |
+| VPN-M 并存模式 | `mode: auto/system/embedded`、`tsnet` 用户态节点、本机端口转发与 SOCKS5、`takeover` 默认关闭 | `vpn/internal/vpnd/{mode,embedded,forward}.go`、`docs/13` | ✅ 单测 + Docker 集成测试通过 |
+| VPN-O 运维 | 单组织 `bootstrap.sh init`、`add-tenant`、策略自动生成与重载、管理员入网、`ctl.sh`、Headplane 暴露档位、仅 VPN 内可达的管理面、可重复的隔离探针 | `deploy/vpn/{bootstrap.sh,ctl.sh,policy.py,test/probe.sh}`、`docs/14` | ✅ 47 项探针通过 |
+| VPN-G 局域网与网关 | 同局域网直连、不在局域网时 DERP 中继、子网网关（手动批准与 `autoApprovers`）的实测 | `vpn/integration/lan_test.go`、`docs/15` | ✅ 三个集成测试通过 |
+| VPN-W 加入码与网关向导 | 一个加入码入网，网络识别，网关一键推荐与启用，本机网页 | `docs/16` | ⏳ 开发中 |
+| VPN-L 许可证 | 传递依赖许可证白名单检查、第三方声明文件、CI 守卫 | `make licenses`、`vpn/THIRD_PARTY_NOTICES.md` | ✅ |
 | VPN-N 下一步 | 生产域名 + TLS + DERP 实测；OIDC 接入；Bridge Connector 读取 `/v1/status`；移动端引导页；Windows 服务；Headscale 备份/升级手册 | — | ⏳ 未开始 |
 
 ## 7. 测试与验收门禁
@@ -165,37 +177,59 @@ sequenceDiagram
   - 管理员通过 Tailscale SSH 登录两台 Local AI 成功，以 root 登录被拒。
   - 在 `policy.hujson` 里新增一个零节点租户的规则块，`policy check` 与 SIGHUP 重载都能通过。
   - 模板里的 `tests` 块默认注释掉：启用后，引用的租户必须已有节点，否则新增租户会被拒绝重载。各租户都有节点后，可以启用它防止规则写错；实测一条跨租户泄漏规则会被它拒绝。
+- **并存、局域网与网关的集成测试**（2026-10-27，本机 Docker，各自独立复现通过）：
+  - `TestEmbeddedAutoLeavesForeignTailscale`：系统 tailscaled 已登录另一台 Headscale 时，`auto` 选择嵌入式节点，原登录全程保持 Running；本机 `127.0.0.1:11434` 经转发把 65553 字节原样送到 `acme-local-ai`；过期后重新注册，重启沿用状态，全程共铸 2 把 key。
+  - `TestLanDirect`：同一网段的两个节点不经 DERP，直连走局域网地址（`pong via 10.250.204.4:41641`，3ms），不需要额外配置。`TestLanAwayRelay`：在不同网络、内嵌 DERP 下，`pong via DERP(lan)`，TCP 仍通。
+  - `TestGatewaySubnetRoute`：路由批准前不可达；手动批准与 `autoApprovers` 两种方式都能批准；批准后允许的端口通、其他端口被 ACL 拒绝；没开 `--accept-routes` 的成员拿不到路由。
+  - `deploy/vpn/test/probe.sh`：两个组织加管理员加网关加仅 VPN 内可达的管理面，47 项断言全部通过，可重复执行。
+  - 这些测试都是实验室明文注册或自签 CA，Docker 里的网络不能代替真实 NAT、Wi-Fi 客户端隔离、VLAN 与物理交换机，见 [15](15-VPN-LAN-AND-GATEWAY.md) 第 6 节。
 - **进入生产前的门禁**：真实域名 + Let's Encrypt + 反代；两台不同 NAT 后的真实设备通过 DERP 互通并 `tailscale ping`；macOS GUI 版 + Homebrew 版 + Ubuntu 三种客户端各跑通一次 `service install`；Headplane 以 API key 登录可见节点；两个租户各自的 Local AI 互不可达，并在公网环境复测一次。
 
 ## 8. 运维
 
+完整手册见 [14-VPN-OPERATIONS.md](14-VPN-OPERATIONS.md)。要点：
+
 0. **前提**：Headscale 必须以 `https://<域名>`（443 端口）对外，见第 7 节的生产约束。宿主机需要 Docker Compose v2 和 python3，不需要 Go。
-1. 把占位域名 `vpn.example.org` 换成真实域名，共三处：`headscale/config.yaml` 的 `server_url`，以及 `headplane/config.yaml` 的 `base_url` 和 `public_url`。`base_url` 不带 `/admin`。反代把 `vpn.example.org` 转到 `headscale:8080`，`/admin` 转到 `headplane:3000`，`enroll.example.org` 转到 `enroll:8787`。反代必须透传 Host 与 X-Forwarded-Proto，并支持 Upgrade。STUN 端口在生产中必须保持 udp/3478，因为 DERP map 通告的就是 3478。
-2. `bash deploy/vpn/bootstrap.sh acme` 首次引导时依次做下列事情。之后再执行 `bash deploy/vpn/bootstrap.sh globex` 就是新增租户：追加注册条目并重启 enroll，不动已有 token。
-   - 建 user，建 365 天服务用 API key，只写入 `deploy/vpn/enroll/headscale.apikey`。
-   - 生成 Headplane 的 `headplane/cookie_secret` 和 `.env`。
-   - 在容器里构建 enroll 镜像。为租户生成两条注册条目并打印两个 token：`<租户>` 给成员用；`<租户>-local-ai` 带 tag `tag:<租户>-local-ai`，限流 5 次/分钟。写入 `enroll/config.json`。
-   - 校验 `server_url` 是 https 且端口为 443。`policy.hujson` 里没有该租户规则时只警告，不中断。
-   - 拉起全部服务，最后执行 `check`。
-   - 以上生成物均已 gitignore。脚本可重复执行，不会覆盖已有的 key、secret 与配置。
-3. 在 `policy.hujson` 中为该租户复制 `TENANT BLOCK 1/3` 至 `3/3` 三块规则，执行 `headscale policy check -f /etc/headscale/policy.hujson`，再 `docker compose kill -s HUP headscale` 重载。
-4. 给组织：成员 token（放 `~/.idoris/enroll.token`）与客户端配置；成员执行 `idoris-vpnd service install --config ~/.idoris/vpnd.json`。
-5. Local AI 主机：使用带 `acl_tags: ["tag:<租户>-local-ai"]` 的注册条目和它的 token，hostname 设为 `<租户>-local-ai`。
-6. 轮换：`headscale apikeys expire/create` 后替换文件并重启 `enroll`；租户 token 加新 hash → 下发 → 删旧 hash。
-7. 观测：`metrics_listen_addr: 127.0.0.1:9090` 绑在容器内部，其他容器访问不到；要采集指标需改为 `0.0.0.0:9090`，且只放在内部网络、不发布端口。注册服务日志每次签发一行，`remote=` 目前记录的是反代 IP。客户端用 `idoris-vpnd status`。
-8. 备份：`db.sqlite` 连同 `-wal`/`-shm`、`noise_private.key`、`derp_server_private.key`，以及 `headplane-data` 卷。
+1. 把占位域名 `vpn.example.org` 换成真实域名（`headscale/config.yaml` 的 `server_url`，`headplane/config.yaml` 的 `base_url` 与 `public_url`）。反代把域名转到 `headscale:8080`，`/admin` 转到 `headplane:3000`，`enroll.<域名>` 转到 `enroll:8787`，透传 Host 与 X-Forwarded-Proto 并支持 Upgrade。STUN 端口生产中必须保持 udp/3478。
+2. **一个组织**：`bash deploy/vpn/bootstrap.sh init [--org office] [--admin admin] [--lan-cidr 192.168.1.0/24]`。它建用户和 API key、生成 Headplane cookie secret、渲染该组织的策略块并 `policy check` 后重载、创建 `admin` / 成员 / Local AI（以及可选的网关）注册项并只打印一次 token。可重复执行，不覆盖已有密钥。
+3. **再加一个组织**（进阶）：`bash deploy/vpn/bootstrap.sh add-tenant <名称>`。
+4. **日常操作**：SSH 上服务器用 `deploy/vpn/ctl.sh`（节点、过期与删除、路由批准、策略检查与重载、API key、日志、备份与恢复）。
+5. **管理 UI**：Headplane 默认只绑 `127.0.0.1`（配 SSH 隧道）；`HEADPLANE_BIND` 可改为办公室局域网地址；`--profile tailnet-admin` 让它只在 VPN 内可达，成员访问不到。
+6. **隔离回归**：`bash deploy/vpn/test/probe.sh`，两个组织加管理员加网关，47 项允许/拒绝断言。
+7. 备份内容：`db.sqlite`（含 `-wal`/`-shm`）、`noise_private.key`、`derp_server_private.key`、Headplane 数据卷。私钥必须和 sqlite 一起恢复。
+8. 观测：注册服务每次签发写一行审计日志，`remote=` 目前是反代 IP；客户端用 `idoris-vpnd status`。
 
 ## 9. 待决问题
 
-- **同机双 tailnet**：Tailscale 客户端同一时刻只能登录一个控制面。若成员本来就用公司 Tailscale，接管会断掉对方。备选方案是守护进程用 `tsnet` 在进程内自建一个用户态节点（不触碰系统 Tailscale），Bridge Connector 走该节点访问 Local AI；代价是失去系统级路由和 MagicDNS。需要产品决策。
-- **Headscale 单实例**：官方定位 self-hoster，无 HA；中小组织规模可接受，需明确备份（见第 8 节）与升级流程。
-- **共享实例还是每组织一套**：共享实例靠 ACL 按租户授权实现隔离，写错一条就会跨租户；每组织一套隔离最强，但运维成本线性增长。默认共享，由隔离要求高的客户选择独立部署，需要产品确认。
+已解决：
+
+- **同机双 tailnet**：不再是限制。`auto`/`embedded` 模式用进程内 `tsnet` 节点与系统 Tailscale 并存，限制是只有本机回环转发与 SOCKS5、没有系统级路由和 MagicDNS，见 [13](13-VPN-CLIENT-MODES.md)。移动端仍只能一个 VPN。
+- **共享实例还是每组织一套**：默认一个组织；多组织是显式的 `add-tenant`；隔离要求高的组织另起一套 `deploy/vpn`。
+- **管理员设备入网与服务器运维入口**：见 [14](14-VPN-OPERATIONS.md)。
+
+仍待决定：
+
+- **Headscale 单实例**：官方定位 self-hoster，无 HA；中小组织规模可接受，需明确备份与升级流程。
 - **审计日志的来源 IP**：注册服务目前不读 X-Forwarded-For，部署在反代后只能记录反代 IP。
 - **OIDC**：Headscale 支持 OIDC 注册，可作为移动端与无守护进程设备的登录方式；与 token 注册并存时的用户归属需设计。
-- **许可证**：Headscale/Tailscale（BSD-3）、Headplane（MIT）与本仓库 Apache-2.0 兼容；`vpn/go.mod` 引入 `tailscale.com` 的传递依赖需在发布前跑一次许可证扫描并写入 THIRD_PARTY_NOTICES。
 - **语言**：本组件用 Go 而非仓库其他部分规划的 Rust，理由见 [ADR-0005](adr/0005-vpn-tailscale-client-headscale-control.md)。
+- **容器镜像发布**：见第 10 节，发布前要换掉 Alpine 基础镜像。
+
+## 10. 许可证与合规
+
+本节是工程层面的核对，不是法律意见。
+
+- **整体结论**：本仓库以 Apache-2.0 发布没有许可证障碍。Headscale（BSD-3-Clause）、Headplane（MIT）作为独立容器运行，不修改、不链接、不随本仓库分发；官方 Tailscale 客户端只由用户自行安装，本仓库不分发。
+- **链接进二进制的依赖**：对 `idoris-vpnd` 与 `idoris-vpn-enroll` 在 linux、darwin、windows 三个系统上扫描，共 42 个第三方模块，许可证只有 Apache-2.0、BSD-2-Clause、BSD-3-Clause、MIT、ISC，没有 copyleft（GPL / AGPL / LGPL / MPL），Apache-2.0 的依赖里也没有 NOTICE 文件。
+- **自动守卫**：`make licenses`（`vpn/`）用固定版本的 go-licenses 检查，白名单之外的许可证（含 MPL、Unknown）直接失败，并检查 `vpn/THIRD_PARTY_NOTICES.md` 没有过期；`make notices` 重新生成该文件；CI 见 `.github/workflows/vpn-licenses.yml`。扩大白名单要经人工审阅，不是把许可证加进去让检查通过。
+- **署名**：BSD 许可要求二进制分发时保留版权声明，`THIRD_PARTY_NOTICES.md` 负责这件事，发布二进制时要一并带上。
+- **名称**：Tailscale 与 Headscale 的 LICENSE 第 3 条都禁止未经许可用版权人名字为衍生产品背书或推广。因此产品名不要含 Tailscale / Headscale，文档里只做描述性使用（"官方 Tailscale 客户端"、"基于 Headscale"），并写明与两者无隶属关系。没有查商标注册状态。
+- **容器镜像**：`deploy/vpn/enroll/Dockerfile` 的最终阶段是 `alpine:3.23`，其中 busybox、apk-tools、alpine-baselayout 等是 GPL-2.0-only，`ca-certificates-bundle` 含 MPL-2.0。当前是运维方自己构建自己用，没有问题；**一旦我们发布构建好的镜像**，就要同时提供这些包的对应源码或书面获取要约。更简单的做法是发布前把最终阶段换成 `scratch` / distroless static，并把 HEALTHCHECK 改成二进制自带的子命令（现在用的是 busybox `wget`）。这一项尚未改。
 
 ## 来源（2026-10-27 核验）
+
+- Tailscale 文档：[自定义控制服务器](https://tailscale.com/kb/1507/custom-control-server)、[多账号快速切换](https://tailscale.com/kb/1225/fast-user-switching)（同一设备同一时刻只有一个活跃账号、不能同时在多个 tailnet 收发包）
+- Headscale 文档：[支持的客户端](https://headscale.net/stable/about/clients/)（只列官方 Tailscale 客户端）
 
 - Headscale 文档：[API](https://headscale.net/stable/ref/api/)、[Features](https://headscale.net/stable/about/features/)、[DERP](https://headscale.net/stable/ref/derp/)、[OIDC](https://headscale.net/stable/ref/oidc/)、[Apple 客户端](https://headscale.net/stable/usage/connect/apple/)、[Web UI 列表](https://headscale.net/stable/ref/integration/web-ui/)、[Getting started](https://headscale.net/stable/usage/getting-started/)
 - Headscale v0.29.6 [OpenAPI](https://github.com/juanfont/headscale/blob/v0.29.6/gen/openapiv2/headscale/v1/headscale.swagger.json)、[config-example.yaml](https://github.com/juanfont/headscale/blob/v0.29.6/config-example.yaml)

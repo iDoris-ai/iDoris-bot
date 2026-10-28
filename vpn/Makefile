@@ -32,3 +32,33 @@ integration-lan:
 
 lint-integration:
 	golangci-lint run --build-tags integration ./...
+
+# Third-party license gate for the binaries under ./cmd (not tests).
+#
+# Allowlist, enforced by scripts/licenses.go (allowedLicenses):
+#   Apache-2.0, BSD-2-Clause, BSD-3-Clause, MIT, ISC
+#
+# Extending that list is a legal decision and needs a human review.
+# Read the new license text, decide it can be redistributed inside this
+# Apache-2.0 product, then add the SPDX name in scripts/licenses.go.
+# Do not add GPL, AGPL, LGPL, MPL, CC, or Unknown to make the check pass.
+# After any allowlist change, run `make notices` and commit
+# THIRD_PARTY_NOTICES.md in the same change.
+#
+# The scanner is `go run github.com/google/go-licenses@v1.6.0`.
+# `go run` builds that binary for the host. A wrapper then sets GOOS,
+# because putting GOOS on `go run` itself produces a binary that will
+# not start (exec format error).
+#
+# `make licenses` checks linux, darwin, and windows (amd64 and arm64,
+# CGO_ENABLED=0) and fails if THIRD_PARTY_NOTICES.md is stale.
+# VPN_LICENSES_PROBE_DIR points at an extra module to check with the same
+# allowlist. It cannot drop a package or add an allowed license.
+
+.PHONY: licenses notices
+
+licenses:
+	GO="$(GO)" $(GO) run -tags vpnlicenses ./scripts/licenses.go check
+
+notices:
+	GO="$(GO)" $(GO) run -tags vpnlicenses ./scripts/licenses.go notices

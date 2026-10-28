@@ -1,0 +1,38 @@
+name: vpn-licenses
+on:
+  push:
+    branches: [main]
+    paths:
+      - "vpn/go.mod"
+      - "vpn/go.sum"
+      - "vpn/**/*.go"
+      - "vpn/Makefile"
+      - "vpn/scripts/**"
+      - "vpn/THIRD_PARTY_NOTICES.md"
+      - ".github/workflows/vpn-licenses.yml"
+  pull_request:
+    paths:
+      - "vpn/go.mod"
+      - "vpn/go.sum"
+      - "vpn/**/*.go"
+      - "vpn/Makefile"
+      - "vpn/scripts/**"
+      - "vpn/THIRD_PARTY_NOTICES.md"
+      - ".github/workflows/vpn-licenses.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  licenses:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vpn
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: vpn/go.mod
+          cache-dependency-path: vpn/go.sum
+      - run: make licenses
