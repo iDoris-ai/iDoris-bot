@@ -158,6 +158,10 @@ func wantsForward(plan Plan) bool {
 	return plan.Role == join.RoleGateway && len(plan.Routes) > 0
 }
 
+// PlanEnablesForward reports whether applying this plan needs ip_forward.
+// The root continuation enables that and does not rewrite the user's files.
+func PlanEnablesForward(plan Plan) bool { return wantsForward(plan) }
+
 // defaultSOCKSListen is the authenticated loopback proxy a member or admin
 // gets when the config is embedded, or auto (which becomes embedded when the
 // system tailnet is foreign or down). The daemon writes the credential to
