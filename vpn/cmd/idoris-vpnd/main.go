@@ -404,6 +404,7 @@ func runCmd(args []string) error {
 		RecoverUnregistered: node.RecoverUnregistered,
 		MarkRegistered:      node.markRegistered,
 		Role:                cfg.Role,
+		Mode:                node.Mode,
 		Identity:            ident,
 		State:               binding,
 		EnrollUnreachable:   !enrollReachable,
@@ -518,7 +519,9 @@ func openBinding(cfg *vpnd.Config) (*vpnd.StateFile, error) {
 func accessOptions(cfg *vpnd.Config, mode, ourControl string, src vpnd.StatusSource, be vpnd.Backend, binding *vpnd.StateFile) (vpnd.AccessOptions, error) {
 	var owner *vpnd.LiveOwner
 	if rec, ok := src.(*vpnd.Reconciler); ok {
-		rec.SetRunMode(mode)
+		if err := rec.SetRunMode(mode); err != nil {
+			return vpnd.AccessOptions{}, err
+		}
 		owner = vpnd.NewLiveOwner(vpnd.LiveOwnerConfig{
 			Backend:    be,
 			Mode:       mode,
