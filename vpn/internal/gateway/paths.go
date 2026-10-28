@@ -17,29 +17,46 @@ type Paths struct {
 // operator gives none.
 const DefaultConfigName = "vpn.json"
 
-// PathsFor returns the paths for configPath. An empty configPath, or the default
-// <home>/.idoris/vpn.json, keeps the historical names (enroll.token and
-// gateway-plan.json). Any other config owns files named after it, in the same
-// directory: <stem>.enroll-token and <stem>.gateway-plan.json.
+// PathsFor returns the paths for configPath. An empty configPath, or a config
+// whose path is <dir>/.idoris/vpn.json (including the default under home),
+// keeps the historical names enroll.token and gateway-plan.json. Any other
+// config owns sidecars named from the whole file name, extension included, so
+// office.json and office.conf do not share a token or a plan:
+// office.json.enroll-token and office.json.gateway-plan.json.
 func PathsFor(home, configPath string) Paths {
 	base := filepath.Join(home, ".idoris")
 	def := filepath.Join(base, DefaultConfigName)
-	if configPath == "" || filepath.Clean(configPath) == def {
+	configPath = strings.TrimSpace(configPath)
+	cleaned := ""
+	if configPath != "" {
+		cleaned = filepath.Clean(configPath)
+	}
+	if configPath == "" || cleaned == filepath.Clean(def) || historicalDefaultConfig(cleaned) {
+		dir := base
+		cfg := def
+		if historicalDefaultConfig(cleaned) {
+			dir = filepath.Dir(cleaned)
+			cfg = cleaned
+		}
 		return Paths{
-			Config: def,
-			Token:  filepath.Join(base, "enroll.token"),
-			Plan:   filepath.Join(base, "gateway-plan.json"),
+			Config: cfg,
+			Token:  filepath.Join(dir, "enroll.token"),
+			Plan:   filepath.Join(dir, "gateway-plan.json"),
 		}
 	}
-	configPath = filepath.Clean(configPath)
-	dir := filepath.Dir(configPath)
-	stem := strings.TrimSuffix(filepath.Base(configPath), filepath.Ext(configPath))
-	if stem == "" {
-		stem = "config"
+	name := filepath.Base(cleaned)
+	if name == "" || name == "." || name == string(filepath.Separator) {
+		name = "config"
 	}
 	return Paths{
-		Config: configPath,
-		Token:  filepath.Join(dir, stem+".enroll-token"),
-		Plan:   filepath.Join(dir, stem+".gateway-plan.json"),
+		Config: cleaned,
+		Token:  filepath.Join(filepath.Dir(cleaned), name+".enroll-token"),
+		Plan:   filepath.Join(filepath.Dir(cleaned), name+".gateway-plan.json"),
 	}
+}
+
+// historicalDefaultConfig reports a path that is the historical default config
+// even when home is not available to compare against.
+func historicalDefaultConfig(cleaned string) bool {
+	return cleaned != "" && filepath.Base(cleaned) == DefaultConfigName && filepath.Base(filepath.Dir(cleaned)) == ".idoris"
 }

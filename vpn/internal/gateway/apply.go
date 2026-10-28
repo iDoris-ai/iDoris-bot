@@ -79,17 +79,21 @@ func Apply(plan Plan, host Host, opt ApplyOptions) (ApplyResult, error) {
 	if plan.ConfigPath == "" || plan.TokenFile == "" {
 		return ApplyResult{}, errors.New("gateway: plan is missing config_path or token_file")
 	}
-	if err := host.MkdirAll(filepath.Dir(plan.ConfigPath), 0o700); err != nil {
-		return ApplyResult{}, err
-	}
-	if err := host.MkdirAll(filepath.Dir(plan.TokenFile), 0o700); err != nil {
-		return ApplyResult{}, err
-	}
 	existing, haveConfig, err := readExistingConfig(host, plan.ConfigPath)
 	if err != nil {
 		return ApplyResult{}, err
 	}
 	if haveConfig {
+		// A config that still points at another file (the historical shared
+		// enroll.token, or a previous sidecar) keeps that file's bytes. The new
+		// token is written to this config's own sidecar and the config is updated
+		// to point there.
+		if pointer, ok := jsonStringField(existing, "enroll_token_file"); ok && strings.TrimSpace(pointer) != "" {
+			own := PathsFor("", plan.ConfigPath).Token
+			if filepath.Clean(pointer) != filepath.Clean(own) {
+				plan.TokenFile = own
+			}
+		}
 		oldURL, hasURL := jsonStringField(existing, "enroll_url")
 		if hasURL && oldURL != "" && oldURL != plan.EnrollURL && !opt.ReplaceExisting {
 			return ApplyResult{}, fmt.Errorf("gateway: %s is already enrolled with %s; pass --replace to switch it to %s", plan.ConfigPath, oldURL, plan.EnrollURL)
@@ -100,6 +104,12 @@ func Apply(plan Plan, host Host, opt ApplyOptions) (ApplyResult, error) {
 		return ApplyResult{}, err
 	}
 	if err := validateConfigBytes(raw); err != nil {
+		return ApplyResult{}, err
+	}
+	if err := host.MkdirAll(filepath.Dir(plan.ConfigPath), 0o700); err != nil {
+		return ApplyResult{}, err
+	}
+	if err := host.MkdirAll(filepath.Dir(plan.TokenFile), 0o700); err != nil {
 		return ApplyResult{}, err
 	}
 	if opt.Token != "" {

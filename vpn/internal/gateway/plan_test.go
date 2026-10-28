@@ -532,7 +532,7 @@ func TestR3W2MemberAndAdminSOCKS(t *testing.T) {
 	}
 	p.EnrollURL = "https://enroll.example.org"
 	p.ConfigPath = "/home/acme/.idoris/custom.json"
-	p.TokenFile = "/home/acme/.idoris/custom.enroll-token"
+	p.TokenFile = "/home/acme/.idoris/custom.json.enroll-token"
 	h := newMemHost(false, "darwin")
 	h.files[p.ConfigPath] = []byte("{\n  \"socks5_listen\": \"127.0.0.1:1055\",\n  \"socks5_auth_file\": \"/home/acme/.idoris/custom.auth\",\n  \"state_dir\": \"/var/lib/idoris/state\"\n}\n")
 	res, err := Apply(p, h, ApplyOptions{Token: token, NoService: true})

@@ -688,8 +688,8 @@ func r3w2SideConfigChecks(t *testing.T, e *wizEnv, enrollURL, gatewayCode, devic
 	if tok := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/enroll.token"); tok != tokenBefore {
 		t.Fatal("side joins rewrote the live enrollment token")
 	}
-	keepTok := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/keep.enroll-token")
-	memTok := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/member.enroll-token")
+	keepTok := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/keep.json.enroll-token")
+	memTok := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/member.json.enroll-token")
 	if strings.TrimSpace(keepTok) == strings.TrimSpace(tokenBefore) || strings.TrimSpace(memTok) == strings.TrimSpace(keepTok) {
 		t.Fatal("side configs did not keep distinct tokens")
 	}
