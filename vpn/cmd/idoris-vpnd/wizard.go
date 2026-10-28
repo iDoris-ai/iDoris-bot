@@ -514,13 +514,16 @@ func (d *deps) paths(config string) (idorisPaths, error) {
 		if err != nil {
 			return idorisPaths{}, fmt.Errorf("config path: %w", err)
 		}
-		config = abs
+		// An explicit config does not need a home directory. The historical
+		// default name is recognised from the path itself.
+		p := gateway.PathsFor("", abs)
+		return idorisPaths{config: p.Config, token: p.Token, plan: p.Plan}, nil
 	}
 	home, err := d.home()
 	if err != nil || home == "" {
 		return idorisPaths{}, fmt.Errorf("home directory: %w", err)
 	}
-	p := gateway.PathsFor(home, config)
+	p := gateway.PathsFor(home, "")
 	return idorisPaths{config: p.Config, token: p.Token, plan: p.Plan}, nil
 }
 
