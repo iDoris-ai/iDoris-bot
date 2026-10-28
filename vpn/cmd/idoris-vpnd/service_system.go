@@ -386,28 +386,28 @@ func installSystemdSystem(configPath string) error {
 	if err := validateExecutableAncestors(exe); err != nil {
 		return err
 	}
-	if err := copyProtectedExecutable(src, exeDir, exe); err != nil {
-		return err
-	}
 	cfg, err := os.ReadFile(configPath) //nolint:gosec // operator-chosen config copied into /etc
 	if err != nil {
 		return err
 	}
-	cfg, err = stageSystemSecrets(cfg, systemStateDir)
+	// Validate the unit and stage secrets before the installed binary or any
+	// live file is replaced. A rejected listener or a missing credential
+	// leaves the previous installation in place.
+	unit, stage, installed, err := prepareSystemInstall(exe, systemConfigPath, systemStateDir, cfg)
 	if err != nil {
 		return err
 	}
-	unit, err := renderSystemdSystemUnit(exe, systemConfigPath, cfg)
-	if err != nil {
+	defer func() { _ = os.RemoveAll(stage) }() //nolint:gosec // G703: stage is the directory prepareSystemInstall just created
+	if err := copyProtectedExecutable(src, exeDir, exe); err != nil {
 		return err
 	}
-	if err := writeRootFile(systemConfigDir, systemConfigPath, cfg, 0o600); err != nil {
+	if err := finishSystemInstall(stage, systemStateDir, systemConfigPath, installed); err != nil {
 		return err
 	}
 	// Every ReadWritePaths entry has to exist before systemd builds the
 	// namespace. StateDirectory and RuntimeDirectory recreate /var/lib/idoris
 	// and /run/idoris on boot; nested state directories are created here.
-	if err := provisionSystemPaths("", cfg); err != nil {
+	if err := provisionSystemPaths("", installed); err != nil {
 		return err
 	}
 	if err := os.WriteFile(systemUnitPath, []byte(unit), 0o600); err != nil { //nolint:gosec // fixed unit path under /etc/systemd/system
@@ -468,18 +468,23 @@ func installLaunchDaemon(configPath string) error {
 	if err := validateExecutableAncestors(exe); err != nil {
 		return err
 	}
-	if err := copyProtectedExecutable(src, exeDir, exe); err != nil {
-		return err
-	}
 	cfg, err := os.ReadFile(configPath) //nolint:gosec // operator-chosen config copied into /etc
 	if err != nil {
 		return err
 	}
-	cfg, err = stageSystemSecrets(cfg, systemStateDir)
+	// Same order as the systemd installer: a bad listener path or a missing
+	// credential must not overwrite the live token or config. The plist is
+	// rendered after that commit. The systemd unit text is what rejects
+	// /run/user; it is not installed on macOS.
+	_, stage, installed, err := prepareSystemInstall(exe, systemConfigPath, systemStateDir, cfg)
 	if err != nil {
 		return err
 	}
-	if err := writeRootFile(systemConfigDir, systemConfigPath, cfg, 0o600); err != nil {
+	defer func() { _ = os.RemoveAll(stage) }() //nolint:gosec // G703: stage is the directory prepareSystemInstall just created
+	if err := copyProtectedExecutable(src, exeDir, exe); err != nil {
+		return err
+	}
+	if err := finishSystemInstall(stage, systemStateDir, systemConfigPath, installed); err != nil {
 		return err
 	}
 	// STATE_DIRECTORY and the log paths in the plist. 0700 root: a LaunchDaemon
@@ -679,6 +684,65 @@ func activateSystemService(goos string, already bool) error {
 	}
 }
 
+// prepareSystemInstall renders the machine unit, which rejects a shared
+// runtime listener or state path, then copies credential files into a
+// sibling of liveState. It does not write liveState or liveConfig. On
+// failure the staging directory is removed. The caller removes it after a
+// successful finishSystemInstall.
+func prepareSystemInstall(exe, liveConfig, liveState string, cfg []byte) (string, string, []byte, error) {
+	unit, err := renderSystemdSystemUnit(exe, liveConfig, cfg)
+	if err != nil {
+		return "", "", nil, err
+	}
+	parent := filepath.Dir(liveState)
+	if parent == "" || parent == "." || parent == string(filepath.Separator) {
+		return "", "", nil, errors.New("system install: state directory has no parent")
+	}
+	if err := os.MkdirAll(parent, 0o750); err != nil {
+		return "", "", nil, err
+	}
+	stage, err := os.MkdirTemp(parent, ".idoris-stage-*")
+	if err != nil {
+		return "", "", nil, err
+	}
+	body, err := stageSystemSecrets(cfg, stage)
+	if err != nil {
+		_ = os.RemoveAll(stage) //nolint:gosec // G703: stage is the directory just created above
+		return "", "", nil, err
+	}
+	body, err = retargetStagedConfig(body, stage, liveState)
+	if err != nil {
+		_ = os.RemoveAll(stage) //nolint:gosec // G703: stage is the directory just created above
+		return "", "", nil, err
+	}
+	return unit, stage, body, nil
+}
+
+// finishSystemInstall moves staged credential files onto liveState and writes
+// the retargeted config. Call it only after prepareSystemInstall has succeeded.
+func finishSystemInstall(stage, liveState, liveConfig string, body []byte) error {
+	for _, name := range []string{"enroll_token", "auth_key", "socks5.auth"} {
+		src := filepath.Join(stage, name)
+		if _, err := os.Lstat(src); err != nil { //nolint:gosec // G703: src is a credential file inside the staging directory
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return err
+		}
+		if err := os.MkdirAll(liveState, 0o750); err != nil { //nolint:gosec // G301: state directory mode matches the install tree
+			return err
+		}
+		dest := filepath.Join(liveState, name)
+		if err := replaceFile(src, dest); err != nil {
+			return err
+		}
+		if err := chownSystemRoot(dest); err != nil {
+			return err
+		}
+	}
+	return writeRootFile(filepath.Dir(liveConfig), liveConfig, body, 0o600)
+}
+
 // stageSystemSecrets copies credential files into destDir as root-owned
 // 0600 files and rewrites the installed config to those paths.
 func stageSystemSecrets(cfg []byte, destDir string) ([]byte, error) {
@@ -759,70 +823,33 @@ type winInstallOps struct {
 	writeConfig func(dir, path string, data []byte) error
 	protectRest func(config, exeDir, exe string, creds []string) error
 	createTask  func(exe string) error
-	remove      func(dir string) error
-}
-
-func realWindowsInstallOps(exe string) winInstallOps {
-	return winInstallOps{
-		mkdir: func(dir string) error { return os.MkdirAll(dir, 0o750) }, //nolint:gosec // G703: fixed ProgramData directory
-		protectDir: func(dir string) error {
-			return protectWindowsInstall(dir, "", "", "", nil)
-		},
-		readConfig: func(path string) ([]byte, error) {
-			return os.ReadFile(path) //nolint:gosec // operator-chosen config copied into ProgramData
-		},
-		stage: stageWindowsConfig,
-		writeConfig: func(dir, path string, data []byte) error {
-			return writeRootFile(dir, path, data, 0o600)
-		},
-		protectRest: func(config, exeDir, exePath string, creds []string) error {
-			return protectWindowsInstall("", config, exeDir, exePath, creds)
-		},
-		createTask: func(exePath string) error {
-			args := renderSchtasksCreate(exePath, windowsConfigPath)
-			out, err := runServiceCommand("schtasks", args...)
-			if err != nil {
-				return fmt.Errorf("schtasks: %w: %s", err, strings.TrimSpace(string(out)))
-			}
-			return nil
-		},
-		remove: func(dir string) error { return os.RemoveAll(dir) }, //nolint:gosec // G703: fixed ProgramData directory
-	}
 }
 
 // arrangeWindowsInstall protects the destination, then writes secrets.
-// Any failure removes the partial installation.
+// It does not delete the live configuration directory. replaceWindowsTask
+// is the install path; this remains for the order of protect-before-secrets.
 func arrangeWindowsInstall(ops winInstallOps, exeDir, exe, configPath string) error {
-	cleanup := func() {
-		_ = ops.remove(windowsConfigDir)
-	}
 	if err := ops.mkdir(windowsConfigDir); err != nil {
 		return err
 	}
 	if err := ops.protectDir(windowsConfigDir); err != nil {
-		cleanup()
 		return err
 	}
 	cfg, err := ops.readConfig(configPath)
 	if err != nil {
-		cleanup()
 		return err
 	}
 	body, creds, err := ops.stage(cfg, windowsConfigDir)
 	if err != nil {
-		cleanup()
 		return err
 	}
 	if err := ops.writeConfig(windowsConfigDir, windowsConfigPath, body); err != nil {
-		cleanup()
 		return err
 	}
 	if err := ops.protectRest(windowsConfigPath, exeDir, exe, creds); err != nil {
-		cleanup()
 		return err
 	}
 	if err := ops.createTask(exe); err != nil {
-		cleanup()
 		return err
 	}
 	return nil

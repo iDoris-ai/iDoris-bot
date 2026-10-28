@@ -75,7 +75,7 @@ func replaceWindowsTask(spec windowsReplaceSpec) error {
 	if stage == live || strings.HasPrefix(stage, live+string(filepath.Separator)) {
 		return fmt.Errorf("windows install: staging directory %s is inside %s", spec.StagingDir, spec.LiveDir)
 	}
-	if err := os.MkdirAll(filepath.Dir(stage), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(stage), 0o750); err != nil {
 		return err
 	}
 	if err := os.Mkdir(stage, 0o750); err != nil {

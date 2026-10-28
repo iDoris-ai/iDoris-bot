@@ -207,20 +207,13 @@ func TestR4CWindowsInstallProtectsBeforeSecrets(t *testing.T) {
 			order = append(order, "task")
 			return nil
 		},
-		remove: func(dir string) error {
-			order = append(order, "remove")
-			if dir != windowsConfigDir {
-				t.Fatalf("remove %s", dir)
-			}
-			return nil
-		},
 	}
 	err := arrangeWindowsInstall(ops, `C:\Program Files\iDoris`, `C:\Program Files\iDoris\idoris-vpnd.exe`, `C:\cfg.json`)
 	if err == nil || !strings.Contains(err.Error(), "auth_key_file") {
 		t.Fatal(err)
 	}
 	got := strings.Join(order, ",")
-	want := "mkdir,protect-dir,read,stage,remove"
+	want := "mkdir,protect-dir,read,stage"
 	if got != want {
 		t.Fatalf("order %s", got)
 	}
