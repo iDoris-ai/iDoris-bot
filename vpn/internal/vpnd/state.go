@@ -178,7 +178,7 @@ func OpenState(path string) (*StateFile, error) {
 		return nil, err
 	}
 	s := &StateFile{path: path}
-	if _, err := os.Lstat(path); err != nil {
+	if _, err := os.Lstat(path); err != nil { //nolint:gosec // G703: daemon state file path
 		if errors.Is(err, os.ErrNotExist) {
 			return s, nil
 		}
