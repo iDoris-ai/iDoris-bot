@@ -24,7 +24,7 @@
   <p id="authority" class="authority">保存加入码后，这里会显示登记服务器。</p>
   <label class="check"><input id="confirm-authority" type="checkbox"> 这是我组织的服务器（this is my organisation's server）</label>
 
-  <p class="question">这台机器就是 Local AI 吗？</p>
+  <p id="ai-question" class="question">这台机器就是 Local AI 吗？</p>
   <div class="row">
     <button id="yes-ai" type="button">是，这台就是 Local AI</button>
     <button id="no-ai" type="button">不是，它是另一台设备</button>
@@ -35,12 +35,12 @@
   <div id="networks"></div>
   <div id="checks"></div>
 
-  <label class="block">设备 IP（只填一台，不扫描网段）
+  <label id="device-label" class="block">设备 IP（只填一台，不扫描网段）
     <input id="device" type="text" inputmode="decimal" autocomplete="off" spellcheck="false">
   </label>
   <button id="probe" type="button">测试能否到达</button>
   <p id="probe-state" class="hint"></p>
-  <label class="check"><input id="whole" type="checkbox"> 通告整个子网。这会暴露该网段上的每台设备，并且可能和成员家里的 192.168.0.0/24、192.168.1.0/24、10.0.0.0/24 撞车。默认只通告上面这一台的 /32。</label>
+  <label id="whole-label" class="check"><input id="whole" type="checkbox"> 通告整个子网。这会暴露该网段上的每台设备，并且可能和成员家里的 192.168.0.0/24、192.168.1.0/24、10.0.0.0/24 撞车。默认只通告上面这一台的 /32。</label>
 
   <button id="recommend" type="button">使用建议</button>
 </section>
