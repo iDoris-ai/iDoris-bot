@@ -53,13 +53,40 @@ var uiLauncherRoot = func() (string, error) {
 	return filepath.Join(root, "idoris", "ui-launch"), nil
 }
 
+// uiOpenerTimeout is how long a browser launcher may run before the wizard
+// treats it as started and leaves it alone. Tests shorten it.
+var uiOpenerTimeout = 3 * time.Second
+
 // uiStartBrowser is the process starter. Tests replace it and assert argv.
 var uiStartBrowser = func(argv []string) error {
+	return uiObserveOpener(argv, uiOpenerTimeout)
+}
+
+// uiObserveOpener starts argv and waits up to timeout. A non-zero exit or a
+// failure to start is an error. A process that is still running when the
+// timeout fires is left running: it may be the browser. timeout <= 0 uses
+// the default of a few seconds.
+func uiObserveOpener(argv []string, timeout time.Duration) error {
 	if len(argv) == 0 {
 		return nil
 	}
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
 	cmd := exec.Command(argv[0], argv[1:]...) //nolint:gosec // G204: argv[0] is open, xdg-open, or rundll32, chosen above
-	return cmd.Start()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return nil
+	}
 }
 
 // uiGOOS selects the browser opener. Tests set it to cover Windows on another OS.
@@ -68,6 +95,11 @@ var uiGOOS = runtime.GOOS
 // uiLauncherHint is printed when the wizard cannot open the launcher file.
 // The page URL has no sign-in secret, so it is not a substitute.
 const uiLauncherHint = "Open this file in a browser. It signs in, then loads the page. Opening the page URL by itself does not sign in:"
+
+// uiLauncherFallback is one stderr line printed when a browser was started,
+// including when the opener is still running. A launcher that exits 0 can
+// still have failed to show a window.
+const uiLauncherFallback = "If the browser did not open, open this file:"
 
 // uiBrowserArgv is the command line used to open the launcher file.
 // The secret is not an element: the file path is the only argument.
@@ -115,6 +147,7 @@ func uiPrepareOpen(srv *ui.Server, noOpen bool, open func([]string) error) (stri
 		fmt.Fprintln(os.Stderr, "idoris-vpnd: browser:", err)
 		return uiLauncherInstructions(path), nil
 	}
+	fmt.Fprintln(os.Stderr, uiLauncherFallback, path)
 	return srv.PageURL(), nil
 }
 
