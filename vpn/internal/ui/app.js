@@ -65,6 +65,11 @@
 
   var ready = bootstrap().catch(showError);
   var expectIdentity = null;
+  // The daemon retries discovery about every 30s. Ninety polls at 2s is
+  // three minutes (several retries). Then the page stops and names the
+  // still-unconfirmed identity instead of spinning with no explanation.
+  var unconfirmedPollLimit = 90;
+  var unconfirmedPolls = 0;
 
   function exposed(st, key) {
     if (!st || !Object.prototype.hasOwnProperty.call(st, key)) {
@@ -229,15 +234,54 @@
     return { scheme: scheme, host: host, path: path, userinfo: userinfo };
   }
 
+  function daemonNotice(st) {
+    var lines = [];
+    var warnings = st && st.warnings;
+    if (warnings && Object.prototype.toString.call(warnings) === "[object Array]") {
+      var i;
+      for (i = 0; i < warnings.length; i++) {
+        if (typeof warnings[i] === "string" && warnings[i] !== "") {
+          lines.push(warnings[i]);
+        }
+      }
+    }
+    if (st && typeof st.last_error === "string" && st.last_error !== "") {
+      var dup = false;
+      var j;
+      for (j = 0; j < lines.length; j++) {
+        if (lines[j] === st.last_error) {
+          dup = true;
+        }
+      }
+      if (!dup) {
+        lines.push(st.last_error);
+      }
+    }
+    return lines.join("\n");
+  }
+
+  function unconfirmedNote(st, timedOut) {
+    var note = timedOut ? "身份尚未确认，等待超时。" : "身份尚未确认，继续等待。";
+    var extra = daemonNotice(st);
+    if (extra) {
+      note += "\n" + extra;
+    }
+    return note;
+  }
+
   // Completion is the identity Apply just wrote. An empty expected control
   // URL means discovery did not name a server, so role is the only check.
   // Control URLs compare in canonical form, so a pinned spelling with a
   // trailing slash or an explicit :443 matches discovery. Tenant and token
   // fingerprint count only when the daemon status already carries a
-  // non-empty value for them.
+  // non-empty value for them. identity_unconfirmed means discovery has not
+  // confirmed this credential, so a matching fingerprint is not completion.
   function identityMatches(st) {
     if (!expectIdentity) {
       return true;
+    }
+    if (st && st.identity_unconfirmed === true) {
+      return false;
     }
     if (expectIdentity.role && st.role !== expectIdentity.role) {
       return false;
@@ -501,15 +545,38 @@
           text += "\n" + r.cidr + (r.approved ? " 已批准" : " 未批准");
         });
       }
-      document.getElementById("status").textContent = text;
+      var unconfirmed = st && st.identity_unconfirmed === true;
       if (phase === "connected" || phase === "routes-pending-approval") {
         if (!identityMatches(st)) {
-          document.getElementById("status").textContent = text + "\n正在运行的仍是上一份身份，继续等待新的服务。";
+          var note;
+          if (unconfirmed) {
+            unconfirmedPolls++;
+            if (unconfirmedPolls >= unconfirmedPollLimit) {
+              document.getElementById("status").textContent = text + "\n" + unconfirmedNote(st, true);
+              return;
+            }
+            note = unconfirmedNote(st, false);
+          } else {
+            unconfirmedPolls = 0;
+            note = "正在运行的仍是上一份身份，继续等待新的服务。";
+          }
+          document.getElementById("status").textContent = text + "\n" + note;
           window.setTimeout(poll, 2000);
           return;
         }
+        unconfirmedPolls = 0;
+        document.getElementById("status").textContent = text;
         return;
       }
+      if (unconfirmed) {
+        unconfirmedPolls++;
+        if (unconfirmedPolls >= unconfirmedPollLimit) {
+          document.getElementById("status").textContent = text + "\n" + unconfirmedNote(st, true);
+          return;
+        }
+        text += "\n" + unconfirmedNote(st, false);
+      }
+      document.getElementById("status").textContent = text;
       window.setTimeout(poll, 2000);
     }).catch(function () {
       window.setTimeout(poll, 2000);
@@ -528,6 +595,7 @@
         tenant: res.tenant || "",
         token_fingerprint: res.token_fingerprint || ""
       };
+      unconfirmedPolls = 0;
       var lines = ["配置已写入 " + (res.config_path || "")];
       lines.push("新身份：角色 " + (res.role || "") + "，主机 " + (res.hostname || "") + "，登记 " + (res.enroll_url || ""));
       if (boundURL) {
