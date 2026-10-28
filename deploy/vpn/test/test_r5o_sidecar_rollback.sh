@@ -56,11 +56,22 @@ _restore_sidecar_volume "$fast/snap" || die "sidecar volume restore failed"
 got="$(read_state)"
 [[ "$got" == "original-sidecar" ]] || die "helper left ${got}"
 
-echo "test: a snapshot with no sidecar tar removes a planted identity"
-rm -f "$fast/snap/sidecar-state.tar"
+echo "test: a snapshot that did not capture sidecar state leaves the volume"
+rm -f "$fast/snap/sidecar-state.tar" "$fast/snap/sidecar-absent"
 docker run --rm --network none -v "${sid_vol}:/data" "$alpine" \
   sh -c 'printf planted > /data/tailscaled.state'
-_restore_sidecar_volume "$fast/snap" || die "missing-tar sidecar restore failed"
+set +e
+_restore_sidecar_volume "$fast/snap"
+rc=$?
+set -e
+[[ "$rc" -ne 0 ]] || die "uncaptured sidecar restore reported success"
+got="$(read_state)"
+[[ "$got" == "planted" ]] || die "uncaptured snapshot changed identity: ${got}"
+
+echo "test: confirmed absence removes a planted identity"
+printf 'file\n' > "$fast/snap/sidecar-absent"
+chmod 600 "$fast/snap/sidecar-absent"
+_restore_sidecar_volume "$fast/snap" || die "confirmed-absent sidecar restore failed"
 got="$(read_state)"
 [[ "$got" == "MISSING" ]] || die "planted identity remained: ${got}"
 docker volume rm -f "$sid_vol" >/dev/null
