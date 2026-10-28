@@ -1299,12 +1299,25 @@ here, snap = sys.argv[1:]
 meta = os.path.join(snap, "META")
 if os.path.isfile(meta):
     for line in open(meta):
-        rel, uid, gid, mode = line.rstrip("\n").split(" ", 3)
-        src = os.path.join(snap, "files", rel)
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        kind, rel, uid, gid, mode = line.split(" ", 4)
         dest = os.path.join(here, rel)
         parent = os.path.dirname(dest)
-        if os.path.islink(parent) or os.path.islink(dest):
+        if (parent and os.path.islink(parent)) or os.path.islink(dest):
             sys.exit("refusing to roll back through symlink %s" % dest)
+        if kind == "d":
+            if os.path.lexists(dest) and not os.path.isdir(dest):
+                sys.exit("refusing to roll back directory onto %s" % dest)
+            os.makedirs(dest, exist_ok=True)
+            os.chmod(dest, int(mode, 8))
+            if os.geteuid() == 0:
+                os.chown(dest, int(uid), int(gid))
+            continue
+        if kind != "f":
+            sys.exit("snapshot META kind %s" % kind)
+        src = os.path.join(snap, "files", rel)
         os.makedirs(parent, exist_ok=True)
         shutil.copy2(src, dest)
         os.chmod(dest, int(mode, 8))
@@ -1446,6 +1459,7 @@ import os, shutil, sys
 here, dest = sys.argv[1:]
 rels = [
     "enroll/config.json",
+    "enroll/config.json.lock",
     "enroll/headscale.apikey",
     "enroll/minted-tokens.txt",
     "headplane/cookie_secret",
@@ -1458,6 +1472,12 @@ rels = [
 ]
 meta = []
 missing = []
+enroll_dir = os.path.join(here, "enroll")
+if os.path.islink(enroll_dir):
+    sys.exit("refusing to snapshot symlink enroll")
+if os.path.isdir(enroll_dir):
+    st = os.stat(enroll_dir)
+    meta.append("d enroll %d %d %o" % (st.st_uid, st.st_gid, st.st_mode & 0o777))
 for rel in rels:
     src = os.path.join(here, rel)
     if os.path.islink(src):
@@ -1467,7 +1487,7 @@ for rel in rels:
         os.makedirs(os.path.dirname(target), exist_ok=True)
         shutil.copy2(src, target)
         st = os.stat(src)
-        meta.append("%s %d %d %o" % (rel, st.st_uid, st.st_gid, st.st_mode & 0o777))
+        meta.append("f %s %d %d %o" % (rel, st.st_uid, st.st_gid, st.st_mode & 0o777))
     else:
         missing.append(rel)
 open(os.path.join(dest, "META"), "w").write("\n".join(meta) + ("\n" if meta else ""))
