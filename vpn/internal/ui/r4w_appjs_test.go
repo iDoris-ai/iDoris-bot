@@ -32,6 +32,31 @@ func TestR4WAppJSWaitsForTheNewIdentity(t *testing.T) {
 	}
 }
 
+func TestR4WAppJSHidesGatewayQuestionsForMember(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed")
+	}
+	app, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "smoke.mjs")
+	if err := os.WriteFile(script, []byte(r4wAppJSMemberSmoke), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "app.js"), app, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(node, script)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("node smoke: %v\n%s", err, out)
+	}
+}
+
 func TestR4WAppJSClearsConfirmationWhenSaving(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -212,5 +237,108 @@ const planB = calls.filter((c) => c.url === "/api/plan").pop();
 if (!planB || planB.body.authority !== "b.example" || planB.body.join_rev !== 2) {
   throw new Error("plan B " + JSON.stringify(planB && planB.body));
 }
+console.log("ok");
+`
+
+const r4wAppJSMemberSmoke = `import { readFileSync } from "node:fs";
+import vm from "node:vm";
+
+const elements = {};
+function el(id) {
+  if (!elements[id]) {
+    elements[id] = {
+      id, value: "", checked: false, textContent: "", disabled: false, hidden: false,
+      listeners: {},
+      addEventListener(type, fn) { this.listeners[type] = fn; },
+      classList: { add() {}, remove() {} },
+    };
+  }
+  return elements[id];
+}
+const calls = [];
+let joinN = 0;
+const fetch = async (url, opt) => {
+  calls.push({ url, body: opt && opt.body ? JSON.parse(opt.body) : null });
+  if (url === "/api/bootstrap") {
+    return { ok: true, status: 200, text: async () => JSON.stringify({ capability: "cap", csrf: "csrf" }) };
+  }
+  if (url === "/api/join") {
+    joinN++;
+    const role = joinN === 1 ? "member" : (joinN === 2 ? "admin" : "gateway");
+    return { ok: true, status: 200, text: async () => JSON.stringify({
+      authority: "enroll.example", join_rev: joinN, tenant: "acme", role
+    }) };
+  }
+  if (url === "/api/detect") {
+    return { ok: true, status: 200, text: async () => JSON.stringify({ candidates: [] }) };
+  }
+  if (url === "/api/plan") {
+    const role = (opt && opt.body && JSON.parse(opt.body).authority) ? "member" : "member";
+    return { ok: true, status: 200, text: async () => JSON.stringify({ role, mode: "auto", accept_routes: true }) };
+  }
+  return { ok: true, status: 200, text: async () => "{}" };
+};
+const document = { getElementById: el, querySelector() { return null; } };
+const context = {
+  document, fetch, Promise, JSON, Error,
+  sessionStorage: { getItem() { return null; }, setItem() {} },
+  location: { hash: "", pathname: "/", search: "" },
+  history: { replaceState() {} },
+  window: {},
+  console,
+  setTimeout,
+};
+context.window.history = context.history;
+context.window.location = context.location;
+context.window.setTimeout = setTimeout;
+vm.createContext(context);
+vm.runInContext(readFileSync(new URL("./app.js", import.meta.url), "utf8"), context);
+await new Promise((r) => setTimeout(r, 20));
+
+function hiddenGateway() {
+  return ["ai-question", "yes-ai", "no-ai", "detect", "device-label", "device", "probe", "whole-label"]
+    .every((id) => el(id).hidden === true);
+}
+
+el("code").value = "member-code";
+el("save-code").listeners.click();
+await new Promise((r) => setTimeout(r, 20));
+if (!hiddenGateway()) throw new Error("member save left gateway questions visible");
+if (!el("role-state").textContent.includes("成员")) throw new Error("member text " + el("role-state").textContent);
+el("confirm-authority").checked = true;
+el("device").value = "10.1.1.1";
+el("whole").checked = true;
+el("recommend").listeners.click();
+await new Promise((r) => setTimeout(r, 30));
+const memberPlan = calls.filter((c) => c.url === "/api/plan").pop();
+if (!memberPlan) throw new Error("member recommend did not post a plan");
+if (memberPlan.body.this_machine_is_local_ai !== false || memberPlan.body.whole_subnet !== false || memberPlan.body.device_ips.length !== 0) {
+  throw new Error("member plan kept gateway answers " + JSON.stringify(memberPlan.body));
+}
+if (calls.some((c) => c.url === "/api/detect")) throw new Error("member recommend detected the network");
+
+el("code").value = "admin-code";
+el("save-code").listeners.click();
+await new Promise((r) => setTimeout(r, 20));
+if (!hiddenGateway()) throw new Error("admin save showed gateway questions");
+if (!el("role-state").textContent.includes("管理员")) throw new Error("admin text " + el("role-state").textContent);
+el("confirm-authority").checked = true;
+el("recommend").listeners.click();
+await new Promise((r) => setTimeout(r, 30));
+if (calls.filter((c) => c.url === "/api/plan").length !== 2) throw new Error("admin recommend did not post a plan");
+if (calls.some((c) => c.url === "/api/detect")) throw new Error("admin recommend detected the network");
+
+el("code").value = "gateway-code";
+el("save-code").listeners.click();
+await new Promise((r) => setTimeout(r, 20));
+if (hiddenGateway()) throw new Error("gateway save kept the questions hidden");
+const plans = calls.filter((c) => c.url === "/api/plan").length;
+el("confirm-authority").checked = true;
+el("recommend").listeners.click();
+await new Promise((r) => setTimeout(r, 20));
+if (calls.filter((c) => c.url === "/api/plan").length !== plans) {
+  throw new Error("gateway recommend skipped the Local AI question");
+}
+if (!el("error").textContent.includes("Local AI")) throw new Error("missing question " + el("error").textContent);
 console.log("ok");
 `
