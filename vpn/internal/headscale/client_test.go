@@ -42,6 +42,32 @@ func TestCreatePreAuthKey(t *testing.T) {
 	}
 }
 
+func TestExpirePreAuthKey(t *testing.T) {
+	var gotPath, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.Method + " " + r.URL.Path
+		var m map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&m)
+		b, _ := json.Marshal(m)
+		gotBody = string(b)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	c := &Client{BaseURL: srv.URL, APIKey: "k"}
+	if err := c.ExpirePreAuthKey(context.Background(), "77"); err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "POST /api/v1/preauthkey/expire" {
+		t.Fatalf("path %s", gotPath)
+	}
+	if gotBody != `{"id":"77"}` {
+		t.Fatalf("body %s", gotBody)
+	}
+	if err := c.ExpirePreAuthKey(context.Background(), ""); err == nil {
+		t.Fatal("expected error for empty id")
+	}
+}
+
 func TestCreatePreAuthKeyValidation(t *testing.T) {
 	c := &Client{BaseURL: "http://127.0.0.1:1"}
 	if _, err := c.CreatePreAuthKey(context.Background(), CreatePreAuthKeyRequest{Expiration: time.Now()}); err == nil {
