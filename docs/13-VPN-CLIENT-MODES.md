@@ -335,6 +335,7 @@ Windows 用 `LockFileEx`（`LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY`�
 - `SwitchProfile` 之前的再读和 LocalAPI 调用之间仍有窗口。能控制本机 tailscaled 的用户可以谎报节点和 profile。
 - 状态文件锁持有到进程退出。同一进程里第二次打开同一路径可以成功。
 - 失败的 Windows 重装不删除 `C:\ProgramData\idoris`。新文件先写到旁边的暂存目录，核对通过才换上去；失败只删这一次的暂存目录。缺少凭据文件时，原来的 `vpn.json`、令牌和 `vpnd-state.json` 字节不变，也不执行 `schtasks /End`。任务已在跑时，先暂存，再 `/End`，轮询 `tasklist` 直到镜像退出（最多 30 秒），才替换可执行文件。安装程序自己就是那份 exe 时，任务改指向带时间戳的副本，不覆盖正在映射的文件。本机用临时目录和注入的命令跑过。没有在 Windows 上执行 `schtasks` 或 `icacls`。
+- 重装的提交不是事务。单元文件和安装配置在替换任何正在使用的文件之前已经渲染并校验；凭据先放进暂存目录，准备阶段失败只删暂存，不改正在运行的那一份。提交进行到一半失败时没有整次回滚：新的可执行文件或令牌可能已经落在旧配置旁边。再跑一次安装。这一轮没有为这个窗口加事务，也没有用失败注入去演练提交中途退出。
 - 用户级服务已经在跑时，重装要换进程。Linux 是 `systemctl --user daemon-reload` 然后 `restart`；第一次安装仍是 `enable --now`。macOS 已加载的 LaunchAgent 是 `bootout`、`bootstrap`、`kickstart -k`。命令顺序由注入的运行器核实。特权 bookworm 容器里没有 `/run/dbus`，`systemctl start user@` 和 `loginctl enable-linger` 都连不上总线，所以没有核实真实的用户服务 PID 变化。这一轮 `make integration` 里 `TestR5CSystemdUserServiceRestarts` 跳过 28.78s。`launchctl` 没有在这台 Mac 上执行。
 - 配置好的回环或 `unix:` 监听在启动时 bind 失败，进程不退出。`access_error` 带上地址和错误，每 30 秒重试，成功后清空。地址无法解析、不安全路径、凭据文件不合格仍在打开套接字之前失败。本机单测占用端口再放开，并用假后端在监听还没起来时把成员关系跑到 `connected`。
 
