@@ -286,6 +286,14 @@ func assignOwned(keys []string, vals map[string]json.RawMessage, plan Plan) ([]s
 	if err != nil {
 		return nil, err
 	}
+	// enroll_token and enroll_token_file are one setting. Installing the file
+	// removes the inline value, which the daemon would reject at start.
+	if plan.TokenFile != "" {
+		keys = dropJSONKey(keys, vals, "enroll_token")
+	}
+	if path, ok := jsonString(vals, "auth_key_file"); ok && strings.TrimSpace(path) != "" {
+		keys = dropJSONKey(keys, vals, "auth_key")
+	}
 	keys, err = assignRaw(keys, vals, "enroll_allow_insecure", true, plan.AllowInsecure)
 	if err != nil {
 		return nil, err
@@ -320,6 +328,20 @@ func assignOwned(keys []string, vals map[string]json.RawMessage, plan Plan) ([]s
 	}
 	routes := append([]string(nil), plan.Routes...)
 	return assignRaw(keys, vals, "advertise_routes", routes, len(routes) > 0)
+}
+
+func dropJSONKey(keys []string, vals map[string]json.RawMessage, key string) []string {
+	if _, ok := vals[key]; !ok {
+		return keys
+	}
+	delete(vals, key)
+	next := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if k != key {
+			next = append(next, k)
+		}
+	}
+	return next
 }
 
 func assignRaw(keys []string, vals map[string]json.RawMessage, key string, v any, include bool) ([]string, error) {
