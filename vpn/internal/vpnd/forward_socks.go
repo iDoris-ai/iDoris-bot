@@ -19,9 +19,9 @@ import (
 
 const socksHandshakeTimeout = 10 * time.Second
 
-func (a *LocalAccess) serveSOCKS(client net.Conn) {
+func (a *LocalAccess) serveSOCKS(client net.Conn, admitGen uint64) {
 	defer func() { _ = client.Close() }()
-	if !a.track(client) {
+	if !a.track(client, admitGen) {
 		return
 	}
 	defer a.untrack(client)
@@ -32,18 +32,18 @@ func (a *LocalAccess) serveSOCKS(client net.Conn) {
 		a.log.Debug("socks5 handshake failed", "err", err)
 		return
 	}
-	if !a.gateOpen() {
+	if !a.generationLive(admitGen) {
 		socksReply(client, 0x02)
 		return
 	}
-	upstream, err := a.dialUpstream(client, target)
+	upstream, err := a.dialUpstream(client, target, admitGen)
 	if err != nil {
 		a.log.Debug("socks5 dial failed", "target", target, "err", err)
 		socksReply(client, 0x05)
 		return
 	}
 	defer func() { _ = upstream.Close() }()
-	if !a.track(upstream) {
+	if !a.track(upstream, admitGen) {
 		return
 	}
 	defer a.untrack(upstream)
