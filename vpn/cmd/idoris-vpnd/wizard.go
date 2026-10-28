@@ -632,8 +632,14 @@ func (d *deps) printPlan(plan gateway.Plan) {
 
 func (d *deps) printResult(res gateway.ApplyResult) {
 	_, _ = fmt.Fprintf(d.stdout, "config: %s\n", res.ConfigPath)
+	if res.Role != "" || res.EnrollURL != "" || res.Hostname != "" {
+		_, _ = fmt.Fprintf(d.stdout, "identity: role=%s hostname=%s enroll=%s\n", res.Role, res.Hostname, res.EnrollURL)
+	}
+	if res.ControlURL != "" {
+		_, _ = fmt.Fprintf(d.stdout, "control: %s\n", res.ControlURL)
+	}
 	if res.ServiceInstalled {
-		_, _ = fmt.Fprintln(d.stdout, "service: installed")
+		_, _ = fmt.Fprintf(d.stdout, "service: installed role=%s hostname=%s enroll=%s\n", res.Role, res.Hostname, res.EnrollURL)
 	}
 	if res.IPForwardApplied {
 		_, _ = fmt.Fprintln(d.stdout, "ip-forward: enabled")

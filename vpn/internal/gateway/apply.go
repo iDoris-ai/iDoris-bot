@@ -48,6 +48,13 @@ type ApplyResult struct {
 	IPForwardApplied bool   `json:"ip_forward_applied"`
 	SudoCommand      string `json:"sudo_command,omitempty"`
 	ServiceInstalled bool   `json:"service_installed"`
+	// Role, Hostname, EnrollURL and ControlURL name the identity that was
+	// written. ControlURL is empty when the config does not pin one. Callers
+	// use this to tell a new identity from the daemon that is still running.
+	Role       string `json:"role,omitempty"`
+	Hostname   string `json:"hostname,omitempty"`
+	EnrollURL  string `json:"enroll_url,omitempty"`
+	ControlURL string `json:"control_url,omitempty"`
 	// AccessInfo is human-readable text telling the member how applications reach
 	// the Local AI (for example the loopback SOCKS5 address). It never holds a
 	// secret, only the path of the file that does.
@@ -122,7 +129,11 @@ func Apply(plan Plan, host Host, opt ApplyOptions) (ApplyResult, error) {
 	if err := host.WriteFile(plan.ConfigPath, raw, 0o600); err != nil {
 		return ApplyResult{}, err
 	}
-	res := ApplyResult{ConfigPath: plan.ConfigPath, TokenFile: plan.TokenFile, AccessInfo: access}
+	controlURL, _ := jsonStringField(raw, "control_url")
+	res := ApplyResult{
+		ConfigPath: plan.ConfigPath, TokenFile: plan.TokenFile, AccessInfo: access,
+		Role: plan.Role, Hostname: plan.Hostname, EnrollURL: plan.EnrollURL, ControlURL: controlURL,
+	}
 	if wantsForward(plan) {
 		if host.GOOS() != "linux" {
 			return res, errors.New("gateway: refusing to enable forwarding on a non-Linux host")

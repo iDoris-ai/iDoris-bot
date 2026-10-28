@@ -64,6 +64,20 @@
   }
 
   var ready = bootstrap().catch(showError);
+  var expectIdentity = null;
+
+  function identityMatches(st) {
+    if (!expectIdentity) {
+      return true;
+    }
+    if (expectIdentity.role && st.role !== expectIdentity.role) {
+      return false;
+    }
+    if (expectIdentity.control_url && st.control_url !== expectIdentity.control_url) {
+      return false;
+    }
+    return true;
+  }
 
   function post(path, body) {
     return ready.then(function () {
@@ -280,6 +294,11 @@
       }
       document.getElementById("status").textContent = text;
       if (phase === "connected" || phase === "routes-pending-approval") {
+        if (!identityMatches(st)) {
+          document.getElementById("status").textContent = text + "\n正在运行的仍是上一份身份，继续等待新的服务。";
+          window.setTimeout(poll, 2000);
+          return;
+        }
         return;
       }
       window.setTimeout(poll, 2000);
@@ -293,7 +312,15 @@
     var body = answers();
     body.replace_existing = !!(replaceBox && replaceBox.checked);
     post("/api/apply", body).then(function (res) {
+      expectIdentity = { role: res.role || "", control_url: res.control_url || "" };
       var lines = ["配置已写入 " + (res.config_path || "")];
+      lines.push("新身份：角色 " + (res.role || "") + "，主机 " + (res.hostname || "") + "，登记 " + (res.enroll_url || ""));
+      if (res.control_url) {
+        lines.push("控制服务器：" + res.control_url);
+      }
+      if (res.service_installed) {
+        lines.push("服务已按这份新身份安装。");
+      }
       if (res.sudo_command) {
         lines.push("当前不是 root，没有改系统转发。请原样执行：");
         lines.push(res.sudo_command);
