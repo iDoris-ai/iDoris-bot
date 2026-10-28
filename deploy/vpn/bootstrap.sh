@@ -201,13 +201,7 @@ fi
 # The enroll image is USER 65532 and must not run as root. A non-root
 # operator keeps their own uid so mode 0600 files stay readable. Root is
 # rewritten to 65532, and the secret files are chowned before start.
-enroll_uid="$(id -u)"
-enroll_gid="$(id -g)"
-if [[ "$enroll_uid" == 0 ]]; then
-  enroll_uid=65532
-  enroll_gid=65532
-  echo "bootstrap: refusing to run enroll as root; using uid 65532 (the image USER)" >&2
-fi
+read -r enroll_uid enroll_gid < <(select_enroll_runtime bootstrap)
 write_env_var ENROLL_UID "$enroll_uid"
 write_env_var ENROLL_GID "$enroll_gid"
 # Record the compose project before any container is created. A second

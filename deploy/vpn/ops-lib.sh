@@ -293,10 +293,27 @@ mark_deploy_dir() {
     sh -c 'umask 022; printf %s "$1" > /data/.idoris-deploy-dir' _ "$dir"
 }
 
+# Read /data/.idoris-deploy-dir. Exit 0 and print the marker when the file
+# was read. Exit 2 when the file is absent. Exit 1 when the read failed
+# (docker error, symlink, or not a regular file). Callers must not turn
+# exit 1 into an empty marker.
 _volume_deploy_dir() {
-  local vol="$1"
-  docker run --rm --network none -v "${vol}:/data:ro" "$ALPINE_VOLUME_IMAGE" \
-    sh -c 'if [ -f /data/.idoris-deploy-dir ]; then cat /data/.idoris-deploy-dir; fi'
+  local vol="$1" out rc
+  set +e
+  out="$(_docker_host run --rm --network none -v "${vol}:/data:ro" "$ALPINE_VOLUME_IMAGE" \
+    sh -c 'if [ ! -e /data/.idoris-deploy-dir ]; then exit 2; fi
+           if [ -L /data/.idoris-deploy-dir ] || [ ! -f /data/.idoris-deploy-dir ]; then exit 1; fi
+           cat /data/.idoris-deploy-dir' 2>/dev/null)"
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 2 ]]; then
+    return 2
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    return 1
+  fi
+  printf '%s' "$out"
+  return 0
 }
 
 _safe_volume_name() {
@@ -336,24 +353,27 @@ print("%s:%s" % (a, b))' "$spec"
 # Multi-arch index digest. Keep the tag so the version stays readable.
 ALPINE_VOLUME_IMAGE="${ALPINE_VOLUME_IMAGE:-alpine:3.23@sha256:ff7f0c727dd796aa36787bfcd9a64bf35a6ce72a73451b3359fde849b6703d63}"
 
+# Return 1 on failure. Rollback calls this from `if !`, where set -e is off,
+# and a die() there would skip the "rollback incomplete" message.
 wipe_headscale_wal() {
   local cid="$1" vol
   vol="$(volume_name_for "$cid" /var/lib/headscale)"
-  [[ -n "$vol" ]] || die "could not find the headscale data volume"
+  [[ -n "$vol" ]] || return 1
   docker run --rm --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
-    rm -f /data/db.sqlite-wal /data/db.sqlite-shm
+    rm -f /data/db.sqlite-wal /data/db.sqlite-shm || return 1
 }
 
 # docker cp writes root-owned files. Headscale's image is non-root and will
 # refuse to open them. Chown the volume to the image user while it is stopped.
+# Return 1 on failure (see wipe_headscale_wal).
 chown_volume_to_image() {
   local cid="$1" dest="$2" vol owner
   vol="$(volume_name_for "$cid" "$dest")"
-  [[ -n "$vol" ]] || die "no named volume mounted at $dest"
+  [[ -n "$vol" ]] || return 1
   owner="$(image_owner "$cid")"
-  [[ "$owner" =~ ^[0-9]+:[0-9]+$ ]] || die "refusing odd image user $owner"
+  [[ "$owner" =~ ^[0-9]+:[0-9]+$ ]] || return 1
   docker run --rm --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
-    chown -R "$owner" /data
+    chown -R "$owner" /data || return 1
 }
 
 # Create stopped containers for this mode when the host has none.
@@ -603,10 +623,13 @@ for item in data:
 }
 
 # Volumes survive `compose down`. A working_dir label, when the volume has
-# one, or the deploy-dir marker must be this directory. No label and no
-# marker is not proof of another directory.
+# one, or a readable deploy-dir marker must be this directory. No label and
+# no marker is not proof of another directory (`up` may adopt that volume).
+# A marker that cannot be read is a refusal, not an empty marker.
+# Restore uses require_restore_volume_ownership, which demands positive
+# evidence before it overwrites anything.
 reject_project_volumes() {
-  local want="$1" ours names name short labels marker err collision=""
+  local want="$1" ours names name short labels marker marker_rc err collision=""
   ours="$(cd "$here" && pwd -P)"
   names="$(mktemp "$here/.running.XXXXXX")"
   chmod 600 "$names"
@@ -674,10 +697,17 @@ if isinstance(cf, str) and cf:
       break
     fi
     if [[ "$name" == *_headscale-data || "$labels" == *'"com.docker.compose.volume":"headscale-data"'* || "$labels" == *'"com.docker.compose.volume": "headscale-data"'* ]]; then
-      marker="$(_volume_deploy_dir "$name" 2>/dev/null || true)"
+      set +e
+      marker="$(_volume_deploy_dir "$name")"
+      marker_rc=$?
+      set -e
       marker="${marker//$'\r'/}"
       marker="${marker//$'\n'/}"
-      if [[ -n "$marker" ]]; then
+      if [[ "$marker_rc" -eq 1 ]]; then
+        collision="could not read the deploy-directory marker on ${name}; refusing to treat an unreadable marker as empty"
+        break
+      fi
+      if [[ "$marker_rc" -eq 0 && -n "$marker" ]]; then
         if ! err="$(python3 -c '
 import os, sys
 ours, marker, name, want = sys.argv[1:]
@@ -696,6 +726,85 @@ raise SystemExit(1)
   done < "$names"
   rm -f "$names"
   [[ -z "$collision" ]] || die "$collision"
+}
+
+# Names of this project's data volumes, one per line. Empty when none exist.
+_project_data_volume_names() {
+  local project="$1" short name listed
+  listed="$(mktemp "$here/.running.XXXXXX")"
+  for short in headscale-data headscale-run headplane-data vpn-sidecar-state; do
+    name="${project}_${short}"
+    if _safe_volume_name "$name" && _docker_host volume inspect "$name" >/dev/null 2>&1; then
+      printf '%s\n' "$name" >> "$listed"
+    fi
+  done
+  if ! _docker_host volume ls -q --filter "label=com.docker.compose.project=${project}" >> "$listed"; then
+    rm -f "$listed"
+    return 1
+  fi
+  sort -u -o "$listed" "$listed"
+  # Drop blanks. volume ls prints nothing when the project has no labeled volumes.
+  grep -v '^$' "$listed" || true
+  rm -f "$listed"
+}
+
+# Restore overwrites existing volumes only with positive ownership evidence:
+# the headscale-data marker is this checkout, or there are no volumes, or
+# the operator passed --adopt-existing-volumes. A foreign marker stays a
+# refusal. An unreadable marker stays a refusal and is never an empty one.
+# adopt is 1 or 0. The adopt path prints the volumes and does not prompt.
+require_restore_volume_ownership() {
+  local project="$1" adopt="$2" ours data name marker marker_rc listed vols
+  ours="$(cd "$here" && pwd -P)"
+  vols="$(mktemp "$here/.running.XXXXXX")"
+  if ! _project_data_volume_names "$project" > "$vols"; then
+    rm -f "$vols"
+    die "could not list volumes for ${project}"
+  fi
+  if [[ ! -s "$vols" ]]; then
+    rm -f "$vols"
+    return 0
+  fi
+  data=""
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if [[ "$name" == *_headscale-data ]]; then
+      data="$name"
+    fi
+  done < "$vols"
+  if [[ -z "$data" ]]; then
+    data="$(_docker_host volume ls -q --filter "label=com.docker.compose.project=${project}" --filter "label=com.docker.compose.volume=headscale-data" 2>/dev/null | head -n1 || true)"
+  fi
+  if [[ -n "$data" ]]; then
+    set +e
+    marker="$(_volume_deploy_dir "$data")"
+    marker_rc=$?
+    set -e
+    marker="${marker//$'\r'/}"
+    marker="${marker//$'\n'/}"
+    if [[ "$marker_rc" -eq 1 ]]; then
+      rm -f "$vols"
+      die "could not read the deploy-directory marker on ${data}; refusing to treat an unreadable marker as empty"
+    fi
+    if [[ "$marker_rc" -eq 0 && -n "$marker" ]]; then
+      if python3 -c '
+import os, sys
+ours, marker = sys.argv[1:]
+raise SystemExit(0 if os.path.realpath(marker) == os.path.realpath(ours) else 1)
+' "$ours" "$marker"; then
+        rm -f "$vols"
+        return 0
+      fi
+      rm -f "$vols"
+      die "compose project ${project} has volume ${data} from ${marker}; pass --instance NAME or set COMPOSE_PROJECT_NAME"
+    fi
+  fi
+  listed="$(tr '\n' ' ' < "$vols" | sed 's/ *$//')"
+  rm -f "$vols"
+  if [[ "$adopt" != "1" ]]; then
+    die "refusing to overwrite existing volumes with no deploy-directory marker: ${listed}. Pass --adopt-existing-volumes to overwrite them"
+  fi
+  echo "restore: --adopt-existing-volumes will overwrite: ${listed}" >&2
 }
 
 # One knob for Headplane's origin and cookie. tunnel, lan and proxy publish
@@ -945,6 +1054,56 @@ normalize_admin_choice() {
   headplane_access="$access"
 }
 
+# select_enroll_runtime prints "uid gid" on stdout. A non-root operator keeps
+# their own ids. Root is rewritten to the image USER 65532. prefix is the
+# program name on the stderr notice.
+select_enroll_runtime() {
+  local prefix="${1:-enroll}" uid gid
+  uid="$(id -u)"
+  gid="$(id -g)"
+  if [[ "$uid" == 0 ]]; then
+    echo "${prefix}: refusing to run enroll as root; using uid 65532 (the image USER)" >&2
+    uid=65532
+    gid=65532
+  fi
+  printf '%s %s\n' "$uid" "$gid"
+}
+
+# listing_fixture_owner prints uid:gid for a read-only credential fixture.
+# The owner stays different from the enrollment runtime uid. Root chowns the
+# file. Anyone else prints the owner the file already has.
+listing_fixture_owner() {
+  local path="$1" runtime_uid="$2" owner
+  if [[ "$runtime_uid" == 65534 ]]; then
+    owner=65531
+  else
+    owner=65534
+  fi
+  if [[ "$(id -u)" == 0 ]]; then
+    chown "${owner}:${owner}" "$path"
+    printf '%s:%s\n' "$owner" "$owner"
+    return 0
+  fi
+  python3 - "$path" <<'PY'
+import os, sys
+st = os.stat(sys.argv[1])
+print("%d:%d" % (st.st_uid, st.st_gid))
+PY
+}
+
+# provision_enroll_tree gives the enrollment directory to the runtime ids.
+# Root sets directories to 0700 and files to 0600. A non-root caller already
+# owns the files and returns without changing them. Pass the enroll directory
+# only: headplane/cookie_secret belongs to the Headplane image user.
+provision_enroll_tree() {
+  local uid="$1" gid="$2" tree="$3"
+  [[ "$(id -u)" == 0 ]] || return 0
+  [[ "$uid" =~ ^[1-9][0-9]{0,9}$ && "$gid" =~ ^[1-9][0-9]{0,9}$ ]] || die "ENROLL_UID and ENROLL_GID must be non-zero numeric ids"
+  chown -R "${uid}:${gid}" "$tree"
+  find "$tree" -type d -exec chmod 700 {} +
+  find "$tree" -type f -exec chmod 600 {} +
+}
+
 # Same ownership bootstrap uses, but the uid comes from the deployment's
 # ENROLL_UID/GID. Root may chown. Anyone else can only chmod when the ids
 # already match; a different id has to be repaired by root.
@@ -1024,12 +1183,12 @@ copy_sidecar_state() {
 extract_sidecar_tar() {
   local tarpath="$1" sid vol
   sid="$(_compose_ps_id vpn-sidecar)"
-  [[ -n "$sid" ]] || die "vpn-sidecar container is missing"
+  [[ -n "$sid" ]] || return 1
   vol="$(volume_name_for "$sid" /var/lib/tailscale)"
-  [[ -n "$vol" ]] || die "no sidecar state volume"
+  [[ -n "$vol" ]] || return 1
   docker run --rm --user 0 --network none -v "${vol}:/data" -i "$ALPINE_VOLUME_IMAGE" \
-    tar -xf - -C /data < "$tarpath"
-  chown_volume_to_image "$sid" /var/lib/tailscale
+    tar -xf - -C /data < "$tarpath" || return 1
+  chown_volume_to_image "$sid" /var/lib/tailscale || return 1
 }
 
 assert_compose_bindings() {
@@ -1190,12 +1349,25 @@ here, snap = sys.argv[1:]
 meta = os.path.join(snap, "META")
 if os.path.isfile(meta):
     for line in open(meta):
-        rel, uid, gid, mode = line.rstrip("\n").split(" ", 3)
-        src = os.path.join(snap, "files", rel)
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        kind, rel, uid, gid, mode = line.split(" ", 4)
         dest = os.path.join(here, rel)
         parent = os.path.dirname(dest)
-        if os.path.islink(parent) or os.path.islink(dest):
+        if (parent and os.path.islink(parent)) or os.path.islink(dest):
             sys.exit("refusing to roll back through symlink %s" % dest)
+        if kind == "d":
+            if os.path.lexists(dest) and not os.path.isdir(dest):
+                sys.exit("refusing to roll back directory onto %s" % dest)
+            os.makedirs(dest, exist_ok=True)
+            os.chmod(dest, int(mode, 8))
+            if os.geteuid() == 0:
+                os.chown(dest, int(uid), int(gid))
+            continue
+        if kind != "f":
+            sys.exit("snapshot META kind %s" % kind)
+        src = os.path.join(snap, "files", rel)
         os.makedirs(parent, exist_ok=True)
         shutil.copy2(src, dest)
         os.chmod(dest, int(mode, 8))
@@ -1220,6 +1392,9 @@ PY
       if ! _restore_copy_volume_back "$_restore_vol" "${_restore_prev_mode}"; then
         _restore_copy_volume_alpine "$_restore_vol" || rc=1
       fi
+      # Sidecar state lives in a named volume. Dropping the containers this
+      # restore created must not leave the bundle's identity behind.
+      _restore_sidecar_volume "$_restore_vol" || rc=1
     fi
   fi
   COMPOSE_PROJECT_LOCK="${_restore_current}"
@@ -1227,6 +1402,68 @@ PY
     _recreate_original_services "$_restore_snap" "${_restore_prev_mode}" || rc=1
   fi
   return "$rc"
+}
+
+# The saved database is back only when its bytes match the snapshot.
+# A later successful command must not hide a failed copy. This runs under
+# `if !`, so set -e does not apply: every read failure returns 1.
+_restore_verify_database() {
+  local dest="$1" cid vol dir tmp rc
+  dir="$(mktemp -d "$here/.running.XXXXXX")" || return 1
+  tmp="$dir/db.sqlite"
+  cid="$(_compose_ps_id headscale)"
+  if [[ -n "$cid" ]]; then
+    set +e
+    docker cp "$cid:/var/lib/headscale/db.sqlite" "$tmp"
+    rc=$?
+    set -e
+  else
+    vol="$(_project_volume_name headscale-data 2>/dev/null || true)"
+    if [[ -z "$vol" ]]; then
+      rm -rf "$dir"
+      return 1
+    fi
+    set +e
+    _copy_volume_file_out "$vol" db.sqlite "$tmp"
+    rc=$?
+    set -e
+  fi
+  if [[ -s "$dest/headscale/db.sqlite" ]]; then
+    if [[ "$rc" -ne 0 || ! -s "$tmp" ]]; then
+      echo "restore: rollback could not read the restored database" >&2
+      rm -rf "$dir"
+      return 1
+    fi
+    python3 - "$dest/headscale/db.sqlite" "$tmp" <<'PY' || { rm -rf "$dir"; return 1; }
+import hashlib, sys
+def digest(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+snap, got = digest(sys.argv[1]), digest(sys.argv[2])
+if snap != got:
+    sys.stderr.write(
+        "restore: restored database checksum %s does not match snapshot %s\n" % (got, snap)
+    )
+    raise SystemExit(1)
+PY
+    rm -rf "$dir"
+    return 0
+  fi
+  if [[ "$rc" -eq 0 && -s "$tmp" ]]; then
+    echo "restore: rollback left a database the snapshot did not have" >&2
+    rm -rf "$dir"
+    return 1
+  fi
+  if [[ "$rc" -eq 1 ]]; then
+    echo "restore: rollback could not read the restored database" >&2
+    rm -rf "$dir"
+    return 1
+  fi
+  rm -rf "$dir"
+  return 0
 }
 
 _restore_copy_volume_back() {
@@ -1239,32 +1476,30 @@ _restore_copy_volume_back() {
   else
     compose stop headplane >/dev/null 2>&1 || true
   fi
-  docker cp "$dest/headscale/db.sqlite" "$hsid:/var/lib/headscale/db.sqlite"
-  docker cp "$dest/headscale/noise_private.key" "$hsid:/var/lib/headscale/noise_private.key"
+  docker cp "$dest/headscale/db.sqlite" "$hsid:/var/lib/headscale/db.sqlite" || return 1
+  docker cp "$dest/headscale/noise_private.key" "$hsid:/var/lib/headscale/noise_private.key" || return 1
   if [[ -f "$dest/headscale/derp_server_private.key" ]]; then
-    docker cp "$dest/headscale/derp_server_private.key" "$hsid:/var/lib/headscale/derp_server_private.key"
+    docker cp "$dest/headscale/derp_server_private.key" "$hsid:/var/lib/headscale/derp_server_private.key" || return 1
   fi
   if [[ -f "$dest/headscale/db.sqlite-wal" ]]; then
-    docker cp "$dest/headscale/db.sqlite-wal" "$hsid:/var/lib/headscale/db.sqlite-wal"
+    docker cp "$dest/headscale/db.sqlite-wal" "$hsid:/var/lib/headscale/db.sqlite-wal" || return 1
   else
-    wipe_headscale_wal "$hsid"
+    wipe_headscale_wal "$hsid" || return 1
   fi
   if [[ -f "$dest/headscale/db.sqlite-shm" ]]; then
-    docker cp "$dest/headscale/db.sqlite-shm" "$hsid:/var/lib/headscale/db.sqlite-shm"
+    docker cp "$dest/headscale/db.sqlite-shm" "$hsid:/var/lib/headscale/db.sqlite-shm" || return 1
   fi
-  chown_volume_to_image "$hsid" /var/lib/headscale
+  chown_volume_to_image "$hsid" /var/lib/headscale || return 1
   if [[ "$mode" == "tailnet-admin" ]]; then
     hpid="$(_compose_ps_id headplane-tailnet)"
   else
     hpid="$(_compose_ps_id headplane)"
   fi
   if [[ -n "$hpid" && -d "$dest/headplane" ]]; then
-    docker cp "$dest/headplane/." "$hpid:/var/lib/headplane/"
-    chown_volume_to_image "$hpid" /var/lib/headplane
+    docker cp "$dest/headplane/." "$hpid:/var/lib/headplane/" || return 1
+    chown_volume_to_image "$hpid" /var/lib/headplane || return 1
   fi
-  if [[ -s "$dest/sidecar-state.tar" && -n "$(_compose_ps_id vpn-sidecar)" ]]; then
-    extract_sidecar_tar "$dest/sidecar-state.tar"
-  fi
+  _restore_verify_database "$dest" || return 1
 }
 
 _snapshot_host_files() {
@@ -1274,6 +1509,7 @@ import os, shutil, sys
 here, dest = sys.argv[1:]
 rels = [
     "enroll/config.json",
+    "enroll/config.json.lock",
     "enroll/headscale.apikey",
     "enroll/minted-tokens.txt",
     "headplane/cookie_secret",
@@ -1286,6 +1522,12 @@ rels = [
 ]
 meta = []
 missing = []
+enroll_dir = os.path.join(here, "enroll")
+if os.path.islink(enroll_dir):
+    sys.exit("refusing to snapshot symlink enroll")
+if os.path.isdir(enroll_dir):
+    st = os.stat(enroll_dir)
+    meta.append("d enroll %d %d %o" % (st.st_uid, st.st_gid, st.st_mode & 0o777))
 for rel in rels:
     src = os.path.join(here, rel)
     if os.path.islink(src):
@@ -1295,7 +1537,7 @@ for rel in rels:
         os.makedirs(os.path.dirname(target), exist_ok=True)
         shutil.copy2(src, target)
         st = os.stat(src)
-        meta.append("%s %d %d %o" % (rel, st.st_uid, st.st_gid, st.st_mode & 0o777))
+        meta.append("f %s %d %d %o" % (rel, st.st_uid, st.st_gid, st.st_mode & 0o777))
     else:
         missing.append(rel)
 open(os.path.join(dest, "META"), "w").write("\n".join(meta) + ("\n" if meta else ""))
@@ -1470,6 +1712,7 @@ _restore_copy_volume_alpine() {
     # The retained volume had no database. A failed restore may have added one.
     docker run --rm --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
       rm -f /data/db.sqlite /data/db.sqlite-wal /data/db.sqlite-shm || return 1
+    _restore_verify_database "$dest" || return 1
     return 0
   fi
   files=(db.sqlite)
@@ -1477,8 +1720,8 @@ _restore_copy_volume_alpine() {
   [[ -s "$dest/headscale/derp_server_private.key" ]] && files+=(derp_server_private.key)
   [[ -s "$dest/headscale/db.sqlite-wal" ]] && files+=(db.sqlite-wal)
   [[ -s "$dest/headscale/db.sqlite-shm" ]] && files+=(db.sqlite-shm)
-  archive="$(mktemp "$here/.running.XXXXXX")"
-  tar -C "$dest/headscale" -cf "$archive" "${files[@]}"
+  archive="$(mktemp "$here/.running.XXXXXX")" || return 1
+  tar -C "$dest/headscale" -cf "$archive" "${files[@]}" || { rm -f "$archive"; return 1; }
   docker run --rm -i --user 0 --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
     tar -C /data -xf - < "$archive" || { rm -f "$archive"; return 1; }
   rm -f "$archive"
@@ -1494,12 +1737,82 @@ _restore_copy_volume_alpine() {
   if [[ -d "$dest/headplane" ]] && [[ -n "$(ls -A "$dest/headplane" 2>/dev/null || true)" ]]; then
     hp="$(_project_volume_name headplane-data 2>/dev/null || true)"
     if [[ -n "$hp" ]]; then
-      archive="$(mktemp "$here/.running.XXXXXX")"
-      tar -C "$dest/headplane" -cf "$archive" .
+      archive="$(mktemp "$here/.running.XXXXXX")" || return 1
+      tar -C "$dest/headplane" -cf "$archive" . || { rm -f "$archive"; return 1; }
       docker run --rm -i --user 0 --network none -v "${hp}:/data" "$ALPINE_VOLUME_IMAGE" \
         tar -C /data -xf - < "$archive" || { rm -f "$archive"; return 1; }
       rm -f "$archive"
     fi
+  fi
+  _restore_verify_database "$dest" || return 1
+  return 0
+}
+
+# Restore sidecar identity into the retained named volume. The vpn-sidecar
+# container is not required. Runs under rollback, so set -e is off.
+_restore_sidecar_volume() {
+  local dest="$1" vol owner dir rc
+  vol="$(_project_volume_name vpn-sidecar-state 2>/dev/null || true)"
+  if [[ -s "$dest/sidecar-state.tar" ]]; then
+    [[ -n "$vol" ]] || return 1
+    docker run --rm -i --user 0 --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
+      sh -c 'find /data -type f ! -name "*.sock" -exec rm -f {} + || true; tar -C /data -xf -' \
+      < "$dest/sidecar-state.tar" || return 1
+    owner="$(_image_user_from_compose vpn-sidecar 2>/dev/null || true)"
+    owner="${owner:-0:0}"
+    [[ "$owner" =~ ^[0-9]+:[0-9]+$ ]] || owner="0:0"
+    docker run --rm --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
+      chown -R "$owner" /data || return 1
+    dir="$(mktemp -d "$here/.running.XXXXXX")" || return 1
+    python3 - "$dest/sidecar-state.tar" "$dir/expected" <<'PY' || { rm -rf "$dir"; return 1; }
+import sys, tarfile
+tar_path, dest = sys.argv[1:]
+with tarfile.open(tar_path, "r:*") as tf:
+    wanted = None
+    for member in tf.getmembers():
+        name = member.name.replace("\\", "/").lstrip("./")
+        if name == "tailscaled.state" or name.endswith("/tailscaled.state"):
+            if member.isfile():
+                wanted = member
+                break
+    if wanted is None:
+        sys.stderr.write("restore: sidecar snapshot has no tailscaled.state\n")
+        raise SystemExit(1)
+    fh = tf.extractfile(wanted)
+    if fh is None:
+        raise SystemExit(1)
+    open(dest, "wb").write(fh.read())
+PY
+    set +e
+    _copy_volume_file_out "$vol" tailscaled.state "$dir/tailscaled.state"
+    rc=$?
+    set -e
+    if [[ "$rc" -ne 0 || ! -s "$dir/tailscaled.state" ]]; then
+      echo "restore: rollback could not read sidecar state" >&2
+      rm -rf "$dir"
+      return 1
+    fi
+    python3 - "$dir/expected" "$dir/tailscaled.state" <<'PY' || { rm -rf "$dir"; return 1; }
+import hashlib, sys
+def digest(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+snap, got = digest(sys.argv[1]), digest(sys.argv[2])
+if snap != got:
+    sys.stderr.write(
+        "restore: restored sidecar checksum %s does not match snapshot %s\n" % (got, snap)
+    )
+    raise SystemExit(1)
+PY
+    rm -rf "$dir"
+    return 0
+  fi
+  if [[ -n "$vol" ]]; then
+    docker run --rm --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
+      rm -f /data/tailscaled.state || return 1
   fi
   return 0
 }
@@ -1670,7 +1983,7 @@ _install_bundle_volumes() {
   hsid="$(_compose_ps_id headscale)"
   [[ -n "$hsid" ]] || die "headscale container is missing after create"
   if [[ ! -f "$bundle/headscale/db.sqlite-wal" ]]; then
-    wipe_headscale_wal "$hsid"
+    wipe_headscale_wal "$hsid" || die "could not wipe the headscale database journal"
   fi
   docker cp "$bundle/headscale/db.sqlite" "$hsid:/var/lib/headscale/db.sqlite"
   docker cp "$bundle/headscale/noise_private.key" "$hsid:/var/lib/headscale/noise_private.key"
@@ -1685,14 +1998,14 @@ _install_bundle_volumes() {
   if [[ -f "$bundle/headscale/db.sqlite-shm" ]]; then
     docker cp "$bundle/headscale/db.sqlite-shm" "$hsid:/var/lib/headscale/db.sqlite-shm"
   fi
-  chown_volume_to_image "$hsid" /var/lib/headscale
+  chown_volume_to_image "$hsid" /var/lib/headscale || die "could not chown the headscale volume"
   hpid="$(headplane_writer_id "$mode")"
   if [[ -d "$bundle/headplane" ]]; then
     docker cp "$bundle/headplane/." "$hpid:/var/lib/headplane/"
-    chown_volume_to_image "$hpid" /var/lib/headplane
+    chown_volume_to_image "$hpid" /var/lib/headplane || die "could not chown the headplane volume"
   fi
   if [[ "$mode" == "tailnet-admin" && -f "$bundle/sidecar/state.tar" ]]; then
-    extract_sidecar_tar "$bundle/sidecar/state.tar"
+    extract_sidecar_tar "$bundle/sidecar/state.tar" || die "could not restore sidecar state"
   fi
 }
 
@@ -1718,7 +2031,7 @@ _start_restored_stack() {
 }
 
 restore_deployment() {
-  local bundle="$1" info bundle_project ignored
+  local bundle="$1" adopt="${2:-0}" info bundle_project ignored
   [[ -d "$bundle" && ! -L "$bundle" ]] || die "backup directory is missing"
   info="$(python3 "$here/bundle.py" tree "$bundle")"
   bundle_project="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("dotenv", {}).get("COMPOSE_PROJECT_NAME", ""))' "$info")"
@@ -1742,6 +2055,9 @@ restore_deployment() {
   if [[ "$_restore_dest" != "$_restore_current" ]]; then
     reject_project_named "$_restore_dest"
   fi
+  # Before any snapshot or stop. Markerless volumes are not overwritten
+  # unless the operator named them with --adopt-existing-volumes.
+  require_restore_volume_ownership "$_restore_dest" "$adopt"
   _restore_host="$(mktemp -d "${TMPDIR:-/tmp}/idoris-vpn.XXXXXX")"
   _restore_vol="$(mktemp -d "${TMPDIR:-/tmp}/idoris-vpn.XXXXXX")"
   _restore_snap="$(mktemp "${TMPDIR:-/tmp}/idoris-vpn.XXXXXX")"

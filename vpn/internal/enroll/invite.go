@@ -85,6 +85,10 @@ func writeAtomic(path string, data []byte) error {
 		_ = f.Close()
 		return err
 	}
+	if err := preserveOwner(path, f, st); err != nil {
+		_ = f.Close()
+		return err
+	}
 	if err := f.Close(); err != nil {
 		return err
 	}
