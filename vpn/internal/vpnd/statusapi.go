@@ -46,6 +46,7 @@ func (v View) Snapshot() Snapshot {
 	if v.Access != nil {
 		snap.Forwards = v.Access.ForwardStatus()
 		snap.SOCKS5 = v.Access.SOCKS5Status()
+		snap.AccessError = v.Access.AccessError()
 	}
 	if embeddedMemberWithoutPath(snap) {
 		snap.Warnings = appendWarning(snap.Warnings, EmbeddedNoPathWarning)
@@ -128,6 +129,9 @@ func FormatStatus(st map[string]any) string {
 		fmt.Fprintf(&b, "%-13s %v\n", key+":", val)
 	}
 	line("phase", st["phase"])
+	if v, _ := st["access_error"].(string); v != "" {
+		line("access_error", v)
+	}
 	if st["mode"] != nil && st["mode"] != "" {
 		line("mode", st["mode"])
 	}

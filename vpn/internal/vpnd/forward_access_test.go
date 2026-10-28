@@ -300,8 +300,43 @@ func TestUnixStaleSocketIsReplacedAndLiveOneIsNot(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = ln.Close() }()
-	if _, err := StartAccess(&net.Dialer{}, []Forward{{Listen: "unix:" + live, Target: "127.0.0.1:1"}}, "", AccessOptions{}, nil); err == nil {
-		t.Fatal("took over a live socket")
+	served := make(chan struct{}, 1)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, _ = c.Write([]byte("owner"))
+			_ = c.Close()
+			select {
+			case served <- struct{}{}:
+			default:
+			}
+		}
+	}()
+	access, err = StartAccess(&net.Dialer{}, []Forward{{Listen: "unix:" + live, Target: "127.0.0.1:1"}}, "", AccessOptions{}, nil)
+	if err != nil {
+		t.Fatalf("bind conflict stopped the daemon: %v", err)
+	}
+	defer func() { _ = access.Close() }()
+	if access.AccessError() == "" {
+		t.Fatal("live socket was not reported")
+	}
+	c, err := net.Dial("unix", live)
+	if err != nil {
+		t.Fatalf("live socket was replaced: %v", err)
+	}
+	buf := make([]byte, 5)
+	_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(c, buf); err != nil || string(buf) != "owner" {
+		t.Fatalf("original listener did not serve the socket: %v %q", err, buf)
+	}
+	_ = c.Close()
+	select {
+	case <-served:
+	case <-time.After(2 * time.Second):
+		t.Fatal("original listener did not accept")
 	}
 }
 
