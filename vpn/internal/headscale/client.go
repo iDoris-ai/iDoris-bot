@@ -263,6 +263,20 @@ func (c *Client) CreatePreAuthKey(ctx context.Context, req CreatePreAuthKeyReque
 	return out.PreAuthKey, nil
 }
 
+// ExpirePreAuthKey invalidates one pre-auth key by id. Headscale v0.29
+// accepts POST /api/v1/preauthkey/expire with {"id":"<decimal>"}. The key
+// string itself is not sent. Callers use this when a key was minted under
+// an authorization that is no longer current and must not be handed out.
+func (c *Client) ExpirePreAuthKey(ctx context.Context, id string) error {
+	if id == "" {
+		return errors.New("headscale: ExpirePreAuthKey requires id")
+	}
+	in := struct {
+		ID string `json:"id"`
+	}{ID: id}
+	return c.do(ctx, http.MethodPost, "/api/v1/preauthkey/expire", nil, in, nil)
+}
+
 // ListNodes lists nodes, optionally restricted to a user (by name, as the
 // gateway expects for this endpoint).
 func (c *Client) ListNodes(ctx context.Context, userName string) ([]Node, error) {
