@@ -237,6 +237,9 @@ func writeInPlace(path string, data []byte) error {
 	if werr == nil {
 		werr = f.Sync()
 	}
+	if werr == nil {
+		werr = preserveOwner(resolved, f, st)
+	}
 	cerr := f.Close()
 	if werr != nil {
 		_ = restoreInPlace(resolved, original)
