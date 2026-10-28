@@ -55,6 +55,9 @@ type ApplyResult struct {
 	Hostname   string `json:"hostname,omitempty"`
 	EnrollURL  string `json:"enroll_url,omitempty"`
 	ControlURL string `json:"control_url,omitempty"`
+	// ControlPinDropped is true when a new enrollment authority replaced the
+	// previous one and the old control server pin was removed.
+	ControlPinDropped bool `json:"control_pin_dropped,omitempty"`
 	// AccessInfo is human-readable text telling the member how applications reach
 	// the Local AI (for example the loopback SOCKS5 address). It never holds a
 	// secret, only the path of the file that does.
@@ -130,9 +133,14 @@ func Apply(plan Plan, host Host, opt ApplyOptions) (ApplyResult, error) {
 		return ApplyResult{}, err
 	}
 	controlURL, _ := jsonStringField(raw, "control_url")
+	_, pinDropped := jsonStringField(existing, "control_url")
+	if !haveConfig || controlURL != "" || PreviousEnrollURL(existing) == "" || PreviousEnrollURL(existing) == plan.EnrollURL {
+		pinDropped = false
+	}
 	res := ApplyResult{
 		ConfigPath: plan.ConfigPath, TokenFile: plan.TokenFile, AccessInfo: access,
 		Role: plan.Role, Hostname: plan.Hostname, EnrollURL: plan.EnrollURL, ControlURL: controlURL,
+		ControlPinDropped: pinDropped,
 	}
 	if wantsForward(plan) {
 		if host.GOOS() != "linux" {
@@ -219,6 +227,19 @@ func mergeConfig(existing []byte, have bool, plan Plan) ([]byte, []string, error
 
 func assignOwned(keys []string, vals map[string]json.RawMessage, plan Plan) ([]string, error) {
 	var err error
+	oldURL, hasOld := jsonString(vals, "enroll_url")
+	if hasOld && oldURL != "" && oldURL != plan.EnrollURL {
+		if _, pinned := vals["control_url"]; pinned {
+			delete(vals, "control_url")
+			next := make([]string, 0, len(keys))
+			for _, k := range keys {
+				if k != "control_url" {
+					next = append(next, k)
+				}
+			}
+			keys = next
+		}
+	}
 	keys, err = assignRaw(keys, vals, "enroll_url", plan.EnrollURL, plan.EnrollURL != "")
 	if err != nil {
 		return nil, err
@@ -403,6 +424,16 @@ func parseObject(data []byte) ([]string, map[string]json.RawMessage, error) {
 		return nil, nil, errors.New("gateway: existing config is not a JSON object")
 	}
 	return keys, vals, nil
+}
+
+// PreviousEnrollURL reads enroll_url from a config document. Unknown keys are
+// ignored so the warning can be printed before the strict decoder runs.
+func PreviousEnrollURL(data []byte) string {
+	got, ok := jsonStringField(data, "enroll_url")
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(got)
 }
 
 func jsonStringField(data []byte, key string) (string, bool) {
