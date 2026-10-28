@@ -470,16 +470,18 @@ func readExistingConfig(host Host, path string) ([]byte, bool, error) {
 	return b, true, nil
 }
 
-// validateConfigBytes loads the merged document with vpnd.LoadConfig.
-// Keys the daemon schema does not know are kept in the written file, and the
-// loader sees a projection of the known keys so a forward-compatible field
-// does not fail the type check. Resolve then checks mode, role, forwards and
-// routes. A placeholder token avoids reading the real token file, which may
-// not have been written yet.
+// validateConfigBytes runs the exact document through the daemon's strict
+// decoder (DisallowUnknownFields via LoadConfig). Unsupported keys are named
+// and rejected before Apply writes anything. Resolve then checks mode, role,
+// forwards and routes. A placeholder token avoids reading the real token
+// file, which may not have been written yet.
 func validateConfigBytes(data []byte) error {
-	projected, err := projectKnownConfig(data)
+	bad, err := unknownConfigKeys(data)
 	if err != nil {
 		return err
+	}
+	if len(bad) > 0 {
+		return fmt.Errorf("gateway: config has unsupported keys: %s; remove them before joining, the daemon would refuse this file at start", strings.Join(bad, ", "))
 	}
 	dir, err := os.MkdirTemp("", "idoris-vpn-cfg-")
 	if err != nil {
@@ -487,7 +489,7 @@ func validateConfigBytes(data []byte) error {
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
 	path := filepath.Join(dir, "vpn.json")
-	if err := os.WriteFile(path, projected, 0o600); err != nil { //nolint:gosec // G703: path is under MkdirTemp
+	if err := os.WriteFile(path, data, 0o600); err != nil { //nolint:gosec // G703: path is under MkdirTemp
 		return err
 	}
 	cfg, err := vpnd.LoadConfig(path)
@@ -507,19 +509,19 @@ func validateConfigBytes(data []byte) error {
 	return nil
 }
 
-func projectKnownConfig(data []byte) ([]byte, error) {
-	keys, vals, err := parseObject(data)
+func unknownConfigKeys(data []byte) ([]string, error) {
+	keys, _, err := parseObject(data)
 	if err != nil {
 		return nil, err
 	}
 	known := knownConfigKeys()
-	var keep []string
+	var bad []string
 	for _, key := range keys {
-		if _, ok := known[key]; ok {
-			keep = append(keep, key)
+		if _, ok := known[key]; !ok {
+			bad = append(bad, key)
 		}
 	}
-	return emitObject(keep, vals), nil
+	return bad, nil
 }
 
 func knownConfigKeys() map[string]struct{} {
