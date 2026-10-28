@@ -207,6 +207,7 @@ func TestR5CWindowsReinstallStopsBeforeReplace(t *testing.T) {
 	spec.SrcExe = liveExe
 	spec.Active = true
 	spec.SelfPID = 42
+	spec.ExcludePID = 42
 	spec.ConfigSrc = cfgPath
 	spec.StagingDir = filepath.Join(root, "ProgramData", "idoris-install-self")
 	if err := replaceWindowsTask(spec); err != nil {
