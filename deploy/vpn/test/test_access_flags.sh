@@ -103,6 +103,15 @@ PY
       "${FLAG_ROOT:?}/headscale/managed.json"
     ;;
   run)
+    # The deploy-directory marker helpers also go through `docker run`. A
+    # volume this stub lists has no marker (exit 2 on read), and a marker
+    # write succeeds quietly. Everything else is the token hash helper below.
+    if [[ "$*" == *".idoris-deploy-dir"* ]]; then
+      if [[ "$*" == *"cat /data/.idoris-deploy-dir"* ]]; then
+        exit 2
+      fi
+      exit 0
+    fi
     nfile="${DOCKER_LOG}.n"
     n=0
     if [[ -f "$nfile" ]]; then
