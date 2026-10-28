@@ -746,6 +746,9 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	plan.AllowInsecure = held.AllowInsecure
 	plan.TokenFile = paths.token
 	plan.ConfigPath = paths.config
+	if raw, err := os.ReadFile(plan.ConfigPath); err == nil {
+		gateway.NoteControlPinDrop(&plan, gateway.PreviousEnrollURL(raw))
+	}
 	if discoverWarning != "" {
 		plan.Warnings = append(plan.Warnings, netdetect.Notice{Code: "discover", Text: discoverWarning})
 	}
