@@ -11,6 +11,17 @@ import (
 	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/fsutil"
 )
 
+func machineLockDir() (string, error) {
+	if os.Geteuid() != 0 {
+		return "", nil
+	}
+	return "/var/lib/idoris/locks", nil
+}
+
+func currentIsMachineController() bool {
+	return os.Geteuid() == 0
+}
+
 func acquireLock(path, kind string) (*ControllerLock, error) {
 	if err := fsutil.EnsurePrivateDir(dirOf(path)); err != nil {
 		return nil, err
