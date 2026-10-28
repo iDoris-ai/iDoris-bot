@@ -10,6 +10,10 @@ import (
 
 func supportsUnixModes() bool { return true }
 
+func protectSecretBeforeWrite(string) error { return nil }
+
+func protectPrivateDir(string, bool) error { return nil }
+
 func checkDirOwner(st os.FileInfo, dir string) error {
 	sys, ok := st.Sys().(*syscall.Stat_t)
 	if !ok {
