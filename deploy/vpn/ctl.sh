@@ -91,13 +91,17 @@ Usage: bash deploy/vpn/ctl.sh <command> [args]
                                  and no full hashes. An unlabeled credential
                                  is listed as "-".
   token revoke --entry NAME (--label LABEL | --hash-prefix HEX)
+                                 [--allow-empty]
                                  exactly one selector, passed to the enroll
                                  CLI. Then restart enroll. Refuses to remove
-                                 the last credential.
-  offboard --entry NAME (--label LABEL | --hash-prefix HEX) [--node-id N]
+                                 the last credential unless --allow-empty.
+  offboard --entry NAME (--label LABEL | --hash-prefix HEX)
+                                 [--node-id N] [--allow-empty]
                                  revoke that credential first. Only if revoke
                                  succeeds, expire and delete the node.
-                                 --node-id is optional.
+                                 --node-id is optional. Revoking the last
+                                 credential needs --allow-empty; without it
+                                 the node is not expired or deleted.
   logs [service] [--tail N]      service: headscale, headplane, enroll,
                                  vpn-sidecar, headplane-tailnet
   backup [DIR]                   stop the running Headplane writer and headscale,
@@ -210,7 +214,7 @@ require_one_selector() {
 # Return 2 when the CLI refuses to remove the last credential, 1 on any
 # other failure. This function does not expire or delete a node.
 revoke_one() {
-  local entry="$1" label="$2" prefix="$3"
+  local entry="$1" label="$2" prefix="$3" allow_empty="${4:-0}"
   local revoked line got_cmd got_entry got_label got_prefix extra
   local want shown
   local -a args
@@ -219,6 +223,9 @@ revoke_one() {
     args+=(--label "$label")
   else
     args+=(--hash-prefix "$prefix")
+  fi
+  if [[ "$allow_empty" == "1" ]]; then
+    args+=(--allow-empty)
   fi
   if ! revoked="$(enroll_cli "${args[@]}" 2>&1)"; then
     printf '%s\n' "$revoked" >&2
@@ -657,7 +664,7 @@ EOF
     fi
     apply_headplane_access "${access:-tunnel}"
     mode="$(read_admin_mode)"
-    if [[ "$mode" == "tailnet-admin" && -z "${VPN_SERVER_ENROLL_TOKEN:-}" ]]; then
+    if [[ "$mode" == "tailnet-admin" && -z "${VPN_SERVER_ENROLL_TOKEN:-}" ]] && ! sidecar_has_identity; then
       die "export VPN_SERVER_ENROLL_TOKEN (the vpn-server enrollment token) first"
     fi
     write_admin_mode "$mode"
@@ -806,24 +813,25 @@ if found != 1:
         enroll_cli list-credentials --config /work/config.json --entry "$entry"
         ;;
       revoke)
-        entry="" label="" prefix=""
+        entry="" label="" prefix="" allow_empty=0
         while [[ $# -gt 0 ]]; do
           case "$1" in
             --entry) entry="${2:-}"; shift 2 ;;
             --label) label="${2:-}"; shift 2 ;;
             --hash-prefix) prefix="${2:-}"; shift 2 ;;
+            --allow-empty) allow_empty=1; shift ;;
             *) die "unknown argument: $1" ;;
           esac
         done
-        [[ -n "$entry" ]] || die "usage: ctl.sh token revoke --entry NAME (--label LABEL | --hash-prefix HEX); exactly one of --label or --hash-prefix"
-        require_one_selector "$label" "$prefix" "usage: ctl.sh token revoke --entry NAME (--label LABEL | --hash-prefix HEX); exactly one of --label or --hash-prefix"
+        [[ -n "$entry" ]] || die "usage: ctl.sh token revoke --entry NAME (--label LABEL | --hash-prefix HEX) [--allow-empty]; exactly one of --label or --hash-prefix"
+        require_one_selector "$label" "$prefix" "usage: ctl.sh token revoke --entry NAME (--label LABEL | --hash-prefix HEX) [--allow-empty]; exactly one of --label or --hash-prefix"
         echo "revoking $entry ${label:-${prefix:0:8}}..."
         set +e
-        line="$(revoke_one "$entry" "$label" "$prefix")"
+        line="$(revoke_one "$entry" "$label" "$prefix" "$allow_empty")"
         rc=$?
         set -e
         if [[ "$rc" -eq 2 ]]; then
-          die "refusing to remove the last token for $entry; run ctl.sh token new first, then revoke this one"
+          die "refusing to remove the last token for $entry; pass --allow-empty to revoke the last credential"
         fi
         if [[ "$rc" -ne 0 ]]; then
           die "revoke failed; the node was not changed"
@@ -837,18 +845,19 @@ if found != 1:
     esac
     ;;
   offboard)
-    entry="" label="" prefix="" node=""
+    entry="" label="" prefix="" node="" allow_empty=0
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --entry) entry="${2:-}"; shift 2 ;;
         --label) label="${2:-}"; shift 2 ;;
         --hash-prefix) prefix="${2:-}"; shift 2 ;;
         --node-id) node="${2:-}"; shift 2 ;;
+        --allow-empty) allow_empty=1; shift ;;
         *) die "unknown argument: $1" ;;
       esac
     done
-    [[ -n "$entry" ]] || die "usage: ctl.sh offboard --entry NAME (--label LABEL | --hash-prefix HEX) [--node-id N]; exactly one of --label or --hash-prefix"
-    require_one_selector "$label" "$prefix" "usage: ctl.sh offboard --entry NAME (--label LABEL | --hash-prefix HEX) [--node-id N]; exactly one of --label or --hash-prefix"
+    [[ -n "$entry" ]] || die "usage: ctl.sh offboard --entry NAME (--label LABEL | --hash-prefix HEX) [--node-id N] [--allow-empty]; exactly one of --label or --hash-prefix"
+    require_one_selector "$label" "$prefix" "usage: ctl.sh offboard --entry NAME (--label LABEL | --hash-prefix HEX) [--node-id N] [--allow-empty]; exactly one of --label or --hash-prefix"
     if [[ -n "$node" ]]; then
       node="$(require_id "$node")"
     fi
@@ -858,11 +867,11 @@ if found != 1:
       echo "step 1: revoke $entry hash prefix ${prefix:0:8} (stop here if this fails)"
     fi
     set +e
-    line="$(revoke_one "$entry" "$label" "$prefix")"
+    line="$(revoke_one "$entry" "$label" "$prefix" "$allow_empty")"
     rc=$?
     set -e
     if [[ "$rc" -eq 2 ]]; then
-      die "refusing to remove the last token for $entry; the node was not expired or deleted"
+      die "refusing to remove the last token for $entry; pass --allow-empty to revoke the last credential. The node was not expired or deleted"
     fi
     if [[ "$rc" -ne 0 ]]; then
       die "revoke failed; the node was not expired or deleted"
