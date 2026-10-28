@@ -698,7 +698,7 @@ func r3w2SideConfigChecks(t *testing.T, e *wizEnv, enrollURL, gatewayCode, devic
 	if !strings.Contains(ls, "-rw-------") {
 		t.Fatalf("keep.json mode: %s", ls)
 	}
-	t.Log("EVIDENCE side config kept control_url across --replace; member SOCKS5 default written")
+	t.Log("EVIDENCE first join kept control_url; --replace dropped it; member SOCKS5 default written")
 }
 
 func (e *wizEnv) assertJoinPlan(t *testing.T, out string, nets wizNets, route string, auto bool) {
