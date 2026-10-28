@@ -57,6 +57,14 @@ type ApplyResult struct {
 	Hostname   string `json:"hostname,omitempty"`
 	EnrollURL  string `json:"enroll_url,omitempty"`
 	ControlURL string `json:"control_url,omitempty"`
+	// DiscoveryControlURL is the control server the applied credential
+	// authenticates to. It stays set when ControlURL is empty because the
+	// old pin was removed. Tenant is that credential's tenant.
+	// TokenFingerprint is vpnd.TokenFingerprint of the token just written.
+	// It is not the token.
+	DiscoveryControlURL string `json:"discovery_control_url,omitempty"`
+	Tenant              string `json:"tenant,omitempty"`
+	TokenFingerprint    string `json:"token_fingerprint,omitempty"`
 	// ControlPinDropped is true when a new enrollment authority replaced the
 	// previous one and the old control server pin was removed.
 	ControlPinDropped bool `json:"control_pin_dropped,omitempty"`
@@ -142,7 +150,10 @@ func Apply(plan Plan, host Host, opt ApplyOptions) (ApplyResult, error) {
 	res := ApplyResult{
 		ConfigPath: plan.ConfigPath, TokenFile: plan.TokenFile, AccessInfo: access,
 		Role: plan.Role, Hostname: plan.Hostname, EnrollURL: plan.EnrollURL, ControlURL: controlURL,
-		ControlPinDropped: pinDropped,
+		ControlPinDropped:   pinDropped,
+		DiscoveryControlURL: strings.TrimSpace(plan.DiscoveryControlURL),
+		Tenant:              strings.TrimSpace(plan.Tenant),
+		TokenFingerprint:    vpnd.TokenFingerprint(opt.Token),
 	}
 	if wantsForward(plan) {
 		if host.GOOS() != "linux" {
