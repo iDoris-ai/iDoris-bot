@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -190,6 +191,14 @@ type Minter interface {
 	CreatePreAuthKey(ctx context.Context, req headscale.CreatePreAuthKeyRequest) (*headscale.PreAuthKey, error)
 }
 
+// preAuthExpirer expires a key this process just minted. *headscale.Client
+// implements it. The key string is not part of the call. A minter that does
+// not implement it cannot be asked to expire; the handler still withholds
+// the key when authorization changed during the mint.
+type preAuthExpirer interface {
+	ExpirePreAuthKey(ctx context.Context, id string) error
+}
+
 // Server is the HTTP enrollment endpoint.
 type Server struct {
 	cfg    Config
@@ -199,7 +208,10 @@ type Server struct {
 
 	mu      sync.Mutex
 	trusted []netip.Prefix
-	buckets map[string]*bucket
+	// generation increments on every successful Reload. A mint captures the
+	// value it authorized under and rechecks after Headscale returns.
+	generation uint64
+	buckets    map[string]*bucket
 	// authLogNext is the earliest time another failed-auth warning may be logged.
 	authLogNext time.Time
 	// authLogSkipped counts warnings dropped since the last one that was logged.
@@ -238,12 +250,13 @@ func NewServer(cfg Config, minter Minter, log *slog.Logger) (*Server, error) {
 		log = slog.Default()
 	}
 	return &Server{
-		cfg:     cfg,
-		minter:  minter,
-		log:     log,
-		now:     time.Now,
-		trusted: append([]netip.Prefix(nil), cfg.trusted...),
-		buckets: map[string]*bucket{},
+		cfg:        cfg,
+		minter:     minter,
+		log:        log,
+		now:        time.Now,
+		trusted:    append([]netip.Prefix(nil), cfg.trusted...),
+		generation: 1,
+		buckets:    map[string]*bucket{},
 	}, nil
 }
 
@@ -284,6 +297,7 @@ func (s *Server) Reload(cfg Config) error {
 	s.mu.Lock()
 	s.cfg = cfg
 	s.trusted = append([]netip.Prefix(nil), cfg.trusted...)
+	s.generation++
 	s.mu.Unlock()
 	return nil
 }
@@ -390,30 +404,76 @@ func bearerToken(r *http.Request) string {
 	return strings.TrimSpace(auth[len(prefix):])
 }
 
-// credentialStillAccepted reports whether token is still a hash of tenantName
-// in the config loaded now. It walks every hash, like lookupLocked, so the
-// match does not stop early.
-func (s *Server) credentialStillAccepted(tenantName, token string) bool {
+// issuedAuth is the authorization a mint is bound to. generation is the
+// config install counter at capture time. The other fields are what Headscale
+// was asked to put on the key.
+type issuedAuth struct {
+	generation uint64
+	tenant     string
+	userID     string
+	tags       []string
+	ephemeral  bool
+	ttl        time.Duration
+	token      string
+}
+
+// currentMintAuth reads the config under the lock and returns the
+// authorization to mint under. ok is false when token is not accepted for
+// tenantName. The caller does not hold s.mu.
+func (s *Server) currentMintAuth(tenantName, token string) (issuedAuth, bool) {
 	if token == "" {
-		return false
+		return issuedAuth{}, false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	want := sha256.Sum256([]byte(token))
-	matched := ""
-	for i := range s.cfg.Tenants {
-		t := &s.cfg.Tenants[i]
-		for _, h := range t.TokenHashes {
-			b, err := hex.DecodeString(h)
-			if err != nil || len(b) != sha256.Size {
-				continue
-			}
-			if subtle.ConstantTimeCompare(b, want[:]) == 1 && matched == "" {
-				matched = t.Name
-			}
-		}
+	t, _, ok := s.lookupLocked(token)
+	if !ok || t.Name != tenantName {
+		return issuedAuth{}, false
 	}
-	return matched != "" && matched == tenantName
+	return issuedAuth{
+		generation: s.generation,
+		tenant:     t.Name,
+		userID:     t.HeadscaleUserID,
+		tags:       append([]string(nil), t.ACLTags...),
+		ephemeral:  t.Ephemeral,
+		ttl:        time.Duration(t.PreAuthTTL),
+		token:      token,
+	}, true
+}
+
+// mintStillAuthorized reports whether the authorization captured before the
+// mint is still the current one. The caller does not hold s.mu. An unchanged
+// generation means no config install landed during the mint. A newer
+// generation is delivered only when the credential is still accepted for the
+// same tenant, with the same Headscale user and the same tags.
+func (s *Server) mintStillAuthorized(a issuedAuth) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.generation == a.generation {
+		return true
+	}
+	t, _, ok := s.lookupLocked(a.token)
+	if !ok || t.Name != a.tenant || t.HeadscaleUserID != a.userID {
+		return false
+	}
+	return slices.Equal(t.ACLTags, a.tags)
+}
+
+// expireMintedKey asks Headscale to expire a key that must not be returned.
+// The key string is not logged. A failure is logged and still not returned.
+func (s *Server) expireMintedKey(ctx context.Context, key *headscale.PreAuthKey) {
+	id := ""
+	if key != nil {
+		id = key.ID
+	}
+	expirer, ok := s.minterNow().(preAuthExpirer)
+	if !ok || id == "" {
+		s.log.Error("enroll: cannot expire a key minted under superseded authorization", "key_id", id)
+		return
+	}
+	if err := expirer.ExpirePreAuthKey(ctx, id); err != nil {
+		s.log.Error("enroll: expire key minted under superseded authorization", "key_id", id, "err", err)
+	}
 }
 
 func auditLabel(label string) string {
@@ -451,12 +511,13 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
 		return
 	}
-	// Authentication ran before the body was read. A slow body can outlive
-	// a revoke and a reload. Refuse unless this hash is still accepted for
-	// this tenant by the config that is current now. Do this before the
-	// per-tenant enroll bucket and before minting, so a revoked credential
-	// does not spend that budget or receive a key.
-	if !s.credentialStillAccepted(tenant.Name, bearerToken(r)) {
+	// Authentication ran before the body was read. A slow body, and the mint
+	// itself, can outlive a reload. Capture the authorization that is current
+	// now, mint outside the lock, then accept the key only if that
+	// authorization is still current. A revoked credential does not spend the
+	// per-tenant enroll bucket and does not receive a key.
+	auth, still := s.currentMintAuth(tenant.Name, bearerToken(r))
+	if !still {
 		s.sampleWarn("rejected: unknown token", "path", r.URL.Path, "remote", remote)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid token"})
 		return
@@ -466,7 +527,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limited"})
 		return
 	}
-	ttl := time.Duration(tenant.PreAuthTTL)
+	ttl := auth.ttl
 	if ttl <= 0 {
 		ttl = 10 * time.Minute
 	}
@@ -474,15 +535,25 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 	key, err := s.minterNow().CreatePreAuthKey(ctx, headscale.CreatePreAuthKeyRequest{
-		UserID:     tenant.HeadscaleUserID,
+		UserID:     auth.userID,
 		Reusable:   false,
-		Ephemeral:  tenant.Ephemeral,
+		Ephemeral:  auth.ephemeral,
 		Expiration: exp,
-		ACLTags:    tenant.ACLTags,
+		ACLTags:    auth.tags,
 	})
 	if err != nil {
 		s.log.Error("enroll: headscale preauthkey failed", "tenant", tenant.Name, "err", err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "control server unavailable"})
+		return
+	}
+	if !s.mintStillAuthorized(auth) {
+		// Expire on a fresh context. The client may already have gone away,
+		// and the minted key must still be invalidated.
+		ectx, ecancel := context.WithTimeout(context.Background(), 15*time.Second)
+		s.expireMintedKey(ectx, key)
+		ecancel()
+		s.sampleWarn("rejected: unknown token", "path", r.URL.Path, "remote", remote)
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid token"})
 		return
 	}
 	s.log.Info("enrolled", "tenant", tenant.Name, "label", auditLabel(label), "remote", remote, "hostname", req.Hostname, "os", req.OS, "key_id", key.ID, "expires_at", exp.UTC().Format(time.RFC3339))
@@ -491,6 +562,6 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		AuthKey:    key.Key,
 		ExpiresAt:  exp.UTC(),
 		Tenant:     tenant.Name,
-		ACLTags:    tenant.ACLTags,
+		ACLTags:    auth.tags,
 	})
 }
