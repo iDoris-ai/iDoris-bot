@@ -32,7 +32,7 @@ CGO_ENABLED=0 go build -trimpath -o idoris-vpnd ./cmd/idoris-vpnd
 操作员给你两样东西：注册服务的公网地址（`https://enroll.example.org` 这种，没有路径），以及一枚 token 或一条加入码（`idoris-join-v1.` 开头）。
 
 1. 控制服务器必须**逐字**等于 Headscale 的 `server_url`：`https`，端口 443，没有路径，没有多余的斜杠。多一个端口、用了 `http`、或写成注册服务的地址，客户端都会走到别的协调服务器。实验室里的 `http://headscale:8080` 只存在于探针，不能写进成员的配置。
-2. token 放在只有自己可读的文件里，例如 `chmod 600 ~/.idoris/enroll.token`，文件内容就是那一行 token。
+2. token 放在只有自己可读的文件里，例如 `chmod 600 ~/.idoris/enroll.token`，文件内容就是那一行 token。（用向导 `idoris-vpnd join` 或本机页面加入时，令牌会自动放在配置旁边的 `<配置文件名>.enroll-token`，默认配置就是 `~/.idoris/vpn.json.enroll-token`；手写配置可以用任意路径，下面的 `enroll.token` 只是例子。）
 3. MagicDNS 名字是 `<主机名>.idoris.internal`。组织名不在里面。Local AI 的主机名用 `office-local-ai` 这种带前缀的。
 
 加入码里的 `role` 来自注册项。`bootstrap.sh` 现在会给新建的项写上 `admin`、`member`、`local-ai` 或 `gateway`。旧项没有 `role` 时，加入码会写成 `member`；预授权 key 仍然使用该项的 `acl_tags`。`vpn-server` 没有 join role，sidecar 用原始 token。`--headplane-access tailnet` 和 `--tailnet-admin` 是同一个决定，也会建 `vpn-server`。两个旗标互相冲突时，在生成策略之前就拒绝。
