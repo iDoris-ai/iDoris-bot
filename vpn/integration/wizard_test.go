@@ -650,7 +650,10 @@ func r3w2SideConfigChecks(t *testing.T, e *wizEnv, enrollURL, gatewayCode, devic
 		t.Fatalf("replace: %v\n%s", err, e.redact(switched))
 	}
 	body = e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", keep)
-	if !strings.Contains(body, "http://attacker.invalid:9") || !strings.Contains(body, `"control_url": "https://headscale"`) || !strings.Contains(body, `"extra_kept": "yes"`) {
+	if !strings.Contains(switched, gateway.DropControlPinText) {
+		t.Fatalf("replace did not say the control pin is dropped:\n%s", e.redact(switched))
+	}
+	if !strings.Contains(body, "http://attacker.invalid:9") || strings.Contains(body, `"control_url"`) || !strings.Contains(body, `"extra_kept": "yes"`) {
 		t.Fatalf("replaced config:\n%s", body)
 	}
 	const memberToken = "idv1_sidemembersidemembersidemember"

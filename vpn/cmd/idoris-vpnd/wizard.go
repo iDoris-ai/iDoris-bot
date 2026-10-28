@@ -569,6 +569,11 @@ func (d *deps) applyPlan(plan gateway.Plan, paths idorisPaths, payload join.Payl
 	plan.TokenFile = paths.token
 	plan.ConfigPath = paths.config
 	plan.AllowInsecure = allowInsecure
+	if replace {
+		if raw, err := d.host.ReadFile(paths.config); err == nil {
+			gateway.NoteControlPinDrop(&plan, gateway.PreviousEnrollURL(raw))
+		}
+	}
 	d.printPlan(plan)
 	if !yes {
 		ok, err := d.askYes(qEnable)
