@@ -353,24 +353,27 @@ print("%s:%s" % (a, b))' "$spec"
 # Multi-arch index digest. Keep the tag so the version stays readable.
 ALPINE_VOLUME_IMAGE="${ALPINE_VOLUME_IMAGE:-alpine:3.23@sha256:ff7f0c727dd796aa36787bfcd9a64bf35a6ce72a73451b3359fde849b6703d63}"
 
+# Return 1 on failure. Rollback calls this from `if !`, where set -e is off,
+# and a die() there would skip the "rollback incomplete" message.
 wipe_headscale_wal() {
   local cid="$1" vol
   vol="$(volume_name_for "$cid" /var/lib/headscale)"
-  [[ -n "$vol" ]] || die "could not find the headscale data volume"
+  [[ -n "$vol" ]] || return 1
   docker run --rm --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
-    rm -f /data/db.sqlite-wal /data/db.sqlite-shm
+    rm -f /data/db.sqlite-wal /data/db.sqlite-shm || return 1
 }
 
 # docker cp writes root-owned files. Headscale's image is non-root and will
 # refuse to open them. Chown the volume to the image user while it is stopped.
+# Return 1 on failure (see wipe_headscale_wal).
 chown_volume_to_image() {
   local cid="$1" dest="$2" vol owner
   vol="$(volume_name_for "$cid" "$dest")"
-  [[ -n "$vol" ]] || die "no named volume mounted at $dest"
+  [[ -n "$vol" ]] || return 1
   owner="$(image_owner "$cid")"
-  [[ "$owner" =~ ^[0-9]+:[0-9]+$ ]] || die "refusing odd image user $owner"
+  [[ "$owner" =~ ^[0-9]+:[0-9]+$ ]] || return 1
   docker run --rm --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
-    chown -R "$owner" /data
+    chown -R "$owner" /data || return 1
 }
 
 # Create stopped containers for this mode when the host has none.
@@ -1130,12 +1133,12 @@ copy_sidecar_state() {
 extract_sidecar_tar() {
   local tarpath="$1" sid vol
   sid="$(_compose_ps_id vpn-sidecar)"
-  [[ -n "$sid" ]] || die "vpn-sidecar container is missing"
+  [[ -n "$sid" ]] || return 1
   vol="$(volume_name_for "$sid" /var/lib/tailscale)"
-  [[ -n "$vol" ]] || die "no sidecar state volume"
+  [[ -n "$vol" ]] || return 1
   docker run --rm --user 0 --network none -v "${vol}:/data" -i "$ALPINE_VOLUME_IMAGE" \
-    tar -xf - -C /data < "$tarpath"
-  chown_volume_to_image "$sid" /var/lib/tailscale
+    tar -xf - -C /data < "$tarpath" || return 1
+  chown_volume_to_image "$sid" /var/lib/tailscale || return 1
 }
 
 assert_compose_bindings() {
@@ -1335,6 +1338,68 @@ PY
   return "$rc"
 }
 
+# The saved database is back only when its bytes match the snapshot.
+# A later successful command must not hide a failed copy. This runs under
+# `if !`, so set -e does not apply: every read failure returns 1.
+_restore_verify_database() {
+  local dest="$1" cid vol dir tmp rc
+  dir="$(mktemp -d "$here/.running.XXXXXX")" || return 1
+  tmp="$dir/db.sqlite"
+  cid="$(_compose_ps_id headscale)"
+  if [[ -n "$cid" ]]; then
+    set +e
+    docker cp "$cid:/var/lib/headscale/db.sqlite" "$tmp"
+    rc=$?
+    set -e
+  else
+    vol="$(_project_volume_name headscale-data 2>/dev/null || true)"
+    if [[ -z "$vol" ]]; then
+      rm -rf "$dir"
+      return 1
+    fi
+    set +e
+    _copy_volume_file_out "$vol" db.sqlite "$tmp"
+    rc=$?
+    set -e
+  fi
+  if [[ -s "$dest/headscale/db.sqlite" ]]; then
+    if [[ "$rc" -ne 0 || ! -s "$tmp" ]]; then
+      echo "restore: rollback could not read the restored database" >&2
+      rm -rf "$dir"
+      return 1
+    fi
+    python3 - "$dest/headscale/db.sqlite" "$tmp" <<'PY' || { rm -rf "$dir"; return 1; }
+import hashlib, sys
+def digest(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+snap, got = digest(sys.argv[1]), digest(sys.argv[2])
+if snap != got:
+    sys.stderr.write(
+        "restore: restored database checksum %s does not match snapshot %s\n" % (got, snap)
+    )
+    raise SystemExit(1)
+PY
+    rm -rf "$dir"
+    return 0
+  fi
+  if [[ "$rc" -eq 0 && -s "$tmp" ]]; then
+    echo "restore: rollback left a database the snapshot did not have" >&2
+    rm -rf "$dir"
+    return 1
+  fi
+  if [[ "$rc" -eq 1 ]]; then
+    echo "restore: rollback could not read the restored database" >&2
+    rm -rf "$dir"
+    return 1
+  fi
+  rm -rf "$dir"
+  return 0
+}
+
 _restore_copy_volume_back() {
   local dest="$1" mode="$2" hsid hpid
   hsid="$(_compose_ps_id headscale)"
@@ -1345,32 +1410,33 @@ _restore_copy_volume_back() {
   else
     compose stop headplane >/dev/null 2>&1 || true
   fi
-  docker cp "$dest/headscale/db.sqlite" "$hsid:/var/lib/headscale/db.sqlite"
-  docker cp "$dest/headscale/noise_private.key" "$hsid:/var/lib/headscale/noise_private.key"
+  docker cp "$dest/headscale/db.sqlite" "$hsid:/var/lib/headscale/db.sqlite" || return 1
+  docker cp "$dest/headscale/noise_private.key" "$hsid:/var/lib/headscale/noise_private.key" || return 1
   if [[ -f "$dest/headscale/derp_server_private.key" ]]; then
-    docker cp "$dest/headscale/derp_server_private.key" "$hsid:/var/lib/headscale/derp_server_private.key"
+    docker cp "$dest/headscale/derp_server_private.key" "$hsid:/var/lib/headscale/derp_server_private.key" || return 1
   fi
   if [[ -f "$dest/headscale/db.sqlite-wal" ]]; then
-    docker cp "$dest/headscale/db.sqlite-wal" "$hsid:/var/lib/headscale/db.sqlite-wal"
+    docker cp "$dest/headscale/db.sqlite-wal" "$hsid:/var/lib/headscale/db.sqlite-wal" || return 1
   else
-    wipe_headscale_wal "$hsid"
+    wipe_headscale_wal "$hsid" || return 1
   fi
   if [[ -f "$dest/headscale/db.sqlite-shm" ]]; then
-    docker cp "$dest/headscale/db.sqlite-shm" "$hsid:/var/lib/headscale/db.sqlite-shm"
+    docker cp "$dest/headscale/db.sqlite-shm" "$hsid:/var/lib/headscale/db.sqlite-shm" || return 1
   fi
-  chown_volume_to_image "$hsid" /var/lib/headscale
+  chown_volume_to_image "$hsid" /var/lib/headscale || return 1
   if [[ "$mode" == "tailnet-admin" ]]; then
     hpid="$(_compose_ps_id headplane-tailnet)"
   else
     hpid="$(_compose_ps_id headplane)"
   fi
   if [[ -n "$hpid" && -d "$dest/headplane" ]]; then
-    docker cp "$dest/headplane/." "$hpid:/var/lib/headplane/"
-    chown_volume_to_image "$hpid" /var/lib/headplane
+    docker cp "$dest/headplane/." "$hpid:/var/lib/headplane/" || return 1
+    chown_volume_to_image "$hpid" /var/lib/headplane || return 1
   fi
   if [[ -s "$dest/sidecar-state.tar" && -n "$(_compose_ps_id vpn-sidecar)" ]]; then
-    extract_sidecar_tar "$dest/sidecar-state.tar"
+    extract_sidecar_tar "$dest/sidecar-state.tar" || return 1
   fi
+  _restore_verify_database "$dest" || return 1
 }
 
 _snapshot_host_files() {
@@ -1576,6 +1642,7 @@ _restore_copy_volume_alpine() {
     # The retained volume had no database. A failed restore may have added one.
     docker run --rm --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
       rm -f /data/db.sqlite /data/db.sqlite-wal /data/db.sqlite-shm || return 1
+    _restore_verify_database "$dest" || return 1
     return 0
   fi
   files=(db.sqlite)
@@ -1583,8 +1650,8 @@ _restore_copy_volume_alpine() {
   [[ -s "$dest/headscale/derp_server_private.key" ]] && files+=(derp_server_private.key)
   [[ -s "$dest/headscale/db.sqlite-wal" ]] && files+=(db.sqlite-wal)
   [[ -s "$dest/headscale/db.sqlite-shm" ]] && files+=(db.sqlite-shm)
-  archive="$(mktemp "$here/.running.XXXXXX")"
-  tar -C "$dest/headscale" -cf "$archive" "${files[@]}"
+  archive="$(mktemp "$here/.running.XXXXXX")" || return 1
+  tar -C "$dest/headscale" -cf "$archive" "${files[@]}" || { rm -f "$archive"; return 1; }
   docker run --rm -i --user 0 --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
     tar -C /data -xf - < "$archive" || { rm -f "$archive"; return 1; }
   rm -f "$archive"
@@ -1600,13 +1667,14 @@ _restore_copy_volume_alpine() {
   if [[ -d "$dest/headplane" ]] && [[ -n "$(ls -A "$dest/headplane" 2>/dev/null || true)" ]]; then
     hp="$(_project_volume_name headplane-data 2>/dev/null || true)"
     if [[ -n "$hp" ]]; then
-      archive="$(mktemp "$here/.running.XXXXXX")"
-      tar -C "$dest/headplane" -cf "$archive" .
+      archive="$(mktemp "$here/.running.XXXXXX")" || return 1
+      tar -C "$dest/headplane" -cf "$archive" . || { rm -f "$archive"; return 1; }
       docker run --rm -i --user 0 --network none -v "${hp}:/data" "$ALPINE_VOLUME_IMAGE" \
         tar -C /data -xf - < "$archive" || { rm -f "$archive"; return 1; }
       rm -f "$archive"
     fi
   fi
+  _restore_verify_database "$dest" || return 1
   return 0
 }
 
@@ -1776,7 +1844,7 @@ _install_bundle_volumes() {
   hsid="$(_compose_ps_id headscale)"
   [[ -n "$hsid" ]] || die "headscale container is missing after create"
   if [[ ! -f "$bundle/headscale/db.sqlite-wal" ]]; then
-    wipe_headscale_wal "$hsid"
+    wipe_headscale_wal "$hsid" || die "could not wipe the headscale database journal"
   fi
   docker cp "$bundle/headscale/db.sqlite" "$hsid:/var/lib/headscale/db.sqlite"
   docker cp "$bundle/headscale/noise_private.key" "$hsid:/var/lib/headscale/noise_private.key"
@@ -1791,14 +1859,14 @@ _install_bundle_volumes() {
   if [[ -f "$bundle/headscale/db.sqlite-shm" ]]; then
     docker cp "$bundle/headscale/db.sqlite-shm" "$hsid:/var/lib/headscale/db.sqlite-shm"
   fi
-  chown_volume_to_image "$hsid" /var/lib/headscale
+  chown_volume_to_image "$hsid" /var/lib/headscale || die "could not chown the headscale volume"
   hpid="$(headplane_writer_id "$mode")"
   if [[ -d "$bundle/headplane" ]]; then
     docker cp "$bundle/headplane/." "$hpid:/var/lib/headplane/"
-    chown_volume_to_image "$hpid" /var/lib/headplane
+    chown_volume_to_image "$hpid" /var/lib/headplane || die "could not chown the headplane volume"
   fi
   if [[ "$mode" == "tailnet-admin" && -f "$bundle/sidecar/state.tar" ]]; then
-    extract_sidecar_tar "$bundle/sidecar/state.tar"
+    extract_sidecar_tar "$bundle/sidecar/state.tar" || die "could not restore sidecar state"
   fi
 }
 
