@@ -13,7 +13,7 @@ import (
 const socksChecksUnixMode = true
 
 func checkSecretFile(path string) error {
-	info, err := os.Lstat(path)
+	info, err := os.Lstat(path) //nolint:gosec // G703: operator-chosen secret path, not a request path
 	if err != nil {
 		return fmt.Errorf("secret file %s: %w", path, err)
 	}
