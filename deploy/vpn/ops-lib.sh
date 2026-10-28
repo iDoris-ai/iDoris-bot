@@ -293,10 +293,27 @@ mark_deploy_dir() {
     sh -c 'umask 022; printf %s "$1" > /data/.idoris-deploy-dir' _ "$dir"
 }
 
+# Read /data/.idoris-deploy-dir. Exit 0 and print the marker when the file
+# was read. Exit 2 when the file is absent. Exit 1 when the read failed
+# (docker error, symlink, or not a regular file). Callers must not turn
+# exit 1 into an empty marker.
 _volume_deploy_dir() {
-  local vol="$1"
-  docker run --rm --network none -v "${vol}:/data:ro" "$ALPINE_VOLUME_IMAGE" \
-    sh -c 'if [ -f /data/.idoris-deploy-dir ]; then cat /data/.idoris-deploy-dir; fi'
+  local vol="$1" out rc
+  set +e
+  out="$(_docker_host run --rm --network none -v "${vol}:/data:ro" "$ALPINE_VOLUME_IMAGE" \
+    sh -c 'if [ ! -e /data/.idoris-deploy-dir ]; then exit 2; fi
+           if [ -L /data/.idoris-deploy-dir ] || [ ! -f /data/.idoris-deploy-dir ]; then exit 1; fi
+           cat /data/.idoris-deploy-dir' 2>/dev/null)"
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 2 ]]; then
+    return 2
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    return 1
+  fi
+  printf '%s' "$out"
+  return 0
 }
 
 _safe_volume_name() {
@@ -603,10 +620,13 @@ for item in data:
 }
 
 # Volumes survive `compose down`. A working_dir label, when the volume has
-# one, or the deploy-dir marker must be this directory. No label and no
-# marker is not proof of another directory.
+# one, or a readable deploy-dir marker must be this directory. No label and
+# no marker is not proof of another directory (`up` may adopt that volume).
+# A marker that cannot be read is a refusal, not an empty marker.
+# Restore uses require_restore_volume_ownership, which demands positive
+# evidence before it overwrites anything.
 reject_project_volumes() {
-  local want="$1" ours names name short labels marker err collision=""
+  local want="$1" ours names name short labels marker marker_rc err collision=""
   ours="$(cd "$here" && pwd -P)"
   names="$(mktemp "$here/.running.XXXXXX")"
   chmod 600 "$names"
@@ -674,10 +694,17 @@ if isinstance(cf, str) and cf:
       break
     fi
     if [[ "$name" == *_headscale-data || "$labels" == *'"com.docker.compose.volume":"headscale-data"'* || "$labels" == *'"com.docker.compose.volume": "headscale-data"'* ]]; then
-      marker="$(_volume_deploy_dir "$name" 2>/dev/null || true)"
+      set +e
+      marker="$(_volume_deploy_dir "$name")"
+      marker_rc=$?
+      set -e
       marker="${marker//$'\r'/}"
       marker="${marker//$'\n'/}"
-      if [[ -n "$marker" ]]; then
+      if [[ "$marker_rc" -eq 1 ]]; then
+        collision="could not read the deploy-directory marker on ${name}; refusing to treat an unreadable marker as empty"
+        break
+      fi
+      if [[ "$marker_rc" -eq 0 && -n "$marker" ]]; then
         if ! err="$(python3 -c '
 import os, sys
 ours, marker, name, want = sys.argv[1:]
@@ -696,6 +723,85 @@ raise SystemExit(1)
   done < "$names"
   rm -f "$names"
   [[ -z "$collision" ]] || die "$collision"
+}
+
+# Names of this project's data volumes, one per line. Empty when none exist.
+_project_data_volume_names() {
+  local project="$1" short name listed
+  listed="$(mktemp "$here/.running.XXXXXX")"
+  for short in headscale-data headscale-run headplane-data vpn-sidecar-state; do
+    name="${project}_${short}"
+    if _safe_volume_name "$name" && _docker_host volume inspect "$name" >/dev/null 2>&1; then
+      printf '%s\n' "$name" >> "$listed"
+    fi
+  done
+  if ! _docker_host volume ls -q --filter "label=com.docker.compose.project=${project}" >> "$listed"; then
+    rm -f "$listed"
+    return 1
+  fi
+  sort -u -o "$listed" "$listed"
+  # Drop blanks. volume ls prints nothing when the project has no labeled volumes.
+  grep -v '^$' "$listed" || true
+  rm -f "$listed"
+}
+
+# Restore overwrites existing volumes only with positive ownership evidence:
+# the headscale-data marker is this checkout, or there are no volumes, or
+# the operator passed --adopt-existing-volumes. A foreign marker stays a
+# refusal. An unreadable marker stays a refusal and is never an empty one.
+# adopt is 1 or 0. The adopt path prints the volumes and does not prompt.
+require_restore_volume_ownership() {
+  local project="$1" adopt="$2" ours data name marker marker_rc listed vols
+  ours="$(cd "$here" && pwd -P)"
+  vols="$(mktemp "$here/.running.XXXXXX")"
+  if ! _project_data_volume_names "$project" > "$vols"; then
+    rm -f "$vols"
+    die "could not list volumes for ${project}"
+  fi
+  if [[ ! -s "$vols" ]]; then
+    rm -f "$vols"
+    return 0
+  fi
+  data=""
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if [[ "$name" == *_headscale-data ]]; then
+      data="$name"
+    fi
+  done < "$vols"
+  if [[ -z "$data" ]]; then
+    data="$(_docker_host volume ls -q --filter "label=com.docker.compose.project=${project}" --filter "label=com.docker.compose.volume=headscale-data" 2>/dev/null | head -n1 || true)"
+  fi
+  if [[ -n "$data" ]]; then
+    set +e
+    marker="$(_volume_deploy_dir "$data")"
+    marker_rc=$?
+    set -e
+    marker="${marker//$'\r'/}"
+    marker="${marker//$'\n'/}"
+    if [[ "$marker_rc" -eq 1 ]]; then
+      rm -f "$vols"
+      die "could not read the deploy-directory marker on ${data}; refusing to treat an unreadable marker as empty"
+    fi
+    if [[ "$marker_rc" -eq 0 && -n "$marker" ]]; then
+      if python3 -c '
+import os, sys
+ours, marker = sys.argv[1:]
+raise SystemExit(0 if os.path.realpath(marker) == os.path.realpath(ours) else 1)
+' "$ours" "$marker"; then
+        rm -f "$vols"
+        return 0
+      fi
+      rm -f "$vols"
+      die "compose project ${project} has volume ${data} from ${marker}; pass --instance NAME or set COMPOSE_PROJECT_NAME"
+    fi
+  fi
+  listed="$(tr '\n' ' ' < "$vols" | sed 's/ *$//')"
+  rm -f "$vols"
+  if [[ "$adopt" != "1" ]]; then
+    die "refusing to overwrite existing volumes with no deploy-directory marker: ${listed}. Pass --adopt-existing-volumes to overwrite them"
+  fi
+  echo "restore: --adopt-existing-volumes will overwrite: ${listed}" >&2
 }
 
 # One knob for Headplane's origin and cookie. tunnel, lan and proxy publish
@@ -1718,7 +1824,7 @@ _start_restored_stack() {
 }
 
 restore_deployment() {
-  local bundle="$1" info bundle_project ignored
+  local bundle="$1" adopt="${2:-0}" info bundle_project ignored
   [[ -d "$bundle" && ! -L "$bundle" ]] || die "backup directory is missing"
   info="$(python3 "$here/bundle.py" tree "$bundle")"
   bundle_project="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("dotenv", {}).get("COMPOSE_PROJECT_NAME", ""))' "$info")"
@@ -1742,6 +1848,9 @@ restore_deployment() {
   if [[ "$_restore_dest" != "$_restore_current" ]]; then
     reject_project_named "$_restore_dest"
   fi
+  # Before any snapshot or stop. Markerless volumes are not overwritten
+  # unless the operator named them with --adopt-existing-volumes.
+  require_restore_volume_ownership "$_restore_dest" "$adopt"
   _restore_host="$(mktemp -d "${TMPDIR:-/tmp}/idoris-vpn.XXXXXX")"
   _restore_vol="$(mktemp -d "${TMPDIR:-/tmp}/idoris-vpn.XXXXXX")"
   _restore_snap="$(mktemp "${TMPDIR:-/tmp}/idoris-vpn.XXXXXX")"

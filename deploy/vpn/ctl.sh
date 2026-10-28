@@ -109,9 +109,15 @@ Usage: bash deploy/vpn/ctl.sh <command> [args]
                                  host state needed to rebuild the machine.
                                  Starts the same services again. Does not
                                  start the other Headplane.
-  restore DIR --force            restore that bundle, including onto a host
+  restore DIR --force [--adopt-existing-volumes]
+                                 restore that bundle, including onto a host
                                  whose containers are gone. Starts the saved
-                                 admin mode only.
+                                 admin mode only. Existing volumes need this
+                                 checkout's deploy-directory marker, or no
+                                 volumes, or --adopt-existing-volumes.
+                                 The flag prints the volumes it will
+                                 overwrite. It does not prompt, and it does
+                                 not adopt a foreign or unreadable marker.
   up [--published|--tailnet-admin] [--instance NAME]
       [--headplane-access tunnel|lan|tailnet|proxy]
                                  start the saved admin mode. With no access
@@ -592,6 +598,10 @@ case "$cmd" in
 
 Restore (overwrites the live database and the host state files):
   bash $here/ctl.sh restore $dest --force
+Volumes that already exist must carry this checkout's deploy-directory
+marker. A set with no marker is refused. Pass --adopt-existing-volumes
+to overwrite those volumes; the command prints their names and does not
+prompt. An unreadable marker is refused either way.
 The other Headplane stays stopped. Do not restore a backup onto a newer
 Headscale minor than the one that wrote it.
 The checkout compose.yaml is not replaced. sidecar/state.tar, when present,
@@ -608,16 +618,18 @@ EOF
   restore)
     dest="${1:-}"
     force=0
-    [[ -n "$dest" ]] || die "usage: ctl.sh restore DIR --force"
+    adopt=0
+    [[ -n "$dest" ]] || die "usage: ctl.sh restore DIR --force [--adopt-existing-volumes]"
     shift || true
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --force) force=1; shift ;;
+        --adopt-existing-volumes) adopt=1; shift ;;
         *) die "unknown argument: $1" ;;
       esac
     done
     (( force )) || die "refusing to overwrite the live deployment without --force"
-    restore_deployment "$dest"
+    restore_deployment "$dest" "$adopt"
     ;;
   up)
     mode="$(read_admin_mode)"

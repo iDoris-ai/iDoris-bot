@@ -100,7 +100,7 @@ bash deploy/vpn/bootstrap.sh add-tenant globex --lan-cidr 192.168.50.0/24
 | `offboard --entry NAME (--label LABEL \| --hash-prefix HEX) [--node-id N] [--allow-empty]` | **先**吊销这枚凭证。吊销失败则不 expire、不 delete。给了 `--node-id` 才 `nodes expire` 再 `nodes delete`。单独 expire 或 delete 节点不会吊销凭证。最后一枚同样要 `--allow-empty`；不带时拒绝，节点保持不动 |
 | `logs [service] [--tail N]` | 日志，secret 打码 |
 | `backup [DIR]` | 见第 6 节 |
-| `restore DIR --force` | 见第 6 节。没有 `--force` 拒绝 |
+| `restore DIR --force [--adopt-existing-volumes]` | 见第 6 节。没有 `--force` 拒绝。已有卷没有本目录标记时还要这个旗标 |
 | `up [--published\|--tailnet-admin] [--instance NAME] [--headplane-access MODE]` | 按已保存的管理模式启动，并重新套用 `HEADPLANE_ACCESS` |
 | `down` | `docker compose down`，**保留**数据卷和管理模式 |
 | `upgrade` | 只打印升级步骤，不拉镜像 |
@@ -142,7 +142,7 @@ bash deploy/vpn/bootstrap.sh add-tenant globex --lan-cidr 192.168.50.0/24
 
 从记下快照起，失败会回滚。先写回原来的宿主机文件。只删除这一次恢复**新造出来**的容器、卷和网络：动手前的名单里已经有的卷留下，不执行 `down -v`。然后用**失败前的配置** `up -d --force-recreate`，不用 `start`（`start` 不改已经按恢复配置发布出去的端口）。接着核对实际绑定；快照里有 headscale 时还要 `headscale health`。恢复启动之后跑 `idoris-vpn-enroll check`（最多 10 次，间隔 2 秒）。非法的注册 JSON 会在 Headplane 已经按新绑定重建之后把恢复判失败，再按原来的配置重建。回滚任一步失败就留下快照，打印 `restore: rollback incomplete; keeping snapshots` 以及 `host=`、`vol=`、`snap=` 的路径，不删除。还没改数据（phase 0）就失败时，临时目录仍会删掉。回滚成功才删快照。
 
-另一份部署目录不能往这套留下的卷上恢复。Compose 5.1.2 在这台 Docker Desktop（Docker 29.4.0，linux/arm64）上不给卷打 `working_dir` 或 `config_files`；`down` 会删掉带着这些标签的容器，`docker compose ls` 也不再列出项目。`start_stack_for_mode` 和成功的 `restore` 在 `headscale-data` 里写 `/data/.idoris-deploy-dir`，内容是这份目录的物理路径。卷或网络上若真有 `working_dir` / `config_files` 且指向别处，同样拒绝。没有标签也没有标记时不当成外来卷：直接 `docker compose up`、从没走过 `ctl.sh up` 的卷就是这样。同一目录在 `down` 之后不是碰撞。拒绝文本里有 `has volume`。`deploy/vpn/test/test_restore_volumes.sh` 在这台 Docker Desktop 上用真实卷看过标记拒绝、同一目录和无标记放行、没有容器时字节能写回；并用替身 docker 看过回滚命令是 `up -d --force-recreate`，不是 `start`，也不是 `down -v`，回滚失败时三个快照目录还在。原生 Linux 宿主机上没有跑过。2026-10-28 干净主机演练项目 `idoris-vpn-r2d-533526`（Headscale 端口 65370）退出码 0，日志以 `drill: ok` 结束。`down` 之后从另一个目录 `restore` 被拒绝，输出里有 `has volume`，留下的数据库校验和不变。同一目录对一份垃圾库 `restore` 失败后，卷还在，校验和仍是 `down` 之后的那一份，随后脚本自己的 `down -v` 才删卷。局域网包把访问改成 `lan`、绑定改成 `0.0.0.0`，注册配置写成非法 JSON：恢复失败后 Headplane 仍发布在 `127.0.0.1`，回滚完成（没有 `rollback incomplete`），`headscale health` 通过且 `drill-member` 还在。同一轮导出 `COMPOSE_PROFILES=tailnet-admin` 再 `up --headplane-access tunnel`，第二个 Headplane 没有起来。只读凭证列表用夹具文件属主的 `--user` 跑，打印了 `credential shapes ok`。这台 Docker Desktop 把 macOS 上的 0600 文件在容器里显示成 `0:0`，`--user` 仍然读得到；这一步没有证明原生 Linux 上「锁属主和读者不一致」的回退。
+另一份部署目录不能往这套留下的卷上恢复。Compose 5.1.2 在这台 Docker Desktop（Docker 29.4.0，linux/arm64）上不给卷打 `working_dir` 或 `config_files`；`down` 会删掉带着这些标签的容器，`docker compose ls` 也不再列出项目。`start_stack_for_mode` 和成功的 `restore` 在 `headscale-data` 里写 `/data/.idoris-deploy-dir`，内容是这份目录的物理路径。卷或网络上若真有 `working_dir` / `config_files` 且指向别处，同样拒绝。没有标签也没有标记时，`up` 仍不当成外来卷：直接 `docker compose up`、从没走过 `ctl.sh up` 的卷就是这样。同一目录在 `down` 之后对 `up` 不是碰撞。`restore` 要覆盖已经存在的卷时，必须先有正面证据：`headscale-data` 上的 `.idoris-deploy-dir` 解析后等于这份目录，或者这些卷根本不存在。没有标记就拒绝，错误写出卷名和 `--adopt-existing-volumes`。带上这个旗标会在 stderr 打印 `restore: --adopt-existing-volumes will overwrite:` 和卷名，然后继续，不交互询问。标记在但读不出来（不是普通文件，或 docker 读失败）一律拒绝，文案含 `unreadable marker`，不当成空标记，旗标也不放行。标记指向别的目录时仍然拒绝，文案里有 `has volume`。`deploy/vpn/test/test_restore_volumes.sh` 在这台 Docker Desktop 上用真实卷看过：外来标记拒绝；同一目录和无标记对 `up` 放行；无标记卷从另一个目录 `restore` 被拒绝，库字节仍是 `original-bytes`；加上旗标后打印卷名并进入 `creating stopped containers`（空 compose 随后失败，回滚完成，字节不变）；标记做成目录时，带不带旗标都拒绝，且没有 `will overwrite`。拿掉这道门之后，同一条无标记恢复会走到 `creating stopped containers`。把读失败当成空标记时，`reject_project_named` 对目录标记返回 0。没有容器时字节能写回；并用替身 docker 看过回滚命令是 `up -d --force-recreate`，不是 `start`，也不是 `down -v`，回滚失败时三个快照目录还在。原生 Linux 宿主机上没有跑过。2026-10-28 干净主机演练项目 `idoris-vpn-r2d-533526`（Headscale 端口 65370）退出码 0，日志以 `drill: ok` 结束。`down` 之后从另一个目录 `restore` 被拒绝，输出里有 `has volume`，留下的数据库校验和不变。同一目录对一份垃圾库 `restore` 失败后，卷还在，校验和仍是 `down` 之后的那一份，随后脚本自己的 `down -v` 才删卷。局域网包把访问改成 `lan`、绑定改成 `0.0.0.0`，注册配置写成非法 JSON：恢复失败后 Headplane 仍发布在 `127.0.0.1`，回滚完成（没有 `rollback incomplete`），`headscale health` 通过且 `drill-member` 还在。同一轮导出 `COMPOSE_PROFILES=tailnet-admin` 再 `up --headplane-access tunnel`，第二个 Headplane 没有起来。只读凭证列表用夹具文件属主的 `--user` 跑，打印了 `credential shapes ok`。这台 Docker Desktop 把 macOS 上的 0600 文件在容器里显示成 `0:0`，`--user` 仍然读得到；这一步没有证明原生 Linux 上「锁属主和读者不一致」的回退。
 
 成功的恢复用 `up -d --force-recreate`，不用 `start`。随后用 `docker compose port` 和 inspect 核对实际绑定。每次 `docker compose` 都按 `.env` 设置子进程的环境，`.env` 里没有的键会从子进程里去掉。父进程的环境不动。所以 `HEADPLANE_BIND=0.0.0.0 ctl.sh up --headplane-access tunnel` 仍然把 Headplane 绑在 `127.0.0.1`。注册文件的属主按恢复出来的 `ENROLL_UID` / `ENROLL_GID` 处理，见第 2 节。
 
@@ -151,6 +151,8 @@ tailnet-admin 的包如果带了 `sidecar/state.tar`，先解进卷再启动 sid
 ```bash
 bash deploy/vpn/ctl.sh restore /path/to/bundle --force
 ```
+
+已有卷但没有本目录的部署标记时，再加上 `--adopt-existing-volumes`。命令会先打印要覆盖的卷名。读不出标记、或标记属于别的目录时，这个旗标无效。
 
 noise 私钥必须和 sqlite 一起回来，否则节点要重新注册。内嵌 DERP 开着时，DERP 私钥也要一起回来；包里没有这把密钥时，恢复不会凭空造一把。不要把旧 sqlite 恢复进已经迁移过的更新 minor 版本。
 
