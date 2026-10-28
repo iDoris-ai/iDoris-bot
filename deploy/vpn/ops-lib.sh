@@ -1071,16 +1071,19 @@ select_enroll_runtime() {
 
 # listing_fixture_owner prints uid:gid for a read-only credential fixture.
 # The owner stays different from the enrollment runtime uid. Root chowns the
-# file. Anyone else prints the owner the file already has.
+# file and its parent directory. umask 077 leaves that directory 0700, and
+# the selected uid has to be able to traverse it. Anyone else prints the
+# owner the file already has.
 listing_fixture_owner() {
-  local path="$1" runtime_uid="$2" owner
+  local path="$1" runtime_uid="$2" owner parent
   if [[ "$runtime_uid" == 65534 ]]; then
     owner=65531
   else
     owner=65534
   fi
   if [[ "$(id -u)" == 0 ]]; then
-    chown "${owner}:${owner}" "$path"
+    parent="$(dirname "$path")"
+    chown "${owner}:${owner}" "$parent" "$path"
     printf '%s:%s\n' "$owner" "$owner"
     return 0
   fi
