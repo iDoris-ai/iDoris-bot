@@ -318,6 +318,9 @@
       if (res.control_url) {
         lines.push("控制服务器：" + res.control_url);
       }
+      if (res.control_pin_dropped) {
+        lines.push("replacing the enrollment authority removes the previous control server pin; the next start discovers the new server and pins it; the old pin is not kept");
+      }
       if (res.service_installed) {
         lines.push("服务已按这份新身份安装。");
       }
