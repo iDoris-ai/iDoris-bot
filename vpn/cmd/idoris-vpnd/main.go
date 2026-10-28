@@ -418,6 +418,10 @@ func runCmd(args []string) error {
 	if err != nil {
 		return err
 	}
+	// A listener that cannot bind does not fail this call. StartAccess keeps
+	// that listener failed, reports it on access_error, and retries. An
+	// unparseable address, an unsafe path, or a bad credentials file still
+	// returns here, before reconcile starts.
 	access, err := vpnd.StartAccess(node.Dialer, cfg.Forwards, cfg.SOCKS5Listen, opt, log)
 	if err != nil {
 		return err

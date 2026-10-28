@@ -295,7 +295,7 @@ func TestR5CDiscoveryRetryKeepsPending(t *testing.T) {
 		t.Fatal(err)
 	}
 	if disc.calls != 2 {
-		t.Fatalf("discovery calls %d, want the recovery attempt", disc.calls)
+		t.Fatalf("discovery calls %d, want the recovery attempt; snap %+v", disc.calls, snap)
 	}
 	if _, ok := st2.Pending(); !ok {
 		t.Fatal("pending dropped before discovery recovered")

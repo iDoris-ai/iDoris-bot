@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -75,6 +76,11 @@ const (
 	acceptBackoffMax      = time.Second
 )
 
+// accessRetryInterval is how often a listener that failed to bind is tried
+// again. Tests shorten it. An unparseable address, an unsafe path, or a bad
+// credentials file still fails StartAccess before any socket is opened.
+var accessRetryInterval = 30 * time.Second
+
 // anonymousSOCKSWarning is logged when a SOCKS5 listener has no authentication.
 const anonymousSOCKSWarning = "SOCKS5 allows anonymous local access: every local user, and for an HTTP service a web page via DNS rebinding, can use this node's tailnet identity"
 
@@ -92,6 +98,8 @@ type LocalAccess struct {
 	user        string
 	pass        string
 	authFile    string
+	retryEvery  time.Duration
+	listenHook  func(net.Listener) net.Listener
 
 	mu     sync.Mutex
 	closed bool
@@ -110,10 +118,20 @@ type bound struct {
 	target  string
 	socks   bool
 	listen  string
+	network string
+	address string
 	state   string
 	errText string
 	used    int
 	max     int
+}
+
+type listenSpec struct {
+	network    string
+	address    string
+	target     string
+	configured string
+	socks      bool
 }
 
 // startLocalAccess opens an anonymous SOCKS5 listener. Nothing in the daemon
@@ -127,8 +145,12 @@ func startLocalAccess(dial Dialer, forwards []Forward, socksAddr string, log *sl
 
 // StartAccess listens on each forward and on socksAddr (empty disables
 // SOCKS5). A port of 0 selects an ephemeral port and the status reports the
-// bound address. A nil dialer or a listen error fails the call and leaves
-// nothing running.
+// bound address. A nil dialer, an unparseable address, an unsafe unix path,
+// or bad SOCKS5 credentials fails the call before any socket is opened.
+// A bind failure (the address is in use, or a unix socket is still served
+// by another process) does not: that listener stays failed, AccessError
+// reports the address and the error, and the bind is retried until it
+// succeeds or Close is called. Other listeners keep running.
 func StartAccess(dial Dialer, forwards []Forward, socksAddr string, opt AccessOptions, log *slog.Logger) (*LocalAccess, error) {
 	if len(forwards) == 0 && socksAddr == "" {
 		return nil, nil
@@ -170,6 +192,14 @@ func StartAccess(dial Dialer, forwards []Forward, socksAddr string, opt AccessOp
 			callerLog.Info("SOCKS5 auth file created", "path", authFile)
 		}
 	}
+	specs, err := accessListenSpecs(forwards, socksAddr)
+	if err != nil {
+		return nil, err
+	}
+	every := accessRetryInterval
+	if every <= 0 {
+		every = 30 * time.Second
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	a := &LocalAccess{
 		dial:        dial,
@@ -182,65 +212,18 @@ func StartAccess(dial Dialer, forwards []Forward, socksAddr string, opt AccessOp
 		user:        user,
 		pass:        pass,
 		authFile:    authFile,
+		retryEvery:  every,
+		listenHook:  opt.listenHook,
 		conns:       map[net.Conn]uint64{},
 		dialCancel:  map[net.Conn]context.CancelFunc{},
 	}
 	if opt.Owner != nil {
 		opt.Owner.SetOnLost(func() { a.closeStale() })
 	}
-	fail := func(err error) (*LocalAccess, error) {
-		for _, b := range a.bounds {
-			_ = b.ln.Close()
-		}
-		cancel()
-		return nil, err
-	}
-	add := func(network, address, target string, socks bool) error {
-		ln, err := listenLocal(network, address)
-		if err != nil {
-			return err
-		}
-		if opt.listenHook != nil {
-			if wrapped := opt.listenHook(ln); wrapped != nil {
-				ln = wrapped
-			}
-		}
-		a.bounds = append(a.bounds, bound{
-			ln:     ln,
-			target: target,
-			socks:  socks,
-			listen: ln.Addr().String(),
-			state:  "listening",
-			max:    maxConn,
-		})
-		return nil
-	}
-	for _, f := range forwards {
-		network, address, err := splitListen(f.Listen)
-		if err != nil {
-			return fail(fmt.Errorf("forward %s -> %s: %w", f.Listen, f.Target, err))
-		}
-		if network == "unix" {
-			if err := prepareUnixSocket(address); err != nil {
-				return fail(fmt.Errorf("forward %s -> %s: %w", f.Listen, f.Target, err))
-			}
-		}
-		if err := add(network, address, f.Target, false); err != nil {
-			return fail(fmt.Errorf("forward %s -> %s: %w", f.Listen, f.Target, err))
-		}
-	}
-	if socksAddr != "" {
-		network, address, err := splitListen(socksAddr)
-		if err != nil {
-			return fail(fmt.Errorf("socks5 %s: %w", socksAddr, err))
-		}
-		if network == "unix" {
-			if err := prepareUnixSocket(address); err != nil {
-				return fail(fmt.Errorf("socks5 %s: %w", socksAddr, err))
-			}
-		}
-		if err := add(network, address, "", true); err != nil {
-			return fail(fmt.Errorf("socks5 %s: %w", socksAddr, err))
+	failed := false
+	for _, sp := range specs {
+		if err := a.bindSpec(sp, maxConn); err != nil {
+			failed = true
 		}
 	}
 	if a.owner != nil {
@@ -248,10 +231,198 @@ func StartAccess(dial Dialer, forwards []Forward, socksAddr string, opt AccessOp
 		go a.watchOwner()
 	}
 	for i := range a.bounds {
+		if a.bounds[i].ln == nil {
+			continue
+		}
 		a.wg.Add(1)
 		go a.acceptLoop(i)
 	}
+	if failed {
+		a.wg.Add(1)
+		go a.retryBinds()
+	}
 	return a, nil
+}
+
+func accessListenSpecs(forwards []Forward, socksAddr string) ([]listenSpec, error) {
+	specs := make([]listenSpec, 0, len(forwards)+1)
+	for _, f := range forwards {
+		network, address, err := splitListen(f.Listen)
+		if err != nil {
+			return nil, fmt.Errorf("forward %s -> %s: %w", f.Listen, f.Target, err)
+		}
+		specs = append(specs, listenSpec{
+			network: network, address: address, target: f.Target, configured: f.Listen,
+		})
+	}
+	if socksAddr != "" {
+		network, address, err := splitListen(socksAddr)
+		if err != nil {
+			return nil, fmt.Errorf("socks5 %s: %w", socksAddr, err)
+		}
+		specs = append(specs, listenSpec{
+			network: network, address: address, configured: socksAddr, socks: true,
+		})
+	}
+	return specs, nil
+}
+
+// bindSpec opens one listener. A failure is stored on the access and does
+// not close listeners that already bound. The caller holds no goroutines yet.
+func (a *LocalAccess) bindSpec(sp listenSpec, maxConn int) error {
+	b := bound{
+		target:  sp.target,
+		socks:   sp.socks,
+		listen:  sp.configured,
+		network: sp.network,
+		address: sp.address,
+		max:     maxConn,
+	}
+	if sp.network == "unix" {
+		if err := prepareUnixSocket(sp.address); err != nil {
+			b.state = "failed"
+			b.errText = err.Error()
+			a.bounds = append(a.bounds, b)
+			a.log.Error("listener failed", "listen", sp.configured, "err", err)
+			return err
+		}
+	}
+	ln, err := listenLocal(sp.network, sp.address)
+	if err != nil {
+		b.state = "failed"
+		b.errText = err.Error()
+		a.bounds = append(a.bounds, b)
+		a.log.Error("listener failed", "listen", sp.configured, "err", err)
+		return err
+	}
+	if a.listenHook != nil {
+		if wrapped := a.listenHook(ln); wrapped != nil {
+			ln = wrapped
+		}
+	}
+	b.ln = ln
+	b.listen = ln.Addr().String()
+	b.state = "listening"
+	a.bounds = append(a.bounds, b)
+	return nil
+}
+
+// retryBinds tries failed listeners until each one is bound or Close runs.
+func (a *LocalAccess) retryBinds() {
+	defer a.wg.Done()
+	ticker := time.NewTicker(a.retryEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-ticker.C:
+			if a.rebindFailed() {
+				return
+			}
+		}
+	}
+}
+
+// rebindFailed reports whether every previously failed listener is now bound.
+func (a *LocalAccess) rebindFailed() bool {
+	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return true
+	}
+	type job struct {
+		idx              int
+		network, address string
+	}
+	var jobs []job
+	for i, b := range a.bounds {
+		if b.state == "failed" && b.ln == nil {
+			jobs = append(jobs, job{idx: i, network: b.network, address: b.address})
+		}
+	}
+	a.mu.Unlock()
+	if len(jobs) == 0 {
+		return true
+	}
+	for _, j := range jobs {
+		if j.network == "unix" {
+			if err := prepareUnixSocket(j.address); err != nil {
+				a.noteBind(j.idx, nil, err)
+				continue
+			}
+		}
+		ln, err := listenLocal(j.network, j.address)
+		a.noteBind(j.idx, ln, err)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return true
+	}
+	for _, b := range a.bounds {
+		if b.state == "failed" {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *LocalAccess) noteBind(idx int, ln net.Listener, bindErr error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed || a.bounds[idx].state != "failed" {
+		if ln != nil {
+			_ = ln.Close()
+		}
+		return
+	}
+	b := &a.bounds[idx]
+	if bindErr != nil {
+		if ln != nil {
+			_ = ln.Close()
+		}
+		b.ln = nil
+		b.state = "failed"
+		b.errText = bindErr.Error()
+		a.log.Warn("listener bind retry failed", "listen", b.listen, "err", bindErr)
+		return
+	}
+	if a.listenHook != nil {
+		if wrapped := a.listenHook(ln); wrapped != nil {
+			ln = wrapped
+		}
+	}
+	b.ln = ln
+	b.listen = ln.Addr().String()
+	b.state = "listening"
+	b.errText = ""
+	a.log.Info("listener bound", "listen", b.listen)
+	a.wg.Add(1)
+	go a.acceptLoop(idx)
+}
+
+// AccessError is empty once every configured listener is bound. While any
+// bind is failing it contains that listener's address and the error.
+func (a *LocalAccess) AccessError() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var bld strings.Builder
+	for _, b := range a.bounds {
+		if b.state != "failed" || b.errText == "" {
+			continue
+		}
+		if bld.Len() > 0 {
+			bld.WriteString("; ")
+		}
+		bld.WriteString(b.listen)
+		bld.WriteString(": ")
+		bld.WriteString(b.errText)
+	}
+	return bld.String()
 }
 
 // watchOwner polls LocalAPI on the ownership cache interval and also wakes
@@ -600,7 +771,9 @@ func (a *LocalAccess) Close() error {
 	a.mu.Unlock()
 	a.cancel()
 	for _, ln := range lns {
-		_ = ln.Close()
+		if ln != nil {
+			_ = ln.Close()
+		}
 	}
 	for _, c := range conns {
 		_ = c.Close()
