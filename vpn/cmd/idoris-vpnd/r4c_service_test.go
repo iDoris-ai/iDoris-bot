@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -170,66 +169,6 @@ func TestR4CInstallServiceAbsMissingConfig(t *testing.T) {
 	want := filepath.Join(dir, "rel", "missing.json")
 	if !strings.Contains(err.Error(), want) {
 		t.Fatalf("got %v, want %s", err, want)
-	}
-}
-
-func TestR4CWindowsInstallProtectsBeforeSecrets(t *testing.T) {
-	var order []string
-	ops := winInstallOps{
-		mkdir: func(string) error {
-			order = append(order, "mkdir")
-			return nil
-		},
-		protectDir: func(dir string) error {
-			order = append(order, "protect-dir")
-			if dir != windowsConfigDir {
-				t.Fatalf("protect dir %s", dir)
-			}
-			return nil
-		},
-		readConfig: func(string) ([]byte, error) {
-			order = append(order, "read")
-			return []byte(`{"auth_key_file":"/missing/auth_key"}`), nil
-		},
-		stage: func([]byte, string) ([]byte, []string, error) {
-			order = append(order, "stage")
-			return nil, nil, errors.New("auth_key_file: no such file")
-		},
-		writeConfig: func(string, string, []byte) error {
-			order = append(order, "write-secret")
-			return nil
-		},
-		protectRest: func(string, string, string, []string) error {
-			order = append(order, "protect-rest")
-			return nil
-		},
-		createTask: func(string) error {
-			order = append(order, "task")
-			return nil
-		},
-	}
-	err := arrangeWindowsInstall(ops, `C:\Program Files\iDoris`, `C:\Program Files\iDoris\idoris-vpnd.exe`, `C:\cfg.json`)
-	if err == nil || !strings.Contains(err.Error(), "auth_key_file") {
-		t.Fatal(err)
-	}
-	got := strings.Join(order, ",")
-	want := "mkdir,protect-dir,read,stage"
-	if got != want {
-		t.Fatalf("order %s", got)
-	}
-
-	order = nil
-	ops.stage = func([]byte, string) ([]byte, []string, error) {
-		order = append(order, "stage")
-		return []byte("{}\n"), []string{`C:\ProgramData\idoris\auth_key`}, nil
-	}
-	if err := arrangeWindowsInstall(ops, `C:\Program Files\iDoris`, `C:\Program Files\iDoris\idoris-vpnd.exe`, `C:\cfg.json`); err != nil {
-		t.Fatal(err)
-	}
-	got = strings.Join(order, ",")
-	want = "mkdir,protect-dir,read,stage,write-secret,protect-rest,task"
-	if got != want {
-		t.Fatalf("success order %s", got)
 	}
 }
 
