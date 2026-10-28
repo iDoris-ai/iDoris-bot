@@ -51,7 +51,7 @@ func TestR3c2StartAccessWarnsOnTCPForward(t *testing.T) {
 	defer restore()
 	setOwnerOnlyListens(nil)
 
-	access, err := StartLocalAccess(&net.Dialer{}, []Forward{{Listen: "127.0.0.1:0", Target: "peer:1"}}, "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	access, err := startLocalAccess(&net.Dialer{}, []Forward{{Listen: "127.0.0.1:0", Target: "peer:1"}}, "", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestR3c2StartAccessWarnsOnTCPForward(t *testing.T) {
 
 	buf.Reset()
 	dir := shortSockDir(t)
-	uaccess, err := StartLocalAccess(&net.Dialer{}, []Forward{{Listen: "unix:" + filepath.Join(dir, "s"), Target: "peer:1"}}, "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	uaccess, err := startLocalAccess(&net.Dialer{}, []Forward{{Listen: "unix:" + filepath.Join(dir, "s"), Target: "peer:1"}}, "", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}

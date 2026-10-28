@@ -60,7 +60,7 @@ func TestSOCKS5RequiresAuthUnlessAnonymous(t *testing.T) {
 	}
 	var logs bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&logs, nil))
-	access, err := StartLocalAccess(&net.Dialer{}, nil, "127.0.0.1:0", log)
+	access, err := startLocalAccess(&net.Dialer{}, nil, "127.0.0.1:0", log)
 	if err != nil {
 		t.Fatal(err)
 	}
