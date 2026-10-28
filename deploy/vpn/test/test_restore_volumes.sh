@@ -98,10 +98,19 @@ fi
 if [[ "$1" == "ps" || "$1" == "network" ]]; then
   exit 0
 fi
+# Checksum read. The snapshot file in this test is original-bytes plus a newline.
+if [[ "$1" == "run" && "$*" == *"tar -C /data -cf"* ]]; then
+  payload="$(mktemp -d)"
+  printf 'original-bytes\n' > "$payload/db.sqlite"
+  tar -C "$payload" -cf - db.sqlite
+  rm -rf "$payload"
+  exit 0
+fi
 exit 0
 EOF
 chmod 755 "$rb/bin/docker"
 (
+  # shellcheck disable=SC2030
   export PATH="$rb/bin:$PATH"
   export COMPOSE_PROJECT_LOCK="$proj"
   _restore_current="$proj"
@@ -238,5 +247,125 @@ if grep -q 'will overwrite' <<<"$out"; then
 fi
 got="$(docker run --rm --network none -v "${vol}:/data:ro" "$alpine" sh -c 'cat /data/db.sqlite')"
 [[ "$got" == "original-bytes" ]] || die "unreadable-marker restore changed the database: $got"
+
+# A swallowed docker cp plus a later success must not delete the snapshots.
+# The shim plants the snapshot bytes on the way out, so a checksum that ran
+# after the failed copy would match. Alpine's extract then fails. Rollback
+# is incomplete only when the failed copy itself returns 1.
+echo "test: a failed copy keeps snapshots even when the checksum would match"
+r5o_rb="$tmp/r5o-rb"
+mkdir -p "$r5o_rb/bin" "$r5o_rb/vol/headscale" "$r5o_rb/host"
+printf 'original-bytes\n' > "$r5o_rb/vol/headscale/db.sqlite"
+printf 'noise\n' > "$r5o_rb/vol/headscale/noise_private.key"
+printf '1\n' > "$r5o_rb/vol/HAD"
+: > "$r5o_rb/vol/volumes.before"
+: > "$r5o_rb/vol/containers.before"
+: > "$r5o_rb/vol/networks.before"
+printf 'marker\n' > "$r5o_rb/host/marker"
+printf 'headscale\n' > "$r5o_rb/snap"
+cat > "$r5o_rb/bin/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+{
+  printf 'CMD'
+  printf ' %q' "$@"
+  printf '\n'
+} >> "${DOCKER_LOG:?}"
+if [[ "$1" == "compose" && "$*" == *" config "* ]]; then
+  printf '%s\n' '{"services":{"headscale":{"image":"headscale/headscale:v0.29.6"},"enroll":{},"headplane":{"ports":[{"target":3000,"published":"3000","host_ip":"127.0.0.1"}]}}}'
+  exit 0
+fi
+if [[ "$1" == "compose" && "$*" == *" ps -aq headscale"* ]]; then
+  printf '%s\n' 'cidhs'
+  exit 0
+fi
+if [[ "$1" == "image" && "$2" == "inspect" ]]; then
+  printf '%s\n' '65532:65532'
+  exit 0
+fi
+if [[ "$1" == "inspect" ]]; then
+  if [[ "$*" == *".Config.Image"* ]]; then
+    printf '%s\n' 'headscale/headscale:v0.29.6'
+    exit 0
+  fi
+  printf '%s %s\n' "/var/lib/headscale" "${R5O_HS_VOL:-hsvol}"
+  exit 0
+fi
+if [[ "$1" == "cp" ]]; then
+  src="${2:-}"
+  dest="${3:-}"
+  if [[ "$dest" == *:* && "$src" == *noise_private.key && "${R5O_FAIL_NOISE:-}" == "1" ]]; then
+    exit 1
+  fi
+  if [[ "$src" == *:* && "$src" == */db.sqlite ]]; then
+    cp "${R5O_DB_FILE:?}" "$dest"
+    exit 0
+  fi
+  exit 0
+fi
+if [[ "$1" == "run" && "$*" == *"tar -C /data -xf"* && "${R5O_FAIL_ALPINE:-}" == "1" ]]; then
+  exit 1
+fi
+if [[ "$1" == "run" && "$*" == *"tar -C /data -cf"* ]]; then
+  payload="$(mktemp -d)"
+  cp "${R5O_DB_FILE:?}" "$payload/db.sqlite"
+  tar -C "$payload" -cf - db.sqlite
+  rm -rf "$payload"
+  exit 0
+fi
+exit 0
+EOF
+chmod 755 "$r5o_rb/bin/docker"
+r5o_rollback_out() {
+  local log="$1" dbfile="$2" fail_noise="$3" fail_alpine="$4"
+  set +e
+  # shellcheck disable=SC2031
+  out="$(
+    {
+      export PATH="${r5o_rb}/bin:${PATH}"
+      export DOCKER_LOG="$log"
+      export COMPOSE_PROJECT_LOCK="$proj"
+      export R5O_HS_VOL="${proj}_headscale-data"
+      export R5O_DB_FILE="$dbfile"
+      export R5O_FAIL_NOISE="$fail_noise"
+      export R5O_FAIL_ALPINE="$fail_alpine"
+      _restore_current="$proj"
+      _restore_dest="$proj"
+      _restore_prev_mode="published"
+      _restore_host="$r5o_rb/host"
+      _restore_vol="$r5o_rb/vol"
+      _restore_snap="$r5o_rb/snap"
+      _restore_ok=0
+      _restore_phase=2
+      _restore_on_exit
+    } 2>&1
+  )"
+  set -e
+  printf '%s\n' "$out"
+}
+: > "$r5o_rb/fail.log"
+fail_out="$(r5o_rollback_out "$r5o_rb/fail.log" "$r5o_rb/vol/headscale/db.sqlite" 1 1)"
+grep -q 'rollback incomplete' <<<"$fail_out" || die "failed copy reported success: $fail_out"
+if grep -q 'rollback complete' <<<"$fail_out"; then
+  die "failed copy still said rollback complete: $fail_out"
+fi
+grep -q 'noise_private.key' "$r5o_rb/fail.log" || die "noise copy was not attempted"
+grep -q 'tar -C /data -xf' "$r5o_rb/fail.log" || die "alpine fallback did not run: $(cat "$r5o_rb/fail.log")"
+[[ -f "$r5o_rb/host/marker" ]] || die "failed copy deleted the host snapshot"
+[[ -d "$r5o_rb/vol" && -f "$r5o_rb/vol/headscale/db.sqlite" ]] || die "failed copy deleted the volume snapshot"
+[[ -f "$r5o_rb/snap" ]] || die "failed copy deleted the service snapshot"
+
+echo "test: matching commands with different database bytes stay incomplete"
+printf 'nope\n' > "$r5o_rb/planted"
+: > "$r5o_rb/sum.log"
+sum_out="$(r5o_rollback_out "$r5o_rb/sum.log" "$r5o_rb/planted" 0 0)"
+grep -q 'does not match snapshot' <<<"$sum_out" || die "checksum mismatch was ignored: $sum_out"
+grep -q 'rollback incomplete' <<<"$sum_out" || die "checksum mismatch reported success: $sum_out"
+if grep -q 'rollback complete' <<<"$sum_out"; then
+  die "checksum mismatch still said rollback complete: $sum_out"
+fi
+[[ -f "$r5o_rb/host/marker" ]] || die "checksum mismatch deleted the host snapshot"
+[[ -d "$r5o_rb/vol" && -f "$r5o_rb/vol/headscale/db.sqlite" ]] || die "checksum mismatch deleted the volume snapshot"
+[[ -f "$r5o_rb/snap" ]] || die "checksum mismatch deleted the service snapshot"
 
 echo "test_restore_volumes: ok"
