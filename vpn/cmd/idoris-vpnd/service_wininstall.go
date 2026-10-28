@@ -25,6 +25,11 @@ var (
 	windowsSleep = time.Sleep
 )
 
+// protectWindowsInstallFn applies the machine DACL. Tests replace it to
+// record whether the staging directory was still empty. Production is
+// protectWindowsInstall.
+var protectWindowsInstallFn = protectWindowsInstall
+
 // windowsReplaceSpec is one Windows install with explicit paths, so the
 // order can be tested on a non-Windows host. StagingDir is a sibling of the
 // live tree, never a directory inside it.
@@ -81,6 +86,13 @@ func replaceWindowsTask(spec windowsReplaceSpec) error {
 	if err := os.Mkdir(stage, 0o750); err != nil {
 		return err
 	}
+	// Windows ignores the 0750 mode. The inherited ProgramData ACL would
+	// let another local user read credential bytes, so the empty directory
+	// is restricted and verified before any file is copied in. Per-file
+	// ACLs are applied again once the staged files exist.
+	if err := protectWindowsInstallFn(stage, "", "", "", nil); err != nil {
+		return err
+	}
 	commit := false
 	defer func() {
 		if !commit {
@@ -116,7 +128,7 @@ func replaceWindowsTask(spec windowsReplaceSpec) error {
 	}
 	// Secrets exist only in the staging directory. Protect that directory
 	// before the task is stopped. On non-Windows this is a no-op.
-	if err := protectWindowsInstall(stage, stagedConfig, "", stagedExe, creds); err != nil {
+	if err := protectWindowsInstallFn(stage, stagedConfig, "", stagedExe, creds); err != nil {
 		return err
 	}
 
@@ -161,7 +173,7 @@ func replaceWindowsTask(spec windowsReplaceSpec) error {
 	if err := replaceFile(stagedConfig, spec.LiveConfig); err != nil {
 		return err
 	}
-	if err := protectWindowsInstall(spec.LiveDir, spec.LiveConfig, spec.ExeDir, runExe, liveCreds); err != nil {
+	if err := protectWindowsInstallFn(spec.LiveDir, spec.LiveConfig, spec.ExeDir, runExe, liveCreds); err != nil {
 		return err
 	}
 	args := renderSchtasksCreateIn(runExe, spec.LiveConfig, spec.LiveDir)
