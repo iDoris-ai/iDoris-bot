@@ -7,8 +7,10 @@ import (
 )
 
 const (
-	systemLibDir = "/usr/local/lib/idoris"
-	systemLibExe = "/usr/local/lib/idoris/idoris-vpnd"
+	systemLibDir    = "/usr/local/lib/idoris"
+	systemLibExe    = "/usr/local/lib/idoris/idoris-vpnd"
+	systemDarwinDir = "/Library/PrivilegedHelperTools/idoris"
+	systemDarwinExe = "/Library/PrivilegedHelperTools/idoris/idoris-vpnd"
 )
 
 // chownSystemRoot sets the owner of an installed file to root. Tests replace it.
@@ -16,18 +18,23 @@ const (
 var chownSystemRoot = chownSystemRootImpl
 
 // systemExecutable is the protected path a machine service runs.
-// Linux and macOS use /usr/local/lib/idoris/idoris-vpnd. Windows uses
-// %ProgramFiles%\iDoris\idoris-vpnd.exe. An empty programFiles means
-// the usual "C:\Program Files".
+// Linux uses /usr/local/lib/idoris/idoris-vpnd after the ancestor check.
+// macOS uses /Library/PrivilegedHelperTools/idoris because /usr/local is
+// user-owned under Intel Homebrew. Windows uses %ProgramFiles%\iDoris\idoris-vpnd.exe.
+// An empty programFiles means the usual "C:\Program Files".
 func systemExecutable(goos, programFiles string) (dir, exe string) {
-	if goos == "windows" {
+	switch goos {
+	case "windows":
 		if programFiles == "" {
 			programFiles = `C:\Program Files`
 		}
 		dir = programFiles + `\iDoris`
 		return dir, dir + `\idoris-vpnd.exe`
+	case "darwin":
+		return systemDarwinDir, systemDarwinExe
+	default:
+		return systemLibDir, systemLibExe
 	}
-	return systemLibDir, systemLibExe
 }
 
 // copyProtectedExecutable installs src at dest, mode 0755, owned by root.
