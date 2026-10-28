@@ -617,3 +617,57 @@ func TestR4WRootApplyForwardsOnly(t *testing.T) {
 		})
 	}
 }
+
+func TestR4WRelativeConfigBecomesAbsolute(t *testing.T) {
+	work := t.TempDir()
+	away := t.TempDir()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+	if err := os.Chdir(work); err != nil {
+		t.Fatal(err)
+	}
+	host := newFakeOS(false, "linux")
+	code := codeFor(t, join.RoleMember, "https://enroll.example.org", false)
+	codePath := filepath.Join(work, "code.txt")
+	host.files[codePath] = []byte(code + "\n")
+	d := testDeps(host, "")
+	rel := filepath.Join("configs", "office.json")
+	absCfg, err := filepath.Abs(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(absCfg) || absCfg == rel {
+		t.Fatalf("fixture path %q", absCfg)
+	}
+	if err := joinCmd([]string{"--yes", "--no-service", "--config", rel, "--code-file", codePath}, d); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(away); err != nil {
+		t.Fatal(err)
+	}
+	absTok := absCfg + ".enroll-token"
+	absPlan := absCfg + ".gateway-plan.json"
+	if _, ok := host.files[absCfg]; !ok {
+		var keys []string
+		for k := range host.files {
+			keys = append(keys, k)
+		}
+		t.Fatalf("config was not written at %s; files %v", absCfg, keys)
+	}
+	if _, ok := host.files[rel]; ok {
+		t.Fatalf("join kept the relative config path %s", rel)
+	}
+	if !bytes.Contains(host.files[absCfg], []byte(absTok)) {
+		t.Fatalf("config token path:\n%s", host.files[absCfg])
+	}
+	plan := host.files[absPlan]
+	if !bytes.Contains(plan, []byte(`"config_path": "`+absCfg+`"`)) || !bytes.Contains(plan, []byte(`"token_file": "`+absTok+`"`)) {
+		t.Fatalf("plan does not persist absolute paths:\n%s", plan)
+	}
+	if !strings.Contains(d.out(), "config: "+absCfg) {
+		t.Fatalf("stdout:\n%s", d.out())
+	}
+}
