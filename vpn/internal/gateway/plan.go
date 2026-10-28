@@ -70,6 +70,11 @@ type Plan struct {
 	AllowInsecure bool   `json:"allow_insecure,omitempty"`
 	ConfigPath    string `json:"config_path,omitempty"`
 	Listen        string `json:"listen,omitempty"`
+	// DiscoveryControlURL is the control server the enrollment service
+	// returned for this credential. Replacing an authority drops the pin
+	// stored in the daemon config, so this is the URL completion has to
+	// wait for. It is not a secret.
+	DiscoveryControlURL string `json:"discovery_control_url,omitempty"`
 }
 
 // BuildPlan chooses the narrowest route that matches the answers.

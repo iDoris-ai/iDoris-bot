@@ -586,7 +586,7 @@ func r3w2SideConfigChecks(t *testing.T, e *wizEnv, enrollURL, gatewayCode, devic
 	const keep = "/root/.idoris/keep.json"
 	const memberPath = "/root/.idoris/member.json"
 	liveBefore := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/vpn.json")
-	tokenBefore := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/enroll.token")
+	tokenBefore := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/vpn.json.enroll-token")
 	seed := "{\n" +
 		"  \"control_url\": \"https://headscale\",\n" +
 		"  \"accept_dns\": false,\n" +
@@ -686,7 +686,7 @@ func r3w2SideConfigChecks(t *testing.T, e *wizEnv, enrollURL, gatewayCode, devic
 	if live := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/vpn.json"); live != liveBefore {
 		t.Fatal("side joins rewrote the live gateway config")
 	}
-	if tok := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/enroll.token"); tok != tokenBefore {
+	if tok := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/vpn.json.enroll-token"); tok != tokenBefore {
 		t.Fatal("side joins rewrote the live enrollment token")
 	}
 	keepTok := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/keep.json.enroll-token")

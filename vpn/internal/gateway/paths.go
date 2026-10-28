@@ -19,10 +19,12 @@ const DefaultConfigName = "vpn.json"
 
 // PathsFor returns the paths for configPath. An empty configPath, or a config
 // whose path is <dir>/.idoris/vpn.json (including the default under home),
-// keeps the historical names enroll.token and gateway-plan.json. Any other
-// config owns sidecars named from the whole file name, extension included, so
-// office.json and office.conf do not share a token or a plan:
-// office.json.enroll-token and office.json.gateway-plan.json.
+// keeps the historical plan name gateway-plan.json. Its token follows the
+// same <filename>.enroll-token rule as every other config, so the default
+// file is vpn.json.enroll-token. enroll.token is the legacy shared name and
+// is not claimed. Any other config owns sidecars named from the whole file
+// name, extension included, so office.json and office.conf do not share a
+// token or a plan: office.json.enroll-token and office.json.gateway-plan.json.
 func PathsFor(home, configPath string) Paths {
 	base := filepath.Join(home, ".idoris")
 	def := filepath.Join(base, DefaultConfigName)
@@ -40,7 +42,7 @@ func PathsFor(home, configPath string) Paths {
 		}
 		return Paths{
 			Config: cfg,
-			Token:  filepath.Join(dir, "enroll.token"),
+			Token:  filepath.Join(dir, DefaultConfigName+".enroll-token"),
 			Plan:   filepath.Join(dir, "gateway-plan.json"),
 		}
 	}

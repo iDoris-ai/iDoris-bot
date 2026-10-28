@@ -66,6 +66,18 @@
   var ready = bootstrap().catch(showError);
   var expectIdentity = null;
 
+  function exposed(st, key) {
+    if (!st || !Object.prototype.hasOwnProperty.call(st, key)) {
+      return false;
+    }
+    var v = st[key];
+    return typeof v === "string" && v !== "";
+  }
+
+  // Completion is the identity Apply just wrote. An empty expected control
+  // URL means discovery did not name a server, so role is the only check.
+  // Tenant and token fingerprint count only when the daemon status already
+  // carries a non-empty value for them.
   function identityMatches(st) {
     if (!expectIdentity) {
       return true;
@@ -74,6 +86,12 @@
       return false;
     }
     if (expectIdentity.control_url && st.control_url !== expectIdentity.control_url) {
+      return false;
+    }
+    if (expectIdentity.tenant && exposed(st, "tenant") && st.tenant !== expectIdentity.tenant) {
+      return false;
+    }
+    if (expectIdentity.token_fingerprint && exposed(st, "token_fingerprint") && st.token_fingerprint !== expectIdentity.token_fingerprint) {
       return false;
     }
     return true;
@@ -346,11 +364,20 @@
     var body = answers();
     body.replace_existing = !!(replaceBox && replaceBox.checked);
     post("/api/apply", body).then(function (res) {
-      expectIdentity = { role: res.role || "", control_url: res.control_url || "" };
+      var boundURL = res.discovery_control_url || res.control_url || "";
+      expectIdentity = {
+        role: res.role || "",
+        control_url: boundURL,
+        tenant: res.tenant || "",
+        token_fingerprint: res.token_fingerprint || ""
+      };
       var lines = ["配置已写入 " + (res.config_path || "")];
       lines.push("新身份：角色 " + (res.role || "") + "，主机 " + (res.hostname || "") + "，登记 " + (res.enroll_url || ""));
-      if (res.control_url) {
-        lines.push("控制服务器：" + res.control_url);
+      if (boundURL) {
+        lines.push("控制服务器：" + boundURL);
+      }
+      if (res.tenant) {
+        lines.push("租户：" + res.tenant);
       }
       if (res.control_pin_dropped) {
         lines.push("replacing the enrollment authority removes the previous control server pin; the next start discovers the new server and pins it; the old pin is not kept");
