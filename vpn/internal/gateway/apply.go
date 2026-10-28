@@ -397,27 +397,19 @@ func accessLines(plan Plan, vals map[string]json.RawMessage) []string {
 	// host, so it only shows the shape of the name; the administrator supplies it.
 	return []string{
 		"SOCKS5 " + addr,
-		"SOCKS5 credential file " + socksAuthPath(plan.ConfigPath, vals),
+		"SOCKS5 credential file " + socksAuthPath(vals),
 		"Reach the Local AI through this proxy by its MagicDNS name <local-ai-hostname>.idoris.internal (your administrator gives you the exact name)",
 	}
 }
 
-func socksAuthPath(configPath string, vals map[string]json.RawMessage) string {
-	if path, ok := jsonString(vals, "socks5_auth_file"); ok && path != "" {
-		return path
+func socksAuthPath(vals map[string]json.RawMessage) string {
+	auth, _ := jsonString(vals, "socks5_auth_file")
+	state, _ := jsonString(vals, "state_dir")
+	path, err := vpnd.SOCKSAuthPath(auth, state)
+	if err != nil {
+		return err.Error()
 	}
-	dir, ok := jsonString(vals, "state_dir")
-	if !ok || dir == "" {
-		parent := filepath.Dir(configPath)
-		if filepath.Base(parent) == ".idoris" {
-			dir = filepath.Join(parent, "vpn-state")
-		} else if d, err := vpnd.DefaultStateDir(); err == nil {
-			dir = d
-		} else {
-			dir = filepath.Join(parent, "vpn-state")
-		}
-	}
-	return filepath.Join(dir, "socks5.auth")
+	return path
 }
 
 func emitObject(keys []string, vals map[string]json.RawMessage) []byte {
