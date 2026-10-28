@@ -63,11 +63,13 @@ export R5O_FAKE_UID=0 R5O_FAKE_GID=0
 got="$(listing_fixture_owner "$tmp/fixture" 65532)"
 [[ "$got" == "65534:65534" ]] || die "fixture owner for 65532: $got"
 grep -q '65534:65534' "$R5O_CHOWN_LOG" || die "root did not chown the fixture: $(cat "$R5O_CHOWN_LOG")"
+grep -q -F "$tmp $tmp/fixture" "$R5O_CHOWN_LOG" || die "root did not chown the fixture directory: $(cat "$R5O_CHOWN_LOG")"
 
 : > "$R5O_CHOWN_LOG"
 got="$(listing_fixture_owner "$tmp/fixture" 65534)"
 [[ "$got" == "65531:65531" ]] || die "fixture owner for 65534: $got"
 grep -q '65531:65531' "$R5O_CHOWN_LOG" || die "root did not chown the nobody fixture: $(cat "$R5O_CHOWN_LOG")"
+grep -q -F "$tmp $tmp/fixture" "$R5O_CHOWN_LOG" || die "root did not chown the nobody fixture directory: $(cat "$R5O_CHOWN_LOG")"
 
 export R5O_FAKE_UID=501 R5O_FAKE_GID=20
 : > "$R5O_CHOWN_LOG"

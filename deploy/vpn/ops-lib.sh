@@ -1071,16 +1071,19 @@ select_enroll_runtime() {
 
 # listing_fixture_owner prints uid:gid for a read-only credential fixture.
 # The owner stays different from the enrollment runtime uid. Root chowns the
-# file. Anyone else prints the owner the file already has.
+# file and its parent directory. umask 077 leaves that directory 0700, and
+# the selected uid has to be able to traverse it. Anyone else prints the
+# owner the file already has.
 listing_fixture_owner() {
-  local path="$1" runtime_uid="$2" owner
+  local path="$1" runtime_uid="$2" owner parent
   if [[ "$runtime_uid" == 65534 ]]; then
     owner=65531
   else
     owner=65534
   fi
   if [[ "$(id -u)" == 0 ]]; then
-    chown "${owner}:${owner}" "$path"
+    parent="$(dirname "$path")"
+    chown "${owner}:${owner}" "$parent" "$path"
     printf '%s:%s\n' "$owner" "$owner"
     return 0
   fi
@@ -1810,11 +1813,18 @@ PY
     rm -rf "$dir"
     return 0
   fi
-  if [[ -n "$vol" ]]; then
-    docker run --rm --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
-      rm -f /data/tailscaled.state || return 1
+  # sidecar-absent is written only after the volume or tailscaled.state was
+  # verified missing. A snapshot that never looked must not delete the
+  # identity that down left behind, and must not report a finished rollback.
+  if [[ -s "$dest/sidecar-absent" ]]; then
+    if [[ -n "$vol" ]]; then
+      docker run --rm --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
+        rm -f /data/tailscaled.state || return 1
+    fi
+    return 0
   fi
-  return 0
+  echo "restore: sidecar state was not captured; leaving the volume untouched" >&2
+  return 1
 }
 
 _recreate_original_services() {
@@ -1860,8 +1870,43 @@ _restored_enroll_check() {
   return 1
 }
 
+# Snapshot vpn-sidecar-state from the named volume. The vpn-sidecar container
+# is not required: down removes it and leaves the volume. sidecar-state.tar
+# means the identity was captured. sidecar-absent means the volume or
+# tailscaled.state was verified missing. A read failure writes neither and
+# returns 1, so a later rollback cannot treat "not captured" as absence.
+_snapshot_sidecar_state() {
+  local dest="$1" sid rc
+  rm -f "$dest/sidecar-state.tar" "$dest/sidecar-absent"
+  sid="$(_project_volume_name vpn-sidecar-state 2>/dev/null || true)"
+  if [[ -z "$sid" ]]; then
+    printf 'volume\n' > "$dest/sidecar-absent" || return 1
+    chmod 600 "$dest/sidecar-absent" || return 1
+    return 0
+  fi
+  set +e
+  docker run --rm --network none -v "${sid}:/data:ro" "$ALPINE_VOLUME_IMAGE" \
+    sh -c 'cd /data && find . -type f ! -name "*.sock" > /tmp/list && if grep -q "tailscaled.state" /tmp/list; then tar -cf - -T /tmp/list; exit 0; fi; exit 42' \
+    > "$dest/sidecar-state.tar"
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 42 ]]; then
+    rm -f "$dest/sidecar-state.tar"
+    printf 'file\n' > "$dest/sidecar-absent" || return 1
+    chmod 600 "$dest/sidecar-absent" || return 1
+    return 0
+  fi
+  if [[ "$rc" -ne 0 || ! -s "$dest/sidecar-state.tar" ]]; then
+    rm -f "$dest/sidecar-state.tar" "$dest/sidecar-absent"
+    echo "restore: could not snapshot sidecar state" >&2
+    return 1
+  fi
+  chmod 600 "$dest/sidecar-state.tar" || return 1
+  return 0
+}
+
 _snapshot_volumes() {
-  local dest="$1" mode="$2" hsid hpid vol rc hp sid
+  local dest="$1" mode="$2" hsid hpid vol rc hp
   mkdir -p "$dest/headscale" "$dest/headplane"
   chmod 700 "$dest" "$dest/headscale" "$dest/headplane"
   _record_project_resources "$dest" || return 1
@@ -1898,21 +1943,7 @@ _snapshot_volumes() {
     if [[ -n "$hp" ]]; then
       _archive_volume_to_dir "$hp" "$dest/headplane" || return 1
     fi
-    sid="$(_project_volume_name vpn-sidecar-state 2>/dev/null || true)"
-    if [[ -n "$sid" ]]; then
-      set +e
-      docker run --rm --network none -v "${sid}:/data:ro" "$ALPINE_VOLUME_IMAGE" \
-        sh -c 'cd /data && find . -type f ! -name "*.sock" > /tmp/list && if grep -q "tailscaled.state" /tmp/list; then tar -cf - -T /tmp/list; exit 0; fi; exit 42' \
-        > "$dest/sidecar-state.tar"
-      rc=$?
-      set -e
-      if [[ "$rc" -eq 42 ]]; then
-        rm -f "$dest/sidecar-state.tar"
-      elif [[ "$rc" -ne 0 ]]; then
-        rm -f "$dest/sidecar-state.tar"
-        return 1
-      fi
-    fi
+    _snapshot_sidecar_state "$dest" || return 1
     return 0
   fi
   printf '1\n' > "$dest/HAD"
@@ -1936,9 +1967,7 @@ _snapshot_volumes() {
   if [[ -n "$hpid" ]]; then
     docker cp "$hpid:/var/lib/headplane/." "$dest/headplane/"
   fi
-  if [[ -n "$(_compose_ps_id vpn-sidecar)" ]]; then
-    copy_sidecar_state "$dest/sidecar-state.tar" || true
-  fi
+  _snapshot_sidecar_state "$dest" || return 1
   return 0
 }
 

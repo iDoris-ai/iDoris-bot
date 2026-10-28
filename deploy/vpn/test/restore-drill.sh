@@ -348,8 +348,10 @@ with open(sys.argv[1], "w") as fh:
     json.dump(cfg, fh)
     fh.write("\n")
 PY
-# The fixture owner stays off the service uid. Root chowns it to 65534
-# (65531 when the runtime uid is already 65534). A non-root caller cannot
+# The fixture owner stays off the service uid. Root chowns the file and the
+# fixture directory to 65534 (65531 when the runtime uid is already 65534).
+# umask 077 makes the directory 0700, so the directory has to change too or
+# the selected uid cannot traverse the mount. A non-root caller cannot
 # chown, so the printed id is the file's current owner. Docker Desktop bind
 # mounts may not keep that ownership; the drill still passes the same --user.
 shape_owner="$(listing_fixture_owner "$bundle_root/shape/config.json" "$ENROLL_UID")"
