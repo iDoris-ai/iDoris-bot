@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -197,7 +198,7 @@ func (d *deps) runJoin(opt joinOpt) error {
 		approved = nil
 		discovered = ""
 	}
-	role, err := reconcileJoinRole(opt.payload.Role, opt.override, discovered)
+	role, err := gateway.ReconcileRole(opt.payload.Role, opt.override, discovered)
 	if err != nil {
 		return err
 	}
@@ -410,6 +411,10 @@ func (d *deps) setupCmd(args []string) error {
 	}, paths, token, cfg.EnrollURL, insecure, *noService, *yes, *replace)
 }
 
+// readPlanHandoff stats the plan file the unprivileged wizard wrote.
+// Tests replace it. The real function does not follow a symlink.
+var readPlanHandoff = gateway.ReadPlanHandoff
+
 func (d *deps) applyCmd(args []string) error {
 	fs := flag.NewFlagSet("gateway apply", flag.ContinueOnError)
 	fs.SetOutput(d.stderr)
@@ -421,6 +426,12 @@ func (d *deps) applyCmd(args []string) error {
 	}
 	if *planPath == "" {
 		return errors.New("gateway apply: --plan is required")
+	}
+	// Root only enables forwarding. The user's config, token and plan were
+	// written before sudo, and this process must not rewrite them or demand
+	// that the user's directory be root-owned.
+	if d.host.IsRoot() {
+		return d.applyPrivileged(*planPath)
 	}
 	raw, err := d.host.ReadFile(*planPath)
 	if err != nil {
@@ -449,6 +460,47 @@ func (d *deps) applyCmd(args []string) error {
 	return nil
 }
 
+// applyPrivileged is `sudo idoris-vpnd gateway apply`. It checks the plan file
+// the unprivileged wizard wrote, then enables forwarding when the plan needs
+// it. It does not install the service or write under the user's directory.
+func (d *deps) applyPrivileged(planPath string) error {
+	h, err := readPlanHandoff(planPath)
+	if err != nil {
+		return err
+	}
+	if err := gateway.CheckPlanHandoff(h); err != nil {
+		return err
+	}
+	raw, err := d.host.ReadFile(planPath)
+	if err != nil {
+		return err
+	}
+	plan, err := gateway.LoadPlan(bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	if plan.TokenFile != "" {
+		if b, err := d.host.ReadFile(plan.TokenFile); err == nil {
+			token := strings.TrimSpace(string(b))
+			if token != "" && bytes.Contains(raw, []byte(token)) {
+				return errors.New("gateway apply: refusing a plan file that contains the enrollment token")
+			}
+		}
+	}
+	res := gateway.ApplyResult{ConfigPath: plan.ConfigPath, PlanPath: planPath, TokenFile: plan.TokenFile}
+	if gateway.PlanEnablesForward(plan) {
+		if d.host.GOOS() != "linux" {
+			return errors.New("gateway: refusing to enable forwarding on a non-Linux host")
+		}
+		if err := d.host.EnableIPForward(gateway.IPForwardConf, gateway.IPForwardBody); err != nil {
+			return err
+		}
+		res.IPForwardApplied = true
+	}
+	d.printResult(res)
+	return nil
+}
+
 type idorisPaths struct {
 	config string
 	token  string
@@ -456,11 +508,22 @@ type idorisPaths struct {
 }
 
 func (d *deps) paths(config string) (idorisPaths, error) {
+	config = strings.TrimSpace(config)
+	if config != "" {
+		abs, err := filepath.Abs(config)
+		if err != nil {
+			return idorisPaths{}, fmt.Errorf("config path: %w", err)
+		}
+		// An explicit config does not need a home directory. The historical
+		// default name is recognised from the path itself.
+		p := gateway.PathsFor("", abs)
+		return idorisPaths{config: p.Config, token: p.Token, plan: p.Plan}, nil
+	}
 	home, err := d.home()
 	if err != nil || home == "" {
 		return idorisPaths{}, fmt.Errorf("home directory: %w", err)
 	}
-	p := gateway.PathsFor(home, config)
+	p := gateway.PathsFor(home, "")
 	return idorisPaths{config: p.Config, token: p.Token, plan: p.Plan}, nil
 }
 
@@ -518,6 +581,11 @@ func (d *deps) applyPlan(plan gateway.Plan, paths idorisPaths, payload join.Payl
 	plan.TokenFile = paths.token
 	plan.ConfigPath = paths.config
 	plan.AllowInsecure = allowInsecure
+	if replace {
+		if raw, err := d.host.ReadFile(paths.config); err == nil {
+			gateway.NoteControlPinDrop(&plan, gateway.PreviousEnrollURL(raw))
+		}
+	}
 	d.printPlan(plan)
 	if !yes {
 		ok, err := d.askYes(qEnable)
@@ -581,8 +649,14 @@ func (d *deps) printPlan(plan gateway.Plan) {
 
 func (d *deps) printResult(res gateway.ApplyResult) {
 	_, _ = fmt.Fprintf(d.stdout, "config: %s\n", res.ConfigPath)
+	if res.Role != "" || res.EnrollURL != "" || res.Hostname != "" {
+		_, _ = fmt.Fprintf(d.stdout, "identity: role=%s hostname=%s enroll=%s\n", res.Role, res.Hostname, res.EnrollURL)
+	}
+	if res.ControlURL != "" {
+		_, _ = fmt.Fprintf(d.stdout, "control: %s\n", res.ControlURL)
+	}
 	if res.ServiceInstalled {
-		_, _ = fmt.Fprintln(d.stdout, "service: installed")
+		_, _ = fmt.Fprintf(d.stdout, "service: installed role=%s hostname=%s enroll=%s\n", res.Role, res.Hostname, res.EnrollURL)
 	}
 	if res.IPForwardApplied {
 		_, _ = fmt.Fprintln(d.stdout, "ip-forward: enabled")
@@ -723,25 +797,6 @@ func (d *deps) confirmAuthority(authority, expect string, yes bool) error {
 		return errors.New("not applied")
 	}
 	return nil
-}
-
-// reconcileJoinRole prefers an authenticated discovery role. A disagreement
-// between that role and the code, or an override, is an error and not a plan.
-// With no discovery role, an explicit override is kept.
-func reconcileJoinRole(codeRole, override, discovered string) (string, error) {
-	if discovered != "" {
-		if codeRole != "" && codeRole != discovered {
-			return "", fmt.Errorf("join: the enrollment server says this code is for a %q machine, but the code says %q", discovered, codeRole)
-		}
-		if override != "" && override != discovered {
-			return "", fmt.Errorf("join: --role-override %q does not match the enrollment server role %q", override, discovered)
-		}
-		return discovered, nil
-	}
-	if override != "" {
-		return override, nil
-	}
-	return codeRole, nil
 }
 
 func credentialRole(opt joinOpt) string {

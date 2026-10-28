@@ -221,11 +221,14 @@ func TestGatewaySetupAndApply(t *testing.T) {
 }
 
 type fakeOS struct {
-	files    map[string][]byte
-	modes    map[string]os.FileMode
-	root     bool
-	goos     string
-	forwards int
+	files     map[string][]byte
+	modes     map[string]os.FileMode
+	root      bool
+	goos      string
+	forwards  int
+	mkdirs    int
+	installs  int
+	installed [][]byte
 }
 
 func newFakeOS(root bool, goos string) *fakeOS {
@@ -243,7 +246,10 @@ func (m *fakeOS) WriteFile(path string, data []byte, mode os.FileMode) error {
 	m.modes[path] = mode
 	return nil
 }
-func (m *fakeOS) MkdirAll(string, os.FileMode) error { return nil }
+func (m *fakeOS) MkdirAll(string, os.FileMode) error {
+	m.mkdirs++
+	return nil
+}
 func (m *fakeOS) Stat(path string) (os.FileInfo, error) {
 	if _, ok := m.files[path]; !ok {
 		return nil, os.ErrNotExist
@@ -270,7 +276,11 @@ func (m *fakeOS) EnableIPForward(path, content string) error {
 	m.forwards++
 	return m.WriteFile(path, []byte(content), 0o644)
 }
-func (m *fakeOS) InstallService(string) error { return nil }
+func (m *fakeOS) InstallService(path string) error {
+	m.installs++
+	m.installed = append(m.installed, append([]byte(nil), m.files[path]...))
+	return nil
+}
 
 type fakeInfo struct{ name string }
 
@@ -282,6 +292,9 @@ func (m fakeInfo) IsDir() bool        { return false }
 func (m fakeInfo) Sys() any           { return nil }
 
 func TestR3W2JoinCodeInputsMatchAndWarn(t *testing.T) {
+	t.Setenv("HOME", "/home/acme")
+	t.Setenv("USERPROFILE", `C:\Users\acme`)
+	t.Setenv("STATE_DIRECTORY", "")
 	code := codeFor(t, join.RoleMember, "https://enroll.example.org", false)
 	run := func(t *testing.T, args []string, in string, term bool, hidden string) (string, string) {
 		t.Helper()
@@ -472,8 +485,8 @@ func TestR3W2JoinDistinctConfigsAndReplace(t *testing.T) {
 	if err := joinCmd([]string{"--yes", "--no-service", "--config", "/home/acme/orgB/vpn.json", "--code-file", "/tmp/b.code"}, d); err != nil {
 		t.Fatal(err)
 	}
-	tokA := "/home/acme/orgA/vpn.enroll-token"
-	tokB := "/home/acme/orgB/vpn.enroll-token"
+	tokA := "/home/acme/orgA/vpn.json.enroll-token"
+	tokB := "/home/acme/orgB/vpn.json.enroll-token"
 	if string(host.files[tokA]) != "idv1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n" || string(host.files[tokB]) != "idv1_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n" {
 		t.Fatalf("tokens %q %q", host.files[tokA], host.files[tokB])
 	}
@@ -503,7 +516,7 @@ func TestR3W2JoinDistinctConfigsAndReplace(t *testing.T) {
 	}
 
 	// gateway apply --replace is the same switch for a plan that names another URL.
-	planPath := "/home/acme/orgA/vpn.gateway-plan.json"
+	planPath := "/home/acme/orgA/vpn.json.gateway-plan.json"
 	plan := bytes.ReplaceAll(host.files[planPath], []byte("https://b.example"), []byte("https://c.example"))
 	host.files[planPath] = plan
 	before := append([]byte(nil), host.files["/home/acme/orgA/vpn.json"]...)
@@ -520,5 +533,171 @@ func TestR3W2JoinDistinctConfigsAndReplace(t *testing.T) {
 	}
 	if !bytes.Contains(host.files["/home/acme/orgA/vpn.json"], []byte("https://c.example")) {
 		t.Fatalf("apply --replace: %s", host.files["/home/acme/orgA/vpn.json"])
+	}
+}
+
+func TestR4WServiceInstallSeesTheNewIdentity(t *testing.T) {
+	code := codeFor(t, join.RoleMember, "https://b.example", false)
+	host := newFakeOS(false, "linux")
+	host.files["/tmp/b.code"] = []byte(code + "\n")
+	host.files["/home/acme/.idoris/vpn.json"] = []byte("{\n  \"enroll_url\": \"https://a.example\",\n  \"enroll_token_file\": \"/home/acme/.idoris/enroll.token\",\n  \"hostname\": \"old\",\n  \"control_url\": \"https://hs-a.example\"\n}\n")
+	host.files["/home/acme/.idoris/enroll.token"] = []byte("idv1_oldoldoldoldoldoldoldoldold\n")
+	d := testDeps(host, "")
+	if err := joinCmd([]string{"--yes", "--replace", "--code-file", "/tmp/b.code"}, d); err != nil {
+		t.Fatal(err)
+	}
+	if host.installs != 1 || len(host.installed) != 1 {
+		t.Fatalf("installs %d", host.installs)
+	}
+	if !bytes.Contains(host.installed[0], []byte("https://b.example")) || bytes.Contains(host.installed[0], []byte("https://a.example")) || bytes.Contains(host.installed[0], []byte("control_url")) {
+		t.Fatalf("service saw the old config:\n%s", host.installed[0])
+	}
+	out := d.out()
+	for _, want := range []string{
+		"identity: role=member hostname=office-gw enroll=https://b.example",
+		"service: installed role=member hostname=office-gw enroll=https://b.example",
+		gateway.DropControlPinText,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in\n%s", want, out)
+		}
+	}
+}
+
+// TestR4WRootApplyForwardsOnly checks that a root `gateway apply` enables
+// forwarding and does not rewrite the files the unprivileged user owns.
+func TestR4WRootApplyForwardsOnly(t *testing.T) {
+	const (
+		planPath = "/home/acme/.idoris/gateway-plan.json"
+		cfgPath  = "/home/acme/.idoris/vpn.json"
+		tokPath  = "/home/acme/.idoris/enroll.token"
+	)
+	planBody := []byte(`{"role":"gateway","routes":["10.1.2.0/24"],"mode":"auto","enroll_url":"https://enroll.example","token_file":"` + tokPath + `","config_path":"` + cfgPath + `"}` + "\n")
+	host := newFakeOS(true, "linux")
+	host.files[planPath] = append([]byte(nil), planBody...)
+	const userConfig = "{\"hostname\":\"office-gw\"}\n"
+	host.files[cfgPath] = []byte(userConfig)
+	host.files[tokPath] = []byte("idv1_userownedtokenuserownedtokenu\n")
+	prev := readPlanHandoff
+	readPlanHandoff = func(string) (gateway.PlanHandoff, error) {
+		return gateway.PlanHandoff{Regular: true, Mode: 0o600, UID: 1000, Root: true, SudoUID: "1000"}, nil
+	}
+	t.Cleanup(func() { readPlanHandoff = prev })
+	d := testDeps(host, "")
+	if err := gatewayCmd([]string{"apply", "--plan", planPath}, d); err != nil {
+		t.Fatal(err)
+	}
+	if host.forwards != 1 || host.mkdirs != 0 || host.installs != 0 {
+		t.Fatalf("forwards=%d mkdirs=%d installs=%d", host.forwards, host.mkdirs, host.installs)
+	}
+	if string(host.files[cfgPath]) != userConfig || string(host.files[tokPath]) != "idv1_userownedtokenuserownedtokenu\n" {
+		t.Fatalf("root apply rewrote user files\nconfig %s\ntoken %s", host.files[cfgPath], host.files[tokPath])
+	}
+	if !bytes.Equal(host.files[planPath], planBody) {
+		t.Fatal("root apply rewrote the plan")
+	}
+	if !strings.Contains(d.out(), "ip-forward: enabled") {
+		t.Fatalf("stdout:\n%s", d.out())
+	}
+	// A rejected handoff never enables forwarding.
+	for _, tc := range []struct {
+		name string
+		h    gateway.PlanHandoff
+		want string
+	}{
+		{"foreign", gateway.PlanHandoff{Regular: true, Mode: 0o600, UID: 1001, Root: true, SudoUID: "1000"}, "uid 1001"},
+		{"symlink", gateway.PlanHandoff{Symlink: true, Mode: 0o600, UID: 1000, Root: true, SudoUID: "1000"}, "symlink"},
+		{"mode", gateway.PlanHandoff{Regular: true, Mode: 0o666, UID: 1000, Root: true, SudoUID: "1000"}, "0600"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			host.forwards = 0
+			readPlanHandoff = func(string) (gateway.PlanHandoff, error) { return tc.h, nil }
+			d := testDeps(host, "")
+			err := gatewayCmd([]string{"apply", "--plan", planPath}, d)
+			if err == nil || !strings.Contains(err.Error(), tc.want) || host.forwards != 0 {
+				t.Fatalf("err=%v forwards=%d", err, host.forwards)
+			}
+		})
+	}
+}
+
+func TestR4WRelativeConfigBecomesAbsolute(t *testing.T) {
+	work := t.TempDir()
+	away := t.TempDir()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+	if err := os.Chdir(work); err != nil {
+		t.Fatal(err)
+	}
+	host := newFakeOS(false, "linux")
+	code := codeFor(t, join.RoleMember, "https://enroll.example.org", false)
+	codePath := filepath.Join(work, "code.txt")
+	host.files[codePath] = []byte(code + "\n")
+	d := testDeps(host, "")
+	rel := filepath.Join("configs", "office.json")
+	absCfg, err := filepath.Abs(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(absCfg) || absCfg == rel {
+		t.Fatalf("fixture path %q", absCfg)
+	}
+	if err := joinCmd([]string{"--yes", "--no-service", "--config", rel, "--code-file", codePath}, d); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(away); err != nil {
+		t.Fatal(err)
+	}
+	absTok := absCfg + ".enroll-token"
+	absPlan := absCfg + ".gateway-plan.json"
+	if _, ok := host.files[absCfg]; !ok {
+		var keys []string
+		for k := range host.files {
+			keys = append(keys, k)
+		}
+		t.Fatalf("config was not written at %s; files %v", absCfg, keys)
+	}
+	if _, ok := host.files[rel]; ok {
+		t.Fatalf("join kept the relative config path %s", rel)
+	}
+	if !bytes.Contains(host.files[absCfg], []byte(absTok)) {
+		t.Fatalf("config token path:\n%s", host.files[absCfg])
+	}
+	plan := host.files[absPlan]
+	if !bytes.Contains(plan, []byte(`"config_path": "`+absCfg+`"`)) || !bytes.Contains(plan, []byte(`"token_file": "`+absTok+`"`)) {
+		t.Fatalf("plan does not persist absolute paths:\n%s", plan)
+	}
+	if !strings.Contains(d.out(), "config: "+absCfg) {
+		t.Fatalf("stdout:\n%s", d.out())
+	}
+}
+
+func TestR4WExplicitConfigDoesNotNeedHome(t *testing.T) {
+	t.Setenv("HOME", "")
+	t.Setenv("USERPROFILE", "")
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "office.json")
+	host := newFakeOS(false, "linux")
+	code := codeFor(t, join.RoleMember, "https://enroll.example.org", false)
+	codePath := filepath.Join(dir, "code.txt")
+	host.files[codePath] = []byte(code + "\n")
+	d := testDeps(host, "")
+	d.home = func() (string, error) { return "", os.ErrNotExist }
+	if err := joinCmd([]string{"--yes", "--no-service", "--config", cfg, "--code-file", codePath}, d); err != nil {
+		t.Fatal(err)
+	}
+	tok := cfg + ".enroll-token"
+	if !bytes.Contains(host.files[cfg], []byte(tok)) || string(host.files[tok]) == "" {
+		t.Fatalf("config %s token %q", host.files[cfg], host.files[tok])
+	}
+	bare := testDeps(newFakeOS(false, "linux"), "")
+	bare.home = d.home
+	bare.host.(*fakeOS).files[codePath] = []byte(code + "\n")
+	err := joinCmd([]string{"--yes", "--no-service", "--code-file", codePath}, bare)
+	if err == nil || !strings.Contains(err.Error(), "home directory") {
+		t.Fatalf("default config without home: %v", err)
 	}
 }

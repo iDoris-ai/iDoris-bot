@@ -64,6 +64,20 @@
   }
 
   var ready = bootstrap().catch(showError);
+  var expectIdentity = null;
+
+  function identityMatches(st) {
+    if (!expectIdentity) {
+      return true;
+    }
+    if (expectIdentity.role && st.role !== expectIdentity.role) {
+      return false;
+    }
+    if (expectIdentity.control_url && st.control_url !== expectIdentity.control_url) {
+      return false;
+    }
+    return true;
+  }
 
   function post(path, body) {
     return ready.then(function () {
@@ -159,13 +173,23 @@
     document.getElementById("plan").textContent = "先识别网络，再使用建议。";
   }
 
+  var savedRole = "";
   var confirmBox = document.getElementById("confirm-authority");
   var replaceBox = document.getElementById("replace-existing");
   var enableBtn = document.getElementById("enable");
+  var shownAuthority = "";
+  var shownRev = 0;
   function syncEnable() {
     enableBtn.disabled = !confirmBox.checked;
   }
   confirmBox.addEventListener("change", syncEnable);
+
+  function clearConfirmation() {
+    confirmBox.checked = false;
+    shownAuthority = "";
+    shownRev = 0;
+    syncEnable();
+  }
 
   function answers() {
     var whole = document.getElementById("whole").checked;
@@ -174,16 +198,35 @@
       this_machine_is_local_ai: localAI === true,
       whole_subnet: whole,
       device_ips: [],
-      confirm_authority: confirmBox.checked
+      confirm_authority: confirmBox.checked,
+      authority: shownAuthority,
+      join_rev: shownRev
     };
     if (localAI === false && !whole && ip) {
       body.device_ips = [ip];
     }
+    if (savedRole === "member" || savedRole === "admin") {
+      body.this_machine_is_local_ai = false;
+      body.whole_subnet = false;
+      body.device_ips = [];
+    }
     return body;
+  }
+
+  function showGatewayQuestions(show) {
+    ["ai-question", "yes-ai", "no-ai", "detect", "device-label", "device", "probe", "whole-label"].forEach(function (id) {
+      var node = document.getElementById(id);
+      if (node) {
+        node.hidden = !show;
+      }
+    });
   }
 
   document.getElementById("save-code").addEventListener("click", function () {
     showError("");
+    // A confirmation of the previous code must not survive this save,
+    // including while the request is still in flight.
+    clearConfirmation();
     var input = document.getElementById("code");
     post("/api/join", {
       code: input.value,
@@ -191,8 +234,26 @@
     }).then(function (view) {
       input.value = "";
       clearPlanText();
+      clearConfirmation();
+      shownAuthority = view.authority || "";
+      shownRev = view.join_rev || 0;
+      var previousRole = savedRole;
+      savedRole = view.role || "";
       document.getElementById("authority").textContent = "登记服务器：" + (view.authority || "");
       document.getElementById("code-state").textContent = "已保存。租户 " + view.tenant + "，角色 " + view.role + "。加入码已从输入框清掉。请核对上面的登记服务器。";
+      if (savedRole === "member" || savedRole === "admin") {
+        showGatewayQuestions(false);
+        localAI = false;
+        document.getElementById("role-state").textContent = savedRole === "admin"
+          ? "这台机器以管理员加入，不开通网关，也不通告局域网。"
+          : "这台机器以成员加入，不开通网关，也不通告局域网。";
+      } else {
+        showGatewayQuestions(true);
+        if (previousRole === "member" || previousRole === "admin") {
+          localAI = null;
+          document.getElementById("role-state").textContent = "";
+        }
+      }
     }).catch(showError);
   });
 
@@ -225,6 +286,10 @@
     showError("");
     if (!confirmBox.checked) {
       showError(new Error("先确认：这是我组织的服务器"));
+      return;
+    }
+    if (savedRole === "member" || savedRole === "admin") {
+      post("/api/plan", answers()).then(renderPlan).catch(showError);
       return;
     }
     if (localAI === null) {
@@ -263,6 +328,11 @@
       }
       document.getElementById("status").textContent = text;
       if (phase === "connected" || phase === "routes-pending-approval") {
+        if (!identityMatches(st)) {
+          document.getElementById("status").textContent = text + "\n正在运行的仍是上一份身份，继续等待新的服务。";
+          window.setTimeout(poll, 2000);
+          return;
+        }
         return;
       }
       window.setTimeout(poll, 2000);
@@ -276,7 +346,18 @@
     var body = answers();
     body.replace_existing = !!(replaceBox && replaceBox.checked);
     post("/api/apply", body).then(function (res) {
+      expectIdentity = { role: res.role || "", control_url: res.control_url || "" };
       var lines = ["配置已写入 " + (res.config_path || "")];
+      lines.push("新身份：角色 " + (res.role || "") + "，主机 " + (res.hostname || "") + "，登记 " + (res.enroll_url || ""));
+      if (res.control_url) {
+        lines.push("控制服务器：" + res.control_url);
+      }
+      if (res.control_pin_dropped) {
+        lines.push("replacing the enrollment authority removes the previous control server pin; the next start discovers the new server and pins it; the old pin is not kept");
+      }
+      if (res.service_installed) {
+        lines.push("服务已按这份新身份安装。");
+      }
       if (res.sudo_command) {
         lines.push("当前不是 root，没有改系统转发。请原样执行：");
         lines.push(res.sudo_command);

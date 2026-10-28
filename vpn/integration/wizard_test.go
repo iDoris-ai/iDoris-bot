@@ -593,8 +593,7 @@ func r3w2SideConfigChecks(t *testing.T, e *wizEnv, enrollURL, gatewayCode, devic
 		"  \"tailscale_socket\": \"/var/run/tailscale/tailscaled.sock\",\n" +
 		"  \"state_dir\": \"/var/lib/idoris/state\",\n" +
 		"  \"takeover\": false,\n" +
-		"  \"forwards\": [{\"listen\": \"127.0.0.1:8740\", \"target\": \"10.1.2.3:8740\"}],\n" +
-		"  \"extra_kept\": \"yes\"\n" +
+		"  \"forwards\": [{\"listen\": \"127.0.0.1:8740\", \"target\": \"10.1.2.3:8740\"}]\n" +
 		"}\n"
 	if wrote, err := e.execStdin(20*time.Second, seed, "exec", "-T", "wiz-gw", "sh", "-c", "umask 077; cat > "+keep); err != nil {
 		t.Fatalf("seed keep.json: %v\n%s", err, e.redact(wrote))
@@ -611,7 +610,6 @@ func r3w2SideConfigChecks(t *testing.T, e *wizEnv, enrollURL, gatewayCode, devic
 		`"state_dir": "/var/lib/idoris/state"`,
 		`"takeover": false`,
 		`"listen": "127.0.0.1:8740"`,
-		`"extra_kept": "yes"`,
 		`"mode": "system"`,
 		`"role": "gateway"`,
 	} {
@@ -650,7 +648,10 @@ func r3w2SideConfigChecks(t *testing.T, e *wizEnv, enrollURL, gatewayCode, devic
 		t.Fatalf("replace: %v\n%s", err, e.redact(switched))
 	}
 	body = e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", keep)
-	if !strings.Contains(body, "http://attacker.invalid:9") || !strings.Contains(body, `"control_url": "https://headscale"`) || !strings.Contains(body, `"extra_kept": "yes"`) {
+	if !strings.Contains(switched, gateway.DropControlPinText) {
+		t.Fatalf("replace did not say the control pin is dropped:\n%s", e.redact(switched))
+	}
+	if !strings.Contains(body, "http://attacker.invalid:9") || strings.Contains(body, `"control_url"`) {
 		t.Fatalf("replaced config:\n%s", body)
 	}
 	const memberToken = "idv1_sidemembersidemembersidemember"
@@ -688,8 +689,8 @@ func r3w2SideConfigChecks(t *testing.T, e *wizEnv, enrollURL, gatewayCode, devic
 	if tok := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/enroll.token"); tok != tokenBefore {
 		t.Fatal("side joins rewrote the live enrollment token")
 	}
-	keepTok := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/keep.enroll-token")
-	memTok := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/member.enroll-token")
+	keepTok := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/keep.json.enroll-token")
+	memTok := e.must(t, 10*time.Second, "exec", "-T", "wiz-gw", "cat", "/root/.idoris/member.json.enroll-token")
 	if strings.TrimSpace(keepTok) == strings.TrimSpace(tokenBefore) || strings.TrimSpace(memTok) == strings.TrimSpace(keepTok) {
 		t.Fatal("side configs did not keep distinct tokens")
 	}
@@ -697,7 +698,7 @@ func r3w2SideConfigChecks(t *testing.T, e *wizEnv, enrollURL, gatewayCode, devic
 	if !strings.Contains(ls, "-rw-------") {
 		t.Fatalf("keep.json mode: %s", ls)
 	}
-	t.Log("EVIDENCE side config kept control_url across --replace; member SOCKS5 default written")
+	t.Log("EVIDENCE first join kept control_url; --replace dropped it; member SOCKS5 default written")
 }
 
 func (e *wizEnv) assertJoinPlan(t *testing.T, out string, nets wizNets, route string, auto bool) {

@@ -140,14 +140,16 @@ type Server struct {
 }
 
 type heldJoin struct {
-	EnrollURL     string
-	Token         string
-	Role          string
-	Tenant        string
-	Hostname      string
-	Approved      []string
-	AllowInsecure bool
-	discovered    bool
+	EnrollURL      string
+	Token          string
+	Role           string
+	DiscoveredRole string
+	ControlURL     string
+	Tenant         string
+	Hostname       string
+	Approved       []string
+	AllowInsecure  bool
+	discovered     bool
 }
 
 // boundPlan is one plan plus the inputs it was built from. Apply refuses
@@ -172,6 +174,7 @@ type joinView struct {
 	Tenant    string   `json:"tenant"`
 	Hostname  string   `json:"hostname"`
 	Authority string   `json:"authority"`
+	JoinRev   uint64   `json:"join_rev"`
 	Approved  []string `json:"approved,omitempty"`
 	Warning   string   `json:"warning,omitempty"`
 }
@@ -617,6 +620,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	s.joinRev++
+	view.JoinRev = s.joinRev
 	s.join = &held
 	s.paths = paths
 	if s.plan != nil {
@@ -673,6 +677,8 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 		DeviceIPs            []string `json:"device_ips"`
 		WholeSubnet          bool     `json:"whole_subnet"`
 		ConfirmAuthority     bool     `json:"confirm_authority"`
+		Authority            string   `json:"authority"`
+		JoinRev              uint64   `json:"join_rev"`
 	}
 	if !readJSON(w, r, &body) {
 		return
@@ -685,10 +691,11 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Reject before dropping a plan or contacting the enrollment service.
-	// A missing confirmation is not a failed re-plan.
-	if !body.ConfirmAuthority {
+	// The confirmation has to name the authority and join revision now on
+	// the page. A bool left checked after a later save is not enough.
+	if msg := confirmMatches(s.join, s.joinRev, body.ConfirmAuthority, body.Authority, body.JoinRev); msg != "" {
 		s.mu.Unlock()
-		writeErr(w, http.StatusBadRequest, confirmAuthorityMsg)
+		writeErr(w, http.StatusBadRequest, msg)
 		return
 	}
 	if s.plan != nil {
@@ -710,16 +717,26 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// The join code is bound to one role. Refuse before Discover, and leave
-	// the plan cleared: this request was a re-plan that cannot be built.
-	if err := gateway.ValidateRoleChoice(held.Role, body.ThisMachineIsLocalAI); err != nil {
+	// A gateway or local-ai code is bound to that role. Refuse before Discover,
+	// and leave the plan cleared: this request was a re-plan that cannot be built.
+	// Member and admin codes do not answer the gateway questions.
+	if held.Role != join.RoleMember && held.Role != join.RoleAdmin {
+		if err := gateway.ValidateRoleChoice(held.Role, body.ThisMachineIsLocalAI); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	discoverWarning := s.discoverInto(r.Context(), held)
+	role, err := gateway.ReconcileRole(held.Role, "", held.DiscoveredRole)
+	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	discoverWarning := s.discoverInto(r.Context(), held)
+	held.Role = role
 	var plan gateway.Plan
-	var err error
-	if body.ThisMachineIsLocalAI {
+	if held.Role == join.RoleMember || held.Role == join.RoleAdmin {
+		plan, err = gateway.SimplePlan(held.Role, held.Tenant, held.Hostname)
+	} else if body.ThisMachineIsLocalAI {
 		plan, err = gateway.BuildPlan(gateway.Request{
 			ThisMachineIsLocalAI: true, Tenant: held.Tenant, Hostname: held.Hostname,
 		})
@@ -741,6 +758,9 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	plan.AllowInsecure = held.AllowInsecure
 	plan.TokenFile = paths.token
 	plan.ConfigPath = paths.config
+	if raw, err := os.ReadFile(plan.ConfigPath); err == nil {
+		gateway.NoteControlPinDrop(&plan, gateway.PreviousEnrollURL(raw))
+	}
 	if discoverWarning != "" {
 		plan.Warnings = append(plan.Warnings, netdetect.Notice{Code: "discover", Text: discoverWarning})
 	}
@@ -761,6 +781,8 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	if s.join != nil {
 		s.join.Approved = append([]string(nil), held.Approved...)
 		s.join.discovered = held.discovered
+		s.join.DiscoveredRole = held.DiscoveredRole
+		s.join.ControlURL = held.ControlURL
 	}
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, plan)
@@ -772,6 +794,8 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		DeviceIPs            []string `json:"device_ips"`
 		WholeSubnet          bool     `json:"whole_subnet"`
 		ConfirmAuthority     bool     `json:"confirm_authority"`
+		Authority            string   `json:"authority"`
+		JoinRev              uint64   `json:"join_rev"`
 		ReplaceExisting      bool     `json:"replace_existing"`
 	}
 	if !readJSON(w, r, &body) {
@@ -784,9 +808,14 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "another apply is already running")
 		return
 	}
-	if !body.ConfirmAuthority {
+	if s.join == nil {
 		s.mu.Unlock()
-		writeErr(w, http.StatusBadRequest, confirmAuthorityMsg)
+		writeErr(w, http.StatusBadRequest, "paste a join code first")
+		return
+	}
+	if msg := confirmMatches(s.join, s.joinRev, body.ConfirmAuthority, body.Authority, body.JoinRev); msg != "" {
+		s.mu.Unlock()
+		writeErr(w, http.StatusBadRequest, msg)
 		return
 	}
 	if s.plan == nil || s.join == nil || s.plan.joinRev != s.joinRev || s.plan.detectGen != s.detectGen {
@@ -846,6 +875,26 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 const stalePlanMsg = "the plan is stale; build it again"
 const answerMismatchMsg = "the plan does not match the answers on the page; build it again"
 const confirmAuthorityMsg = "confirm this is your organization's server before applying"
+const confirmMismatchMsg = "confirmation does not match the displayed enrollment authority and join revision"
+
+// confirmMatches reports why a plan or apply must stop before discovery.
+// An empty string means the request names the join that is stored now.
+func confirmMatches(join *heldJoin, rev uint64, confirmed bool, authority string, gotRev uint64) string {
+	if join == nil {
+		return "paste a join code first"
+	}
+	if !confirmed {
+		return confirmAuthorityMsg
+	}
+	host, err := authorityHost(join.EnrollURL)
+	if err != nil {
+		return err.Error()
+	}
+	if gotRev != rev || !strings.EqualFold(strings.TrimSpace(authority), host) {
+		return confirmMismatchMsg
+	}
+	return ""
+}
 
 // discoverInto contacts the enrollment service only after the operator has
 // confirmed the authority. It records the result on held, which is a copy;
@@ -863,6 +912,8 @@ func (s *Server) discoverInto(ctx context.Context, held *heldJoin) string {
 	held.discovered = true
 	if disc != nil {
 		held.Approved = append([]string(nil), disc.LANCIDRs...)
+		held.DiscoveredRole = strings.TrimSpace(disc.Role)
+		held.ControlURL = strings.TrimSpace(disc.ControlURL)
 	}
 	return ""
 }

@@ -367,8 +367,7 @@ func TestR3W2ApplyPreservesUnownedKeys(t *testing.T) {
     {"listen": "127.0.0.1:11434", "target": "ai.example:11434"}
   ],
   "takeover": false,
-  "hostname": "old-name",
-  "site_note": "keep-me"
+  "hostname": "old-name"
 }
 `
 	h := newMemHost(false, "linux")
@@ -382,7 +381,7 @@ func TestR3W2ApplyPreservesUnownedKeys(t *testing.T) {
 	afterKeys, afterVals := mustObject(t, got)
 	unowned := map[string]struct{}{
 		"control_url": {}, "accept_dns": {}, "tailscale_socket": {}, "state_dir": {},
-		"forwards": {}, "takeover": {}, "site_note": {},
+		"forwards": {}, "takeover": {},
 	}
 	for key := range unowned {
 		if string(beforeVals[key]) != string(afterVals[key]) {
@@ -395,8 +394,8 @@ func TestR3W2ApplyPreservesUnownedKeys(t *testing.T) {
 	if string(afterVals["control_url"]) != `"https://hs.example/headscale"` {
 		t.Fatalf("control_url %s", afterVals["control_url"])
 	}
-	if !bytes.Contains(got, []byte(`"site_note": "keep-me"`)) {
-		t.Fatalf("unknown key dropped:\n%s", got)
+	if bytes.Contains(got, []byte("site_note")) {
+		t.Fatalf("unknown key written:\n%s", got)
 	}
 	// Non-owned keys stay ahead of keys the wizard appended.
 	if indexOf(afterKeys, "control_url") > indexOf(afterKeys, "enroll_url") {
@@ -463,6 +462,9 @@ func TestR3W2DistinctConfigsAndReplace(t *testing.T) {
 }
 
 func TestR3W2MemberAndAdminSOCKS(t *testing.T) {
+	t.Setenv("HOME", "/home/acme")
+	t.Setenv("USERPROFILE", `C:\Users\acme`)
+	t.Setenv("STATE_DIRECTORY", "")
 	const token = "idv1_secretsecretsecretsecretsecretse"
 	applyRole := func(t *testing.T, role, mode string) (ApplyResult, []byte) {
 		t.Helper()
@@ -532,7 +534,7 @@ func TestR3W2MemberAndAdminSOCKS(t *testing.T) {
 	}
 	p.EnrollURL = "https://enroll.example.org"
 	p.ConfigPath = "/home/acme/.idoris/custom.json"
-	p.TokenFile = "/home/acme/.idoris/custom.enroll-token"
+	p.TokenFile = "/home/acme/.idoris/custom.json.enroll-token"
 	h := newMemHost(false, "darwin")
 	h.files[p.ConfigPath] = []byte("{\n  \"socks5_listen\": \"127.0.0.1:1055\",\n  \"socks5_auth_file\": \"/home/acme/.idoris/custom.auth\",\n  \"state_dir\": \"/var/lib/idoris/state\"\n}\n")
 	res, err := Apply(p, h, ApplyOptions{Token: token, NoService: true})

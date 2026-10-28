@@ -29,31 +29,33 @@ func TestR3W1ReplaceExistingAndAccessInfo(t *testing.T) {
 	})
 	cap, csrf := r3w1Bootstrap(t, srv, client)
 	code := r3w1Code(t, "https://enroll.example.org", "token-gw-aaaaaaaaaaaaaaaaaaaa", "office-a")
-	if status, body := r3w1Post(t, client, srv, cap, csrf, "/api/join", map[string]any{"code": code}); status != http.StatusOK {
+	status, body := r3w1Post(t, client, srv, cap, csrf, "/api/join", map[string]any{"code": code})
+	if status != http.StatusOK {
 		t.Fatalf("join %d %s", status, body)
 	}
+	joined := r3w1ReadJoin(t, body)
 	if status, body := r3w1Post(t, client, srv, cap, csrf, "/api/detect", map[string]any{}); status != http.StatusOK {
 		t.Fatalf("detect %d %s", status, body)
 	}
-	status, body := r3w1Post(t, client, srv, cap, csrf, "/api/plan", map[string]any{
-		"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"}, "confirm_authority": true,
-	})
+	status, body = r3w1Post(t, client, srv, cap, csrf, "/api/plan", joined.body(map[string]any{
+		"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"},
+	}))
 	wantPaths := gateway.PathsFor("/home/acme", "")
 	if status != http.StatusOK || !bytes.Contains(body, []byte(wantPaths.Config)) || !bytes.Contains(body, []byte(wantPaths.Token)) {
 		t.Fatalf("plan paths %d %s", status, body)
 	}
 
-	same := map[string]any{
-		"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"}, "confirm_authority": true,
-	}
+	same := joined.body(map[string]any{
+		"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"},
+	})
 	status, body = r3w1Post(t, client, srv, cap, csrf, "/api/apply", same)
 	if status != http.StatusBadGateway || r3w1Err(t, body) != foreign {
 		t.Fatalf("foreign config %d %s", status, body)
 	}
-	status, body = r3w1Post(t, client, srv, cap, csrf, "/api/apply", map[string]any{
+	status, body = r3w1Post(t, client, srv, cap, csrf, "/api/apply", joined.body(map[string]any{
 		"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"},
-		"confirm_authority": true, "replace_existing": true,
-	})
+		"replace_existing": true,
+	}))
 	if status != http.StatusOK || !bytes.Contains(body, []byte("SOCKS5 127.0.0.1:1055")) || !bytes.Contains(body, []byte("token file is mode 0600")) {
 		t.Fatalf("access info %d %s", status, body)
 	}

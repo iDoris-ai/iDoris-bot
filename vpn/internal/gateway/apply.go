@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 
 	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/join"
@@ -48,6 +50,16 @@ type ApplyResult struct {
 	IPForwardApplied bool   `json:"ip_forward_applied"`
 	SudoCommand      string `json:"sudo_command,omitempty"`
 	ServiceInstalled bool   `json:"service_installed"`
+	// Role, Hostname, EnrollURL and ControlURL name the identity that was
+	// written. ControlURL is empty when the config does not pin one. Callers
+	// use this to tell a new identity from the daemon that is still running.
+	Role       string `json:"role,omitempty"`
+	Hostname   string `json:"hostname,omitempty"`
+	EnrollURL  string `json:"enroll_url,omitempty"`
+	ControlURL string `json:"control_url,omitempty"`
+	// ControlPinDropped is true when a new enrollment authority replaced the
+	// previous one and the old control server pin was removed.
+	ControlPinDropped bool `json:"control_pin_dropped,omitempty"`
 	// AccessInfo is human-readable text telling the member how applications reach
 	// the Local AI (for example the loopback SOCKS5 address). It never holds a
 	// secret, only the path of the file that does.
@@ -79,17 +91,21 @@ func Apply(plan Plan, host Host, opt ApplyOptions) (ApplyResult, error) {
 	if plan.ConfigPath == "" || plan.TokenFile == "" {
 		return ApplyResult{}, errors.New("gateway: plan is missing config_path or token_file")
 	}
-	if err := host.MkdirAll(filepath.Dir(plan.ConfigPath), 0o700); err != nil {
-		return ApplyResult{}, err
-	}
-	if err := host.MkdirAll(filepath.Dir(plan.TokenFile), 0o700); err != nil {
-		return ApplyResult{}, err
-	}
 	existing, haveConfig, err := readExistingConfig(host, plan.ConfigPath)
 	if err != nil {
 		return ApplyResult{}, err
 	}
 	if haveConfig {
+		// A config that still points at another file (the historical shared
+		// enroll.token, or a previous sidecar) keeps that file's bytes. The new
+		// token is written to this config's own sidecar and the config is updated
+		// to point there.
+		if pointer, ok := jsonStringField(existing, "enroll_token_file"); ok && strings.TrimSpace(pointer) != "" {
+			own := PathsFor("", plan.ConfigPath).Token
+			if filepath.Clean(pointer) != filepath.Clean(own) {
+				plan.TokenFile = own
+			}
+		}
 		oldURL, hasURL := jsonStringField(existing, "enroll_url")
 		if hasURL && oldURL != "" && oldURL != plan.EnrollURL && !opt.ReplaceExisting {
 			return ApplyResult{}, fmt.Errorf("gateway: %s is already enrolled with %s; pass --replace to switch it to %s", plan.ConfigPath, oldURL, plan.EnrollURL)
@@ -102,6 +118,12 @@ func Apply(plan Plan, host Host, opt ApplyOptions) (ApplyResult, error) {
 	if err := validateConfigBytes(raw); err != nil {
 		return ApplyResult{}, err
 	}
+	if err := host.MkdirAll(filepath.Dir(plan.ConfigPath), 0o700); err != nil {
+		return ApplyResult{}, err
+	}
+	if err := host.MkdirAll(filepath.Dir(plan.TokenFile), 0o700); err != nil {
+		return ApplyResult{}, err
+	}
 	if opt.Token != "" {
 		if err := host.WriteFile(plan.TokenFile, []byte(opt.Token+"\n"), 0o600); err != nil {
 			return ApplyResult{}, err
@@ -112,7 +134,16 @@ func Apply(plan Plan, host Host, opt ApplyOptions) (ApplyResult, error) {
 	if err := host.WriteFile(plan.ConfigPath, raw, 0o600); err != nil {
 		return ApplyResult{}, err
 	}
-	res := ApplyResult{ConfigPath: plan.ConfigPath, TokenFile: plan.TokenFile, AccessInfo: access}
+	controlURL, _ := jsonStringField(raw, "control_url")
+	_, pinDropped := jsonStringField(existing, "control_url")
+	if !haveConfig || controlURL != "" || PreviousEnrollURL(existing) == "" || PreviousEnrollURL(existing) == plan.EnrollURL {
+		pinDropped = false
+	}
+	res := ApplyResult{
+		ConfigPath: plan.ConfigPath, TokenFile: plan.TokenFile, AccessInfo: access,
+		Role: plan.Role, Hostname: plan.Hostname, EnrollURL: plan.EnrollURL, ControlURL: controlURL,
+		ControlPinDropped: pinDropped,
+	}
 	if wantsForward(plan) {
 		if host.GOOS() != "linux" {
 			return res, errors.New("gateway: refusing to enable forwarding on a non-Linux host")
@@ -158,12 +189,48 @@ func wantsForward(plan Plan) bool {
 	return plan.Role == join.RoleGateway && len(plan.Routes) > 0
 }
 
+// PlanEnablesForward reports whether applying this plan needs ip_forward.
+// The root continuation enables that and does not rewrite the user's files.
+func PlanEnablesForward(plan Plan) bool { return wantsForward(plan) }
+
 // defaultSOCKSListen is the authenticated loopback proxy a member or admin
-// gets when the config is embedded, or auto (which becomes embedded when the
-// system tailnet is foreign or down). The daemon writes the credential to
-// <state_dir>/socks5.auth. local-ai and gateway stay on system mode and do
-// not get this listener.
-const defaultSOCKSListen = "127.0.0.1:1080"
+// prefers when the config is embedded, or auto (which becomes embedded when
+// the system tailnet is foreign or down). If that port is taken, ChooseLoopbackSOCKS
+// walks the next ports through socksLastPort. The daemon writes the credential
+// to <state_dir>/socks5.auth. local-ai and gateway stay on system mode and do
+// not get this listener. socks5_allow_anonymous stays unset.
+const (
+	defaultSOCKSListen = "127.0.0.1:1080"
+	socksLastPort      = 1096
+)
+
+// ChooseLoopbackSOCKS returns the first free 127.0.0.1 port from 1080 through
+// 1096. It listens and closes, so the port can be taken again before the
+// daemon binds it. An existing socks5_listen value is left alone by the caller.
+func ChooseLoopbackSOCKS() (string, error) {
+	host, portText, err := net.SplitHostPort(defaultSOCKSListen)
+	if err != nil {
+		return "", err
+	}
+	first, err := strconv.Atoi(portText)
+	if err != nil {
+		return "", err
+	}
+	var lastErr error
+	for port := first; port <= socksLastPort; port++ {
+		addr := net.JoinHostPort(host, strconv.Itoa(port))
+		ln, listenErr := net.Listen("tcp", addr)
+		if listenErr != nil {
+			lastErr = listenErr
+			continue
+		}
+		if err := ln.Close(); err != nil {
+			return "", fmt.Errorf("gateway: close SOCKS probe %s: %w", addr, err)
+		}
+		return addr, nil
+	}
+	return "", fmt.Errorf("gateway: no free loopback port for the member SOCKS5 listener in %s-%d: %w; set socks5_listen before joining", defaultSOCKSListen, socksLastPort, lastErr)
+}
 
 func mergeConfig(existing []byte, have bool, plan Plan) ([]byte, []string, error) {
 	var keys []string
@@ -182,7 +249,11 @@ func mergeConfig(existing []byte, have bool, plan Plan) ([]byte, []string, error
 	}
 	if memberEmbeddedAccess(plan) {
 		if _, ok := vals["socks5_listen"]; !ok {
-			keys, err = assignRaw(keys, vals, "socks5_listen", defaultSOCKSListen, true)
+			addr, err := ChooseLoopbackSOCKS()
+			if err != nil {
+				return nil, nil, err
+			}
+			keys, err = assignRaw(keys, vals, "socks5_listen", addr, true)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -194,6 +265,19 @@ func mergeConfig(existing []byte, have bool, plan Plan) ([]byte, []string, error
 
 func assignOwned(keys []string, vals map[string]json.RawMessage, plan Plan) ([]string, error) {
 	var err error
+	oldURL, hasOld := jsonString(vals, "enroll_url")
+	if hasOld && oldURL != "" && oldURL != plan.EnrollURL {
+		if _, pinned := vals["control_url"]; pinned {
+			delete(vals, "control_url")
+			next := make([]string, 0, len(keys))
+			for _, k := range keys {
+				if k != "control_url" {
+					next = append(next, k)
+				}
+			}
+			keys = next
+		}
+	}
 	keys, err = assignRaw(keys, vals, "enroll_url", plan.EnrollURL, plan.EnrollURL != "")
 	if err != nil {
 		return nil, err
@@ -201,6 +285,14 @@ func assignOwned(keys []string, vals map[string]json.RawMessage, plan Plan) ([]s
 	keys, err = assignRaw(keys, vals, "enroll_token_file", plan.TokenFile, plan.TokenFile != "")
 	if err != nil {
 		return nil, err
+	}
+	// enroll_token and enroll_token_file are one setting. Installing the file
+	// removes the inline value, which the daemon would reject at start.
+	if plan.TokenFile != "" {
+		keys = dropJSONKey(keys, vals, "enroll_token")
+	}
+	if path, ok := jsonString(vals, "auth_key_file"); ok && strings.TrimSpace(path) != "" {
+		keys = dropJSONKey(keys, vals, "auth_key")
 	}
 	keys, err = assignRaw(keys, vals, "enroll_allow_insecure", true, plan.AllowInsecure)
 	if err != nil {
@@ -236,6 +328,20 @@ func assignOwned(keys []string, vals map[string]json.RawMessage, plan Plan) ([]s
 	}
 	routes := append([]string(nil), plan.Routes...)
 	return assignRaw(keys, vals, "advertise_routes", routes, len(routes) > 0)
+}
+
+func dropJSONKey(keys []string, vals map[string]json.RawMessage, key string) []string {
+	if _, ok := vals[key]; !ok {
+		return keys
+	}
+	delete(vals, key)
+	next := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if k != key {
+			next = append(next, k)
+		}
+	}
+	return next
 }
 
 func assignRaw(keys []string, vals map[string]json.RawMessage, key string, v any, include bool) ([]string, error) {
@@ -291,27 +397,19 @@ func accessLines(plan Plan, vals map[string]json.RawMessage) []string {
 	// host, so it only shows the shape of the name; the administrator supplies it.
 	return []string{
 		"SOCKS5 " + addr,
-		"SOCKS5 credential file " + socksAuthPath(plan.ConfigPath, vals),
+		"SOCKS5 credential file " + socksAuthPath(vals),
 		"Reach the Local AI through this proxy by its MagicDNS name <local-ai-hostname>.idoris.internal (your administrator gives you the exact name)",
 	}
 }
 
-func socksAuthPath(configPath string, vals map[string]json.RawMessage) string {
-	if path, ok := jsonString(vals, "socks5_auth_file"); ok && path != "" {
-		return path
+func socksAuthPath(vals map[string]json.RawMessage) string {
+	auth, _ := jsonString(vals, "socks5_auth_file")
+	state, _ := jsonString(vals, "state_dir")
+	path, err := vpnd.SOCKSAuthPath(auth, state)
+	if err != nil {
+		return err.Error()
 	}
-	dir, ok := jsonString(vals, "state_dir")
-	if !ok || dir == "" {
-		parent := filepath.Dir(configPath)
-		if filepath.Base(parent) == ".idoris" {
-			dir = filepath.Join(parent, "vpn-state")
-		} else if d, err := vpnd.DefaultStateDir(); err == nil {
-			dir = d
-		} else {
-			dir = filepath.Join(parent, "vpn-state")
-		}
-	}
-	return filepath.Join(dir, "socks5.auth")
+	return path
 }
 
 func emitObject(keys []string, vals map[string]json.RawMessage) []byte {
@@ -380,6 +478,16 @@ func parseObject(data []byte) ([]string, map[string]json.RawMessage, error) {
 	return keys, vals, nil
 }
 
+// PreviousEnrollURL reads enroll_url from a config document. Unknown keys are
+// ignored so the warning can be printed before the strict decoder runs.
+func PreviousEnrollURL(data []byte) string {
+	got, ok := jsonStringField(data, "enroll_url")
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(got)
+}
+
 func jsonStringField(data []byte, key string) (string, bool) {
 	_, vals, err := parseObject(data)
 	if err != nil {
@@ -414,16 +522,18 @@ func readExistingConfig(host Host, path string) ([]byte, bool, error) {
 	return b, true, nil
 }
 
-// validateConfigBytes loads the merged document with vpnd.LoadConfig.
-// Keys the daemon schema does not know are kept in the written file, and the
-// loader sees a projection of the known keys so a forward-compatible field
-// does not fail the type check. Resolve then checks mode, role, forwards and
-// routes. A placeholder token avoids reading the real token file, which may
-// not have been written yet.
+// validateConfigBytes runs the exact document through the daemon's strict
+// decoder (DisallowUnknownFields via LoadConfig). Unsupported keys are named
+// and rejected before Apply writes anything. Resolve then checks mode, role,
+// forwards and routes. A placeholder token avoids reading the real token
+// file, which may not have been written yet.
 func validateConfigBytes(data []byte) error {
-	projected, err := projectKnownConfig(data)
+	bad, err := unknownConfigKeys(data)
 	if err != nil {
 		return err
+	}
+	if len(bad) > 0 {
+		return fmt.Errorf("gateway: config has unsupported keys: %s; remove them before joining, the daemon would refuse this file at start", strings.Join(bad, ", "))
 	}
 	dir, err := os.MkdirTemp("", "idoris-vpn-cfg-")
 	if err != nil {
@@ -431,7 +541,7 @@ func validateConfigBytes(data []byte) error {
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
 	path := filepath.Join(dir, "vpn.json")
-	if err := os.WriteFile(path, projected, 0o600); err != nil { //nolint:gosec // G703: path is under MkdirTemp
+	if err := os.WriteFile(path, data, 0o600); err != nil { //nolint:gosec // G703: path is under MkdirTemp
 		return err
 	}
 	cfg, err := vpnd.LoadConfig(path)
@@ -451,19 +561,19 @@ func validateConfigBytes(data []byte) error {
 	return nil
 }
 
-func projectKnownConfig(data []byte) ([]byte, error) {
-	keys, vals, err := parseObject(data)
+func unknownConfigKeys(data []byte) ([]string, error) {
+	keys, _, err := parseObject(data)
 	if err != nil {
 		return nil, err
 	}
 	known := knownConfigKeys()
-	var keep []string
+	var bad []string
 	for _, key := range keys {
-		if _, ok := known[key]; ok {
-			keep = append(keep, key)
+		if _, ok := known[key]; !ok {
+			bad = append(bad, key)
 		}
 	}
-	return emitObject(keep, vals), nil
+	return bad, nil
 }
 
 func knownConfigKeys() map[string]struct{} {

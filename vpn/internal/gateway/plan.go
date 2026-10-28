@@ -83,6 +83,20 @@ func BuildPlan(req Request) (Plan, error) {
 	return gatewayPlan(req)
 }
 
+// DropControlPinText is the plan warning shown when an enrollment authority
+// is replaced. The old control server pin is not kept.
+const DropControlPinText = "replacing the enrollment authority removes the previous control server pin; the next start discovers the new server and pins it; the old pin is not kept"
+
+// NoteControlPinDrop appends that warning when previousEnrollURL is a different
+// authority from the one this plan will write.
+func NoteControlPinDrop(plan *Plan, previousEnrollURL string) {
+	previousEnrollURL = strings.TrimSpace(previousEnrollURL)
+	if plan == nil || previousEnrollURL == "" || previousEnrollURL == plan.EnrollURL {
+		return
+	}
+	plan.Warnings = append(plan.Warnings, netdetect.Notice{Code: "drop-control-pin", Text: DropControlPinText})
+}
+
 // SimplePlan is a member or admin join: no routes, accept other people's routes.
 func SimplePlan(role, tenant, hostname string) (Plan, error) {
 	if role != join.RoleMember && role != join.RoleAdmin {
@@ -369,6 +383,25 @@ func aclTag(tenant, suffix string) (string, error) {
 		}
 	}
 	return "tag:" + tenant + "-" + suffix, nil
+}
+
+// ReconcileRole prefers an authenticated discovery role. A disagreement
+// between that role and the code, or an override, is an error and not a plan.
+// With no discovery role, an explicit override is kept.
+func ReconcileRole(codeRole, override, discovered string) (string, error) {
+	if discovered != "" {
+		if codeRole != "" && codeRole != discovered {
+			return "", fmt.Errorf("join: the enrollment server says this code is for a %q machine, but the code says %q", discovered, codeRole)
+		}
+		if override != "" && override != discovered {
+			return "", fmt.Errorf("join: --role-override %q does not match the enrollment server role %q", override, discovered)
+		}
+		return discovered, nil
+	}
+	if override != "" {
+		return override, nil
+	}
+	return codeRole, nil
 }
 
 // ValidateRoleChoice refuses a wizard answer that the credential cannot carry

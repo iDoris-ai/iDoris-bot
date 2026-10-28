@@ -35,6 +35,7 @@ func TestR3W1ApplyRequiresAuthorityConfirmation(t *testing.T) {
 	if status != http.StatusOK || !bytes.Contains(body, []byte(`"authority":"enroll.example.org:8443"`)) {
 		t.Fatalf("join authority %d %s", status, body)
 	}
+	joined := r3w1ReadJoin(t, body)
 	if bytes.Contains(body, []byte(token)) || discover.Load() != 0 {
 		t.Fatalf("join sent the credential or echoed the token: discover %d %s", discover.Load(), body)
 	}
@@ -43,7 +44,7 @@ func TestR3W1ApplyRequiresAuthorityConfirmation(t *testing.T) {
 	}
 
 	no := map[string]any{"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"}}
-	yes := map[string]any{"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"}, "confirm_authority": true}
+	yes := joined.body(map[string]any{"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"}})
 
 	status, body = r3w1Post(t, client, srv, cap, csrf, "/api/plan", no)
 	if status != http.StatusBadRequest || !bytes.Contains(body, []byte("confirm this is your organization")) || discover.Load() != 0 {
