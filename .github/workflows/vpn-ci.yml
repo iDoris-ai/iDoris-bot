@@ -1,0 +1,44 @@
+name: vpn-ci
+on:
+  push:
+    branches: [main]
+    paths: ["vpn/**", ".github/workflows/vpn-ci.yml"]
+  pull_request:
+    paths: ["vpn/**", ".github/workflows/vpn-ci.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vpn
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: vpn/go.mod
+          cache-dependency-path: vpn/go.sum
+      - run: make test
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.14.0
+          working-directory: vpn
+      - run: make build && make build-linux
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: unit
+    defaults:
+      run:
+        working-directory: vpn
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: vpn/go.mod
+          cache-dependency-path: vpn/go.sum
+      - run: docker compose version
+      - run: make integration

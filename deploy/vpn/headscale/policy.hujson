@@ -1,0 +1,138 @@
+// iDoris VPN access policy (Headscale v0.29.x, file mode), one block per tenant.
+//
+// Model
+//   * Tenant "acme" = Headscale user "acme" (policy name "acme@"). Its members'
+//     laptops/phones are the PERSONAL nodes of that user, enrolled with the
+//     "acme" entry of enroll/config.json.
+//   * Its Local AI host is a TAGGED node carrying tag:acme-local-ai, enrolled
+//     with the "acme-local-ai" entry (acl_tags: ["tag:acme-local-ai"]). Tagged
+//     nodes are owned by the special Headscale user "tagged-devices", not by
+//     the tenant, so "acme@" never matches them.
+//   * Default deny. Per tenant, exactly these flows are allowed and nothing else:
+//       acme@                 -> tag:acme-local-ai : 8740, 8742, 443
+//       tag:acme-local-ai     -> acme@ : any port
+//       group:admins          -> tag:acme-local-ai : 22, plus Tailscale SSH
+//     There is no member -> member rule and no rule that mentions two tenants,
+//     so tenants cannot reach each other's members or Local AI hosts.
+//   * Do NOT use autogroup:member / autogroup:tagged / "*" in rules: they span
+//     all tenants and would break the isolation.
+//
+// Trailing commas are valid HuJSON, so copied blocks can simply be pasted
+// one after the other.
+//
+// Adding a tenant (e.g. "globex")
+//   1. bash bootstrap.sh globex     (creates user globex, both enrollment
+//                                    entries and their tokens)
+//   2. Copy the three blocks marked "TENANT BLOCK" below (tagOwners, acls, ssh)
+//      and replace every "acme" with "globex". Names must be lowercase.
+//   3. Validate and reload (policy.mode is "file", Headplane's ACL editor is
+//      read-only):
+//        docker compose exec headscale headscale policy check -f /etc/headscale/policy.hujson
+//        docker compose kill -s HUP headscale
+//   A tenant with no nodes yet is fine: unknown users and tags without nodes
+//   resolve to nothing and never block validation or reload.
+//
+// Admins: Headscale v0.29 has no autogroup:admin (supported autogroups: member,
+// tagged, nonroot, self, internet, danger-all). Admins are the Headscale users
+// listed in group:admins; replace the placeholder "admin@" with real user
+// names written "name@" (the users may be created later). Admin users are not
+// tenants and get no access except the rules in this file.
+//
+// Tailscale SSH needs BOTH an "ssh" rule (who may log in as whom) and an ACL
+// opening port 22 for the same source; the ssh section alone does not open the
+// port. With "check" and no OIDC configured, each SSH login pauses until an
+// operator runs `headscale auth approve --auth-id <id>` on the server (the id
+// is in the SSH banner and at <server_url>/auth/<id>). Use "accept" instead of
+// "check" for no approval step.
+//
+// MagicDNS names are <hostname>.<base_domain> and are shared by the whole
+// instance (the tenant is NOT part of the name; a duplicate hostname becomes
+// "<hostname>-1"). Always give a Local AI host a tenant-prefixed hostname, e.g.
+// "acme-local-ai" -> acme-local-ai.idoris.internal.
+{
+  "groups": {
+    "group:admins": ["admin@"]
+  },
+
+  // Only admins may self-assign a tenant tag (e.g. `tailscale up
+  // --advertise-tags`). The enrollment service tags nodes through pre-auth
+  // keys created with the Headscale API key, which does not consult tagOwners.
+  "tagOwners": {
+    // ===== TENANT BLOCK 1/3: tagOwners (copy per tenant) =====
+    "tag:acme-local-ai": ["group:admins"],
+    // ===== end TENANT BLOCK 1/3 =====
+  },
+
+  "acls": [
+    // ===== TENANT BLOCK 2/3: acls (copy per tenant) =====
+    // Members reach their own Local AI host on the iDoris / Agent24 ports only.
+    {
+      "action": "accept",
+      "src":    ["acme@"],
+      "dst":    [
+        "tag:acme-local-ai:8740",   // iDoris data plane
+        "tag:acme-local-ai:8742",   // Agent24 daemon HTTP/WS (adjust to your port)
+        "tag:acme-local-ai:443"
+      ]
+    },
+    // The Local AI host may reach its own members (Taildrop, callbacks).
+    {
+      "action": "accept",
+      "src":    ["tag:acme-local-ai"],
+      "dst":    ["acme@:*"]
+    },
+    // Admins reach the SSH port of the Local AI host (see "ssh" below).
+    {
+      "action": "accept",
+      "src":    ["group:admins"],
+      "dst":    ["tag:acme-local-ai:22"]
+    },
+    // ===== end TENANT BLOCK 2/3 =====
+  ],
+
+  "ssh": [
+    // ===== TENANT BLOCK 3/3: ssh (copy per tenant) =====
+    // Admins may Tailscale-SSH into the Local AI host as any non-root user,
+    // re-approved through Headscale ("check") per session period.
+    {
+      "action": "check",
+      "src":    ["group:admins"],
+      "dst":    ["tag:acme-local-ai"],
+      "users":  ["autogroup:nonroot"]
+    },
+    // ===== end TENANT BLOCK 3/3 =====
+  ],
+
+  // ---------------------------------------------------------------------------
+  // OPTIONAL regression tests, shipped disabled on purpose.
+  //
+  // Headscale evaluates "tests" against the LIVE nodes on `policy check` and on
+  // every SIGHUP reload, and a test whose src or dst resolves to no node FAILS
+  // ("resolved to no IP addresses") and REJECTS the reload. An active block
+  // would therefore block bootstrapping, and block adding a tenant until that
+  // tenant has nodes. At boot a failing block only logs a warning.
+  //
+  // To use: uncomment, keep one entry per tenant that already has at least one
+  // member node and its Local AI node (and at least one node of a group:admins
+  // user), and add a tenant's entry only AFTER its first nodes registered.
+  // Cross-tenant "deny" lines may only name tenants that have nodes.
+  //
+  // "tests": [
+  //   {
+  //     "src":    "acme@",
+  //     "accept": ["tag:acme-local-ai:8740", "tag:acme-local-ai:8742", "tag:acme-local-ai:443"],
+  //     "deny":   ["tag:acme-local-ai:22", "tag:acme-local-ai:8080", "acme@:8740"]
+  //     // with a second tenant that has nodes, also:  "tag:globex-local-ai:8740"
+  //   },
+  //   {
+  //     "src":    "tag:acme-local-ai",
+  //     "accept": ["acme@:22"]
+  //     // with a second tenant that has nodes, also deny:  "globex@:22"
+  //   },
+  //   {
+  //     "src":    "group:admins",
+  //     "accept": ["tag:acme-local-ai:22"],
+  //     "deny":   ["tag:acme-local-ai:8080"]
+  //   },
+  // ],
+}

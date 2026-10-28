@@ -1,0 +1,22 @@
+{
+  "control_url": "https://vpn.example.org",
+  "headscale_url": "http://headscale:8080",
+  "headscale_api_key_file": "/etc/idoris/headscale.apikey",
+  "tenants": [
+    {
+      "name": "acme",
+      "headscale_user_id": "1",
+      "token_hashes": ["<sha256 hex from: idoris-vpn-enroll token new>"],
+      "preauth_ttl": "10m",
+      "rate_per_minute": 30
+    },
+    {
+      "name": "acme-local-ai",
+      "headscale_user_id": "1",
+      "token_hashes": ["<sha256 hex from: idoris-vpn-enroll token new>"],
+      "acl_tags": ["tag:acme-local-ai"],
+      "preauth_ttl": "10m",
+      "rate_per_minute": 5
+    }
+  ]
+}

@@ -1,0 +1,118 @@
+# iDoris VPN control plane for a small/medium organisation.
+#
+#   Headscale  (official, unmodified)  - Tailscale-compatible coordination server + embedded DERP relay
+#   Headplane  (official, unmodified)  - read/operate admin web UI
+#   idoris-vpn-enroll (this repo)      - hands short-lived pre-auth keys to client daemons
+#
+# TLS: terminate at the reverse proxy you already run (Caddy/Traefik/nginx).
+#   https://vpn.example.org            -> headscale  (host: 127.0.0.1:${HEADSCALE_PORT}, network: headscale:8080)
+#   https://vpn.example.org/admin      -> headplane  (host: 127.0.0.1:${HEADPLANE_PORT}, network: headplane:3000)
+#   https://enroll.example.org         -> enroll     (host: 127.0.0.1:${ENROLL_PORT},    network: enroll:8787)
+# The proxy must pass Host and X-Forwarded-Proto and support WebSocket/Upgrade
+# (Tailscale control and DERP both upgrade the connection). Headscale is
+# reached on plain HTTP; its embedded DERP needs the *same* https origin as
+# server_url plus udp/${DERP_STUN_PORT:-3478} (STUN) reachable from the internet.
+# server_url must be https on the default port 443 (no ":port"): Tailscale
+# clients re-dial the control server on 443.
+# A proxy running as a container joins the network idoris-vpn_default.
+#
+# Published host ports default to the values shown and can be overridden with
+# HEADSCALE_PORT, HEADPLANE_PORT, ENROLL_PORT and DERP_STUN_PORT (env or .env).
+# DERP_STUN_PORT must stay 3478 in production: clients learn the STUN port from
+# the DERP map, which advertises headscale's stun_listen_addr port.
+#
+# First run:  bash deploy/vpn/bootstrap.sh
+name: idoris-vpn
+
+services:
+  headscale:
+    image: headscale/headscale:v0.29.6
+    restart: unless-stopped
+    command: serve
+    volumes:
+      - ./headscale/config.yaml:/etc/headscale/config.yaml:ro
+      - ./headscale/policy.hujson:/etc/headscale/policy.hujson:ro
+      - headscale-data:/var/lib/headscale
+      - headscale-run:/var/run/headscale
+    ports:
+      - "127.0.0.1:${HEADSCALE_PORT:-8080}:8080"   # HTTP control plane -> behind TLS proxy
+      - "${DERP_STUN_PORT:-3478}:3478/udp"         # STUN for embedded DERP
+    environment:
+      TZ: UTC
+    healthcheck:
+      test: ["CMD", "headscale", "health"]   # distroless image: no wget/curl
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+
+  headplane:
+    # Tag is "0.8.2" (no "v" prefix); matches commit 05e3ee33 of tale/headplane.
+    image: ghcr.io/tale/headplane:0.8.2
+    restart: unless-stopped
+    depends_on:
+      headscale:
+        condition: service_healthy
+    volumes:
+      - ./headplane/config.yaml:/etc/headplane/config.yaml:ro
+      # Read-only: Headplane shows the DNS/MagicDNS settings but cannot edit
+      # them. Headscale config and policy are managed as files (GitOps).
+      - ./headscale/config.yaml:/etc/headscale/config.yaml:ro
+      - headplane-data:/var/lib/headplane
+      - type: bind
+        source: ./headplane/cookie_secret
+        target: /run/secrets/headplane_cookie_secret
+        read_only: true
+        bind:
+          create_host_path: false
+    # No Docker socket on purpose: even a ":ro" bind of docker.sock grants full
+    # control of the host's Docker daemon (root-equivalent) to an internet-facing
+    # web UI. The integration would only let Headplane restart Headscale after
+    # editing the config, which this deployment does not allow anyway.
+    ports:
+      - "127.0.0.1:${HEADPLANE_PORT:-3000}:3000"
+    security_opt:
+      - no-new-privileges:true
+
+  enroll:
+    build:
+      context: ../../vpn
+      dockerfile: ../deploy/vpn/enroll/Dockerfile
+      args:
+        VERSION: ${IDORIS_VPN_VERSION:-dev}
+    image: ${ENROLL_IMAGE:-idoris-vpn-enroll:local}
+    restart: unless-stopped
+    depends_on:
+      headscale:
+        condition: service_healthy
+    # bootstrap.sh writes the secret files as the operator (mode 0600) and
+    # records that uid/gid in .env so the container can read them.
+    user: "${ENROLL_UID:-65532}:${ENROLL_GID:-65532}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      # create_host_path:false -> compose fails loudly instead of creating a
+      # directory when bootstrap.sh has not produced these files yet.
+      - type: bind
+        source: ./enroll/config.json
+        target: /etc/idoris/enroll.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./enroll/headscale.apikey
+        target: /etc/idoris/headscale.apikey
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - "127.0.0.1:${ENROLL_PORT:-8787}:8787"
+
+volumes:
+  headscale-data:
+  headscale-run:
+  headplane-data:

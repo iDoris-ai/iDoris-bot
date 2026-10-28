@@ -9,3 +9,6 @@ mautrix-telegram	mautrix/telegram	a1281de301dc655ece17f384709c025f58367720	AGPL-
 mautrix-whatsapp	mautrix/whatsapp	054a7dee77b571b7716a3b0d02ef55adaa4c8c22	AGPL-3.0
 openclaw	openclaw/openclaw	ef6d500b534062f352aa6d7ceef01c97d907c511	MIT
 teloxide	teloxide/teloxide	3c46b96e0dc0cabc75d6430c4566d7e2e12fd233	MIT
+headscale	juanfont/headscale	a2b1d7863926834e94479dcdd91ab344a9356bd0	BSD-3-Clause
+headplane	tale/headplane	05e3ee33f6d3b347013654c69186791347be8bd9	MIT
+tailscale	tailscale/tailscale	e26db7a5797683ec99ad1516c40b628c7f2dfd71	BSD-3-Clause
