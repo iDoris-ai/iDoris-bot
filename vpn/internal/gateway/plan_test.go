@@ -462,6 +462,9 @@ func TestR3W2DistinctConfigsAndReplace(t *testing.T) {
 }
 
 func TestR3W2MemberAndAdminSOCKS(t *testing.T) {
+	t.Setenv("HOME", "/home/acme")
+	t.Setenv("USERPROFILE", `C:\Users\acme`)
+	t.Setenv("STATE_DIRECTORY", "")
 	const token = "idv1_secretsecretsecretsecretsecretse"
 	applyRole := func(t *testing.T, role, mode string) (ApplyResult, []byte) {
 		t.Helper()
