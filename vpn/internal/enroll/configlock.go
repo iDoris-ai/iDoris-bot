@@ -41,12 +41,13 @@ func updateConfig(path string, fn func(*Config) error) error {
 	return SaveFile(path, cfg)
 }
 
-// withConfigLock serializes a read of path with concurrent updates. When the
-// lock file cannot be opened (a read-only mount of a backup or of a running
-// deployment) the read proceeds unlocked: writers swap the file in with an
-// atomic rename, so a reader sees either the old or the new document.
+// withConfigLock serializes a read of path with concurrent updates. It does
+// not create the lock file: a missing lock means no writer has run, and a
+// lock that exists but cannot be opened (read-only mount, or a mode the
+// caller cannot use) is the same fallback. Writers swap the file in with an
+// atomic rename, so an unlocked reader sees either the old or the new document.
 func withConfigLock(path string, fn func() error) error {
-	release, err := acquireConfigLock(path)
+	release, err := acquireConfigLockRead(path)
 	if errors.Is(err, errConfigLockUnavailable) {
 		return fn()
 	}

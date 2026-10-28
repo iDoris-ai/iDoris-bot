@@ -49,7 +49,7 @@ func LoadFile(path string) (*Config, error) {
 // O_TRUNC and the following Write, and a rejected reload would keep a token
 // that a concurrent Revoke already removed.
 func ReadFileLocked(path string) ([]byte, error) {
-	release, err := acquireConfigLock(path)
+	release, err := acquireConfigLockRead(path)
 	if readWithoutLock(err) {
 		return readConfigUnlocked(path)
 	}
