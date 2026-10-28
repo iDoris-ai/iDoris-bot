@@ -480,8 +480,8 @@ func TestR3W2JoinDistinctConfigsAndReplace(t *testing.T) {
 	if err := joinCmd([]string{"--yes", "--no-service", "--config", "/home/acme/orgB/vpn.json", "--code-file", "/tmp/b.code"}, d); err != nil {
 		t.Fatal(err)
 	}
-	tokA := "/home/acme/orgA/vpn.enroll-token"
-	tokB := "/home/acme/orgB/vpn.enroll-token"
+	tokA := "/home/acme/orgA/vpn.json.enroll-token"
+	tokB := "/home/acme/orgB/vpn.json.enroll-token"
 	if string(host.files[tokA]) != "idv1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n" || string(host.files[tokB]) != "idv1_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n" {
 		t.Fatalf("tokens %q %q", host.files[tokA], host.files[tokB])
 	}
@@ -511,7 +511,7 @@ func TestR3W2JoinDistinctConfigsAndReplace(t *testing.T) {
 	}
 
 	// gateway apply --replace is the same switch for a plan that names another URL.
-	planPath := "/home/acme/orgA/vpn.gateway-plan.json"
+	planPath := "/home/acme/orgA/vpn.json.gateway-plan.json"
 	plan := bytes.ReplaceAll(host.files[planPath], []byte("https://b.example"), []byte("https://c.example"))
 	host.files[planPath] = plan
 	before := append([]byte(nil), host.files["/home/acme/orgA/vpn.json"]...)
