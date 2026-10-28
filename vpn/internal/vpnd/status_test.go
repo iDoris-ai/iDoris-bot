@@ -17,7 +17,7 @@ type stubStatus struct{ snap Snapshot }
 func (s stubStatus) Snapshot() Snapshot { return s.snap }
 
 func TestStatusViewAddsModeAndForwards(t *testing.T) {
-	access, err := StartLocalAccess(&net.Dialer{}, []Forward{{Listen: "127.0.0.1:0", Target: "acme-local-ai:11434"}}, "127.0.0.1:0", nil)
+	access, err := startLocalAccess(&net.Dialer{}, []Forward{{Listen: "127.0.0.1:0", Target: "acme-local-ai:11434"}}, "127.0.0.1:0", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -146,6 +146,11 @@ func stageWindowsConfig(cfg []byte, destDir string) ([]byte, []string, error) {
 	}
 	var files []string
 	changed := false
+	rollback := func() {
+		for _, f := range files {
+			_ = os.Remove(f)
+		}
+	}
 	for _, it := range items {
 		raw, ok := probe[it.key]
 		if !ok || raw == nil {
@@ -153,6 +158,7 @@ func stageWindowsConfig(cfg []byte, destDir string) ([]byte, []string, error) {
 		}
 		src, ok := raw.(string)
 		if !ok {
+			rollback()
 			return nil, nil, fmt.Errorf("config: %s is not a string", it.key)
 		}
 		src = strings.TrimSpace(src)
@@ -161,6 +167,7 @@ func stageWindowsConfig(cfg []byte, destDir string) ([]byte, []string, error) {
 		}
 		dest := filepath.Join(destDir, it.name)
 		if err := copyCredentialFile(src, dest); err != nil {
+			rollback()
 			return nil, nil, fmt.Errorf("%s: %w", it.key, err)
 		}
 		probe[it.key] = dest
@@ -172,6 +179,7 @@ func stageWindowsConfig(cfg []byte, destDir string) ([]byte, []string, error) {
 	}
 	body, err := json.MarshalIndent(probe, "", "  ")
 	if err != nil {
+		rollback()
 		return nil, nil, err
 	}
 	return append(body, '\n'), files, nil

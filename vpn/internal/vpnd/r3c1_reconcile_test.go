@@ -12,6 +12,7 @@ import (
 
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/types/key"
 )
 
 // r3c1FlipKey changes the backend's control URL inside AuthKey, while the
@@ -83,10 +84,12 @@ func TestR3C1IdentityFollowsRunningNode(t *testing.T) {
 	if err := st.SetIdentity(ours, "acme", "member", "fp", "node-member", "p-member"); err != nil {
 		t.Fatal(err)
 	}
+	oldKey := key.NewNode().Public()
+	newKey := key.NewNode().Public()
 	be := &fakeBackend{
 		state:   ipn.Running,
 		prefs:   ipn.Prefs{ControlURL: ours, WantRunning: true, CorpDNS: true},
-		self:    &ipnstate.PeerStatus{ID: "node-admin"},
+		self:    &ipnstate.PeerStatus{ID: "node-admin", PublicKey: oldKey},
 		current: ipn.LoginProfile{ID: "p-admin", ControlURL: ours},
 	}
 	keys := &countingKeys{}
@@ -110,8 +113,10 @@ func TestR3C1IdentityFollowsRunningNode(t *testing.T) {
 	if err != nil || snap.Phase == PhaseConnected || keys.n != 1 {
 		t.Fatalf("still the old node: %+v keys=%d err=%v", snap, keys.n, err)
 	}
-	be.self = &ipnstate.PeerStatus{ID: "node-member-2"}
-	be.current = ipn.LoginProfile{ID: "p-member-2", ControlURL: ours}
+	// Headscale keeps the stable node ID. The login is complete when the node
+	// public key changes and the profile is still the one the login returned under.
+	be.self = &ipnstate.PeerStatus{ID: "node-admin", PublicKey: newKey}
+	be.current = ipn.LoginProfile{ID: "p-admin", ControlURL: ours}
 	be.state = ipn.Running
 	be.prefs.ControlURL = ours
 	snap, err = r.Step(ctx)
@@ -119,7 +124,7 @@ func TestR3C1IdentityFollowsRunningNode(t *testing.T) {
 		t.Fatalf("converged node: %+v keys=%d err=%v", snap, keys.n, err)
 	}
 	got := st.Get()
-	if got.NodeID != "node-member-2" || got.ProfileID != "p-member-2" || got.Role != "member" {
+	if got.NodeID != "node-admin" || got.ProfileID != "p-admin" || got.Role != "member" {
 		t.Fatalf("binding %+v", got)
 	}
 }
@@ -148,14 +153,14 @@ func TestR3C1EmptyBindingDoesNotCertifyRunningNode(t *testing.T) {
 		t.Fatalf("wrote the binding before enrollment converged: %+v", st.Get())
 	}
 	be.self = &ipnstate.PeerStatus{ID: "node-new"}
-	be.current = ipn.LoginProfile{ID: "p-new", ControlURL: ours}
+	be.current = ipn.LoginProfile{ID: "p-old", ControlURL: ours}
 	be.state = ipn.Running
 	be.prefs.ControlURL = ours
 	snap, err = r.Step(ctx)
 	if err != nil || snap.Phase != PhaseConnected || keys.n != 1 {
 		t.Fatalf("after the confirming enroll: %+v keys=%d err=%v", snap, keys.n, err)
 	}
-	if st.Get().NodeID != "node-new" || st.Get().ProfileID != "p-new" {
+	if st.Get().NodeID != "node-new" || st.Get().ProfileID != "p-old" {
 		t.Fatalf("binding %+v", st.Get())
 	}
 }

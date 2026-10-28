@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/fsutil"
 	"golang.org/x/sys/windows"
@@ -16,6 +17,36 @@ import (
 type winLockState struct {
 	h  windows.Handle
 	ol windows.Overlapped
+}
+
+func machineLockDir() (string, error) {
+	if !windowsMachineController() {
+		return "", nil
+	}
+	pd := os.Getenv("ProgramData")
+	if pd == "" {
+		pd = `C:\ProgramData`
+	}
+	return filepath.Join(pd, "idoris", "locks"), nil
+}
+
+func currentIsMachineController() bool {
+	return windowsMachineController()
+}
+
+// windowsMachineController is true for an elevated token and for LOCAL SYSTEM.
+// A user who can change ProgramData can point this directory elsewhere; that
+// process is already an administrator.
+func windowsMachineController() bool {
+	token := windows.GetCurrentProcessToken()
+	if token.IsElevated() {
+		return true
+	}
+	user, err := token.GetTokenUser()
+	if err != nil || user == nil || user.User.Sid == nil {
+		return false
+	}
+	return user.User.Sid.String() == "S-1-5-18"
 }
 
 func acquireLock(path, kind string) (*ControllerLock, error) {

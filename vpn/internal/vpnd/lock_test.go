@@ -95,7 +95,7 @@ func TestR3c2LockCanonicalIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantDir := filepath.Join(cache, "idoris", "locks")
+	wantDir := r4cWantLockDir(t, filepath.Join(cache, "idoris", "locks"))
 	if filepath.Dir(first) != wantDir {
 		t.Fatalf("lock dir %s, want %s", filepath.Dir(first), wantDir)
 	}

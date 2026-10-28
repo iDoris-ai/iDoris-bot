@@ -97,7 +97,12 @@ type LocalAccess struct {
 	closed bool
 	bounds []bound
 	conns  map[net.Conn]uint64
-	wg     sync.WaitGroup
+	// dialCancel aborts an in-flight dial when its admission generation is
+	// revoked. Closing the net.Conn is not enough: watchDisconnect holds a
+	// duplicate of the socket, so the peer stays up until the dial returns
+	// and that duplicate is closed.
+	dialCancel map[net.Conn]context.CancelFunc
+	wg         sync.WaitGroup
 }
 
 type bound struct {
@@ -111,10 +116,12 @@ type bound struct {
 	max     int
 }
 
-// Deprecated: StartLocalAccess opens an anonymous SOCKS5 listener. The daemon
-// calls StartAccess with credentials. A non-nil logger receives
+// startLocalAccess opens an anonymous SOCKS5 listener. Nothing in the daemon
+// wiring calls it. cmd/idoris-vpnd uses StartAccess and sets AllowAnonymous
+// only from the explicit socks5_allow_anonymous config. The helper remains so
+// tests can open the old listener. A non-nil logger receives
 // anonymousSOCKSWarning when socksAddr is set.
-func StartLocalAccess(dial Dialer, forwards []Forward, socksAddr string, log *slog.Logger) (*LocalAccess, error) {
+func startLocalAccess(dial Dialer, forwards []Forward, socksAddr string, log *slog.Logger) (*LocalAccess, error) {
 	return StartAccess(dial, forwards, socksAddr, AccessOptions{AllowAnonymous: true}, log)
 }
 
@@ -176,6 +183,7 @@ func StartAccess(dial Dialer, forwards []Forward, socksAddr string, opt AccessOp
 		pass:        pass,
 		authFile:    authFile,
 		conns:       map[net.Conn]uint64{},
+		dialCancel:  map[net.Conn]context.CancelFunc{},
 	}
 	if opt.Owner != nil {
 		opt.Owner.SetOnLost(func() { a.closeStale() })
@@ -255,6 +263,10 @@ func (a *LocalAccess) watchOwner() {
 	ticker := time.NewTicker(a.owner.TTL())
 	defer ticker.Stop()
 	for {
+		// A bump that landed before this goroutine subscribed, or while
+		// Poll was running, is still applied here. Reopen does not spare
+		// streams admitted under the generation that ended.
+		a.closeStale()
 		ch := a.owner.WaitCh()
 		select {
 		case <-a.ctx.Done():
@@ -262,9 +274,6 @@ func (a *LocalAccess) watchOwner() {
 		case <-ticker.C:
 			a.owner.Poll(a.ctx)
 		case <-ch:
-			if !a.owner.Allow() {
-				a.closeStale()
-			}
 		}
 	}
 }
@@ -299,7 +308,8 @@ func (a *LocalAccess) acceptLoop(idx int) {
 			return
 		}
 		backoff = acceptBackoffStart
-		if !a.gateOpen() {
+		admitGen, open := a.admit()
+		if !open {
 			_ = c.Close()
 			continue
 		}
@@ -309,39 +319,59 @@ func (a *LocalAccess) acceptLoop(idx int) {
 		}
 		go func() {
 			defer a.release(idx)
-			a.serveAccepted(c, idx)
+			a.serveAccepted(c, idx, admitGen)
 		}()
 	}
 }
 
-func (a *LocalAccess) serveAccepted(client net.Conn, idx int) {
+// admit records the ownership generation under which this connection may
+// proceed. A generation that moves while the check runs is not admitted:
+// the next accept observes the new one. Owner nil keeps the plain gate.
+func (a *LocalAccess) admit() (uint64, bool) {
+	if a.owner == nil {
+		if a.gate == nil || a.gate() {
+			return 0, true
+		}
+		return 0, false
+	}
+	gen := a.owner.Generation()
+	if !a.owner.Allow() {
+		return 0, false
+	}
+	if a.owner.Generation() != gen {
+		return 0, false
+	}
+	return gen, true
+}
+
+func (a *LocalAccess) serveAccepted(client net.Conn, idx int, admitGen uint64) {
 	a.mu.Lock()
 	socks := a.bounds[idx].socks
 	target := a.bounds[idx].target
 	a.mu.Unlock()
 	if socks {
-		a.serveSOCKS(client)
+		a.serveSOCKS(client, admitGen)
 		return
 	}
-	a.serveConn(client, target)
+	a.serveConn(client, target, admitGen)
 }
 
-func (a *LocalAccess) serveConn(client net.Conn, target string) {
+func (a *LocalAccess) serveConn(client net.Conn, target string, admitGen uint64) {
 	defer func() { _ = client.Close() }()
-	if !a.track(client) {
+	if !a.track(client, admitGen) {
 		return
 	}
 	defer a.untrack(client)
-	if !a.gateOpen() {
+	if !a.generationLive(admitGen) {
 		return
 	}
-	upstream, err := a.dialUpstream(client, target)
+	upstream, err := a.dialUpstream(client, target, admitGen)
 	if err != nil {
 		a.log.Debug("forward dial failed", "target", target, "err", err)
 		return
 	}
 	defer func() { _ = upstream.Close() }()
-	if !a.track(upstream) {
+	if !a.track(upstream, admitGen) {
 		return
 	}
 	defer a.untrack(upstream)
@@ -355,53 +385,103 @@ func (a *LocalAccess) serveConn(client net.Conn, target string) {
 // dialUpstream cancels the dial when the daemon stops, the timeout fires, or
 // the client goes away. The watch is armed before DialContext and stopped
 // before the byte copy, so it does not run for the life of the session.
-func (a *LocalAccess) dialUpstream(client net.Conn, target string) (net.Conn, error) {
+func (a *LocalAccess) dialUpstream(client net.Conn, target string, admitGen uint64) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(a.ctx, a.dialTimeout)
 	defer cancel()
+	a.armDial(client, cancel, admitGen)
+	defer a.disarmDial(client)
 	stop := watchDisconnect(client, cancel)
 	defer stop()
-	a.watchLost(ctx, cancel)
+	a.watchLost(ctx, cancel, admitGen)
 	return a.dial.DialContext(ctx, "tcp", target)
 }
 
-// watchLost cancels a dial when the ownership generation moves to a closed
-// gate. The goroutine exits when the dial context ends.
-func (a *LocalAccess) watchLost(ctx context.Context, cancel context.CancelFunc) {
+// armDial lets closeStale cancel this dial. A generation that is already
+// obsolete cancels immediately, before DialContext.
+func (a *LocalAccess) armDial(c net.Conn, cancel context.CancelFunc, admitGen uint64) {
+	// Generation is read outside a.mu. closeStale takes the owner lock and
+	// then a.mu, so the opposite order deadlocks.
+	a.mu.Lock()
+	closed := a.closed
+	if !closed {
+		a.dialCancel[c] = cancel
+	}
+	a.mu.Unlock()
+	if closed || (a.owner != nil && a.owner.Generation() != admitGen) {
+		a.disarmDial(c)
+		cancel()
+	}
+}
+
+func (a *LocalAccess) disarmDial(c net.Conn) {
+	a.mu.Lock()
+	delete(a.dialCancel, c)
+	a.mu.Unlock()
+}
+
+// watchLost cancels a dial when the ownership generation is no longer the
+// one this connection was admitted under. A gate that closed and reopened
+// under another identity still cancels: Allow can be true again while this
+// dial belongs to the previous generation. The generation is read again
+// after WaitCh so a bump between the two is not lost.
+func (a *LocalAccess) watchLost(ctx context.Context, cancel context.CancelFunc, admitGen uint64) {
 	if a.owner == nil {
 		return
 	}
 	go func() {
 		for {
+			if a.owner.Generation() != admitGen {
+				cancel()
+				return
+			}
 			ch := a.owner.WaitCh()
+			if a.owner.Generation() != admitGen {
+				cancel()
+				return
+			}
 			select {
 			case <-ctx.Done():
 				return
 			case <-ch:
-				if !a.owner.Allow() {
-					cancel()
-					return
-				}
 			}
 		}
 	}()
 }
 
-// closeStale closes connections accepted under an older ownership generation.
-// The current generation is the one that just lost ownership, so anything
-// still tracked was admitted before that.
-func (a *LocalAccess) closeStale() {
-	var limit uint64
-	if a.owner != nil {
-		limit = a.owner.Generation()
+// generationLive reports whether admitGen is still the current ownership
+// generation. With no owner the plain gate decides.
+func (a *LocalAccess) generationLive(admitGen uint64) bool {
+	if a.owner == nil {
+		return a.gateOpen()
 	}
+	return a.owner.Generation() == admitGen && a.owner.Allow()
+}
+
+// closeStale closes connections admitted under a generation that is not the
+// current one. A reopen does not spare them: their generation is obsolete
+// even if the gate is open again.
+func (a *LocalAccess) closeStale() {
+	if a.owner == nil {
+		return
+	}
+	current := a.owner.Generation()
 	a.mu.Lock()
 	conns := make([]net.Conn, 0, len(a.conns))
+	cancels := make([]context.CancelFunc, 0, len(a.dialCancel))
 	for c, gen := range a.conns {
-		if a.owner == nil || gen < limit {
-			conns = append(conns, c)
+		if gen == current {
+			continue
+		}
+		conns = append(conns, c)
+		if cancel, ok := a.dialCancel[c]; ok {
+			cancels = append(cancels, cancel)
+			delete(a.dialCancel, c)
 		}
 	}
 	a.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
 	for _, c := range conns {
 		_ = c.Close()
 	}
@@ -467,18 +547,14 @@ func (a *LocalAccess) sleep(d time.Duration) bool {
 	}
 }
 
-func (a *LocalAccess) track(c net.Conn) bool {
+func (a *LocalAccess) track(c net.Conn, admitGen uint64) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.closed {
 		_ = c.Close()
 		return false
 	}
-	gen := uint64(0)
-	if a.owner != nil {
-		gen = a.owner.Generation()
-	}
-	a.conns[c] = gen
+	a.conns[c] = admitGen
 	return true
 }
 
