@@ -32,7 +32,8 @@ func usage() {
 Usage:
   idoris-vpnd run     [--config FILE] [flags]   run in the foreground (launchd/systemd)
   idoris-vpnd status  [--listen SPEC] [--json]  query a running daemon
-  idoris-vpnd join <code> [--yes] [--no-service] [--role-override ROLE] [--device IP] [--whole-subnet]
+  idoris-vpnd join --code-file FILE [--yes] [--no-service] [--role-override ROLE] [--device IP] [--whole-subnet]
+  idoris-vpnd join --code-stdin [--yes] [--no-service] [--role-override ROLE] [--device IP] [--whole-subnet]
   idoris-vpnd gateway detect [--json]
   idoris-vpnd gateway setup [--yes] [--device IP] [--whole-subnet] [--no-service]
   idoris-vpnd gateway apply --plan FILE
@@ -46,8 +47,12 @@ in-process node. local-ai and gateway never use that fallback: they wait until
 the official tailscaled is reachable. --takeover switches the system Tailscale;
 the default is not to.
 
-join accepts one code. A gateway code asks whether this machine is the Local AI
-host. --yes skips prompts: a gateway then needs --device or --whole-subnet.
+join accepts one code, given through --code-file, --code-stdin, or a no-echo
+prompt when stdin is a terminal. A code passed as an argument is still accepted
+but is visible in the process list and shell history, so it is warned about.
+Give only one of the three. A gateway code asks whether this machine is the
+Local AI host. --yes skips prompts: a gateway then needs --device or
+--whole-subnet.
 The program never escalates to root; it prints the sudo command instead.
 `, version.Version)
 }
