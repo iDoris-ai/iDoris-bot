@@ -239,6 +239,8 @@ iOS / Android 同时只允许一个活动 VPN。这次没有在手机上验证�
 
 身份、锁和机器服务这一轮在 `work/vpn-r4-c` 上跑完门禁，当时 `HEAD` 是 `8bb3134`。`make test` 退出码 0：`cmd/idoris-vpn-enroll` 1.799s，`cmd/idoris-vpnd` 3.518s，`internal/enroll` 10.396s，`internal/fsutil` 4.589s，`internal/gateway` 2.266s，`internal/headscale` 5.659s，`internal/join` 1.493s，`internal/netdetect` 2.581s，`internal/ui` 4.805s，`internal/vpnd` 7.896s。`echosrv`、`wireclient`、`internal/version` 没有测试文件。两次 `golangci-lint`（第二次带 `--build-tags integration`）都是 `0 issues`。`GOOS=windows go build ./...` 与 `GOOS=windows go vet ./...` 退出码 0。`make licenses` 扫完 linux、darwin、windows 的 amd64 与 arm64，输出 `THIRD_PARTY_NOTICES.md is up to date`。`make build-linux` 版本串是 `8bb3134`。`make integration` 退出码 0，包耗时 454.957s。`TestEmbeddedAutoLeavesForeignTailscale` 49.29s，`TestHardAAwaitTailscaled` 3.44s，`TestHardAClientCore` 56.15s（`foreign-stays` 16.35s，`unmanaged-prefs` 25.70s，`enroll-down` 5.69s），`TestEnrollConnectAndReauth` 36.79s，`TestLanDirect` 30.28s，`TestLanAwayRelay` 22.88s，`TestGatewaySubnetRoute` 37.17s（`ManualApprove` 10.42s，`AutoApprovers` 5.11s），`TestR3svcSystemdMachineService` 53.49s，`TestR4CEmbeddedStaticAndRoleSwap` 42.97s，`TestR4CRootLockNamespace` 18.45s，`TestR4CServiceRootProofs` 13.66s，`TestWireAccessForwardsAndSOCKS5` 36.87s（日志 `max_connections refusal in 0s` 与 `wire access ok: tcp, unix mode 0600, socks5 auth, cap refusal 0s`），`TestWizardGatewayJoin` 52.93s。本代理的 `idoris-vpn-r4c-*` 与 `idoris-vpn-r3svc-*` 容器在结束时已经清掉。当时还在的 `idoris-vpn-r2d-533526-*` 属于另一条工作，没有动。macOS 的 `launchctl`、Windows 的 `icacls`、`schtasks` 和 `LockFileEx` 没有在对应系统上执行。
 
+待确认登录、发现重试、Windows ACL、用户级重装、Windows 停任务再换文件、失败重装不覆盖，以及监听 bind 失败不退出，这一轮在 `work/vpn-r5-c` 上跑完门禁。代码提交到 `4be5157`，文档在那之后才提交，所以 `make build-linux` 的版本串是 `4be5157-dirty`。`make test`（`go vet ./...`，然后 `go test -race -count=1 ./...`）退出码 0：`cmd/idoris-vpn-enroll` 1.574s，`cmd/idoris-vpnd` 1.956s，`internal/enroll` 13.042s，`internal/fsutil` 4.854s，`internal/gateway` 3.673s，`internal/headscale` 5.891s，`internal/join` 2.231s，`internal/netdetect` 4.008s，`internal/ui` 5.496s，`internal/vpnd` 6.039s。`integration/echosrv`、`integration/wireclient`、`internal/version` 没有测试文件。两次 `golangci-lint`（第二次带 `--build-tags integration`）都是 `0 issues`。`GOOS=windows go build ./...` 与 `GOOS=windows go vet ./...` 退出码 0，输出 `WINDOWS_OK`；Windows 上没有执行。`make licenses` 扫完 linux、darwin、windows 的 amd64 与 arm64，输出 `THIRD_PARTY_NOTICES.md is up to date`。`make integration` 退出码 0，包耗时 385.949s。未自带项目名的 compose 调用使用 `COMPOSE_PROJECT_NAME=idoris-vpn-r5c-a7e3c91b`。`TestEmbeddedAutoLeavesForeignTailscale` 50.35s，`TestHardAAwaitTailscaled` 3.17s，`TestHardAClientCore` 56.21s（`foreign-stays` 15.99s，`unmanaged-prefs` 26.21s，`enroll-down` 7.43s），`TestEnrollConnectAndReauth` 34.81s，`TestLanDirect` 29.50s，`TestLanAwayRelay` 23.36s，`TestGatewaySubnetRoute` 35.77s（`ManualApprove` 11.87s，`AutoApprovers` 4.86s），`TestR3svcSystemdMachineService` 34.81s，`TestR4CEmbeddedStaticAndRoleSwap` 27.90s，`TestR4CRootLockNamespace` 2.78s，`TestR4CServiceRootProofs` 2.97s，`TestR4WSudoApplyHonoursUserOwnedPlan` 1.63s，`TestR5LeadExpirePreAuthKeyAgainstHeadscale` 6.60s，`TestWireAccessForwardsAndSOCKS5` 13.31s（日志 `max_connections refusal in 0s` 与 `wire access ok: tcp, unix mode 0600, socks5 auth, cap refusal 0s`），`TestWizardGatewayJoin` 33.38s。`TestR5CSystemdUserServiceRestarts` 跳过 28.78s：`systemctl start user@` 退出码 1，`user@1000.service` 的依赖作业失败，`loginctl enable-linger` 报 `Failed to connect to bus`，容器里没有 `/run/dbus`。结束后 `docker compose -p idoris-vpn-r5c-a7e3c91b down -v` 报告该项目没有资源可删。当时还在的 `idoris-vpn-r2d-117620-*` 属于另一条工作，没有动。没有留下名字里带 `r5c` 的容器、网络或卷。
+
 ## 11. 身份绑定、环境变量、锁
 
 ### 身份与控制面
@@ -257,7 +259,9 @@ iOS / Android 同时只允许一个活动 VPN。这次没有在手机上验证�
 
 登录路径在铸 key 之前会再 discover 一次。发现出的角色要求系统模式（`local-ai`、`gateway`；`admin` 不要求）而当前后端是嵌入式时，不 enroll，停在错误状态。正文说明要安装官方 tailscaled、改用系统模式，并且不会 enroll。
 
-进行中的过渡（不匹配的节点 ID 和节点公钥、profile、开始时间、登录是否已返回）写在同一状态文件。进程在退避里重启时读回这份记录，把未完成的过渡做完，不因为重启再铸一把 key。落盘失败则内存回到上一份。
+进行中的过渡（不匹配的节点 ID 和节点公钥、profile、开始时间、登录是否已返回）写在同一状态文件。同一份记录还写下这次登录用的令牌指纹、要登记的 tenant 和 role、control URL、后端模式（`embedded` 或 `system`）。系统模式本来就有 profile。进程在退避里重启时，只有这些项都和当前配置一致才把未完成的过渡做完，不因为重启再铸一把 key。有一项对不上就丢掉这份过渡，日志只写原因，不写令牌；正在跑的节点按普通规则视为未确认。profile 对不上不整份丢掉，仍走原来的 profile 搬迁。当前选项还没填模式时，空模式不算不一致。身份还未知时先不比 tenant 和 role，发现把身份填上之后、写入绑定之前再比一次。静态配置不能接上一份注册过渡。单测用两份状态文件：嵌入式成员用凭证 X 开始登记并写下 pending-login，换成凭证 Y 再打开，X 登录出来的节点不会被认证成 Y。假后端，这一项没有再跑真实 Headscale。落盘失败则内存回到上一份。
+
+绑定还没落盘时不清除 pending-login。身份未知且绑定是空的，随后每次 Running 最多每 30 秒再 discover 一次，访问保持关闭；发现成功才写入并打开。登录已经成功、身份也能写的那一轮会写入并清掉过渡，不会再铸一把 key。单测把发现前两次失败、第三次成功，中间按 30 秒推进时钟。假的发现客户端。`TestR4CEmbeddedStaticAndRoleSwap` 在这一轮 `make integration` 里重跑通过，27.90s（见第 10 节）。
 
 能控制本机 tailscaled 的用户可以让 LocalAPI 谎报节点和 profile。守护进程信 LocalAPI。这是明确不做的目标。
 
@@ -304,7 +308,7 @@ Unix 上，令牌文件、auth key 文件、状态文件、SOCKS5 凭据文件�
 
 2026-10-28。注册令牌和 auth key 各是一整份凭证，inline 和文件二选一。优先级仍是配置文件、然后环境变量、然后 flag。更高一层写了其中一边，就清掉较低层留下的另一边。同一层两边都写（配置文件里两个字段、两个环境变量、或两个 flag）直接报错，错误里有 `both`。空白的环境变量不算设置。flag 只要出现在命令行上就算设置，空字符串也会清掉较低层。`Resolve` 只在 inline 为空时读文件；两边都还在则拒绝。单测对两份凭证各跑了文件、环境变量、flag 三层。
 
-Windows 上 Go 把普通文件的权限报成 0666。SOCKS 凭据的加载不再用 0600 去比这些位，否则生成的 `socks5.auth` 每次重启都被拒绝。生成文件走三步 `icacls`：`/reset`、`/inheritance:r`、`/grant:r *<当前用户 SID>:F`。服务安装那套授予 SYSTEM 和 Administrators，因为那是机器目录；这份文件在用户配置里，所以只授予当前用户。操作者提供的 `socks5_auth_file` 不改 ACL，沿用所在目录的 ACL。`icacls` 没有在这台 Mac 上执行。单测注入运行器，核对参数，并核对第二步失败时第三步不跑。`CheckSecretFile` 在 Windows 上仍是警告后放行。
+Windows 上 Go 把普通文件的权限报成 0666。SOCKS 凭据的加载不再用 0600 去比这些位，否则生成的 `socks5.auth` 每次重启都被拒绝。生成文件走三步 `icacls`：`/reset`、`/inheritance:r`、`/grant:r *<当前用户 SID>:F`。服务安装那套授予 SYSTEM 和 Administrators，因为那是机器目录；这份文件在用户配置里，所以只授予当前用户。读回不再解析 `icacls` 印出的账户名。`GetNamedSecurityInfo` 和 `GetAce` 取出 DACL 里的 SID。服务路径必须恰好是显式允许的 SYSTEM（`S-1-5-18`）和 Administrators（`S-1-5-32-544`），不能多一个 SID。继承 ACE、拒绝 ACE 和无法识别的项都失败。属主是 SYSTEM 或 Administrators 都接受。用户文件只要求当前用户 SID。表驱动单测用假的安全描述符，覆盖仅 SYSTEM、普通用户、外来 ACE 和继承 ACE。`GOOS=windows` 下编译并 `go vet` 过这套读回，没有在 Windows 上执行。操作者提供的 `socks5_auth_file` 不改 ACL，沿用所在目录的 ACL。`icacls` 没有在这台 Mac 上执行。单测注入运行器，核对参数，并核对第二步失败时第三步不跑。`CheckSecretFile` 在 Windows 上仍是警告后放行。
 
 ### 控制器锁
 
@@ -330,7 +334,9 @@ Windows 用 `LockFileEx`（`LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY`�
 - 非 root 的用户守护进程和 root 机器服务用不同的锁目录。支持的部署是每个后端恰好一个控制器。
 - `SwitchProfile` 之前的再读和 LocalAPI 调用之间仍有窗口。能控制本机 tailscaled 的用户可以谎报节点和 profile。
 - 状态文件锁持有到进程退出。同一进程里第二次打开同一路径可以成功。
-- 失败的 Windows 重装会删掉 `C:\ProgramData\idoris`，包括上一次成功安装留在那里的文件。顺序由注入的安装器核实：先保护目录，再写密钥；缺少 `auth_key_file` 时删掉这一次的部分安装。`icacls` 本身没有执行。
+- 失败的 Windows 重装不删除 `C:\ProgramData\idoris`。新文件先写到旁边的暂存目录，核对通过才换上去；失败只删这一次的暂存目录。缺少凭据文件时，原来的 `vpn.json`、令牌和 `vpnd-state.json` 字节不变，也不执行 `schtasks /End`。任务已在跑时，先暂存，再 `/End`，轮询 `tasklist` 直到镜像退出（最多 30 秒），才替换可执行文件。安装程序自己就是那份 exe 时，任务改指向带时间戳的副本，不覆盖正在映射的文件。本机用临时目录和注入的命令跑过。没有在 Windows 上执行 `schtasks` 或 `icacls`。
+- 用户级服务已经在跑时，重装要换进程。Linux 是 `systemctl --user daemon-reload` 然后 `restart`；第一次安装仍是 `enable --now`。macOS 已加载的 LaunchAgent 是 `bootout`、`bootstrap`、`kickstart -k`。命令顺序由注入的运行器核实。特权 bookworm 容器里没有 `/run/dbus`，`systemctl start user@` 和 `loginctl enable-linger` 都连不上总线，所以没有核实真实的用户服务 PID 变化。这一轮 `make integration` 里 `TestR5CSystemdUserServiceRestarts` 跳过 28.78s。`launchctl` 没有在这台 Mac 上执行。
+- 配置好的回环或 `unix:` 监听在启动时 bind 失败，进程不退出。`access_error` 带上地址和错误，每 30 秒重试，成功后清空。地址无法解析、不安全路径、凭据文件不合格仍在打开套接字之前失败。本机单测占用端口再放开，并用假后端在监听还没起来时把成员关系跑到 `connected`。
 
 ## 13. 本机转发与 SOCKS5 的访问控制
 
@@ -343,7 +349,7 @@ Windows 用 `LockFileEx`（`LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY`�
 - 传输层收紧。优先 `unix:<绝对路径>`，套接字创建后是 `0600`，只有拥有者能连。父目录不能是全员可写。已经有进程在听的套接字不会被清掉；没人听的残留文件会删掉再监听。SOCKS5 默认要用户名和密码（RFC 1929）。用户名和密码各自必须是 1 到 255 字节（按字节，不按字符），显式配置、`socks5_auth_file` 和生成的文件都在监听打开之前检查。256 字节的密码会让 `StartAccess` 失败，并且不返回监听器。凭据放在 `0600` 的 `socks5_auth_file`，文件内容一行 `user:password`，这个路径只读取、不创建。都不给时，在 `<state_dir>/socks5.auth` 生成用户名 `idoris` 和 64 位十六进制密码，模式 0600；重启继续用同一份。创建时 info 日志和 `idoris-vpnd status` 都只出现路径。只有显式 `socks5_allow_anonymous: true` 才不认证，进程会打出警告。它和 `socks5_auth_file` 一起写是配置错误。
 - 应用自己再认证一次。转到 Local AI 的流量，Local AI 应用必须自己验身份。转发和 SOCKS5 只决定谁能用这条通道，不代替应用的登录。
 
-每个监听单独限制。`max_connections` 默认 64，满了就立刻关掉新连接，不排队。`dial_timeout` 默认 10 秒。客户端在拨号期间断开，拨号的 goroutine 会跟着结束。`Accept` 遇到暂时错误会退避重试；致命错误把该监听的 `state` 写成 `failed`，并把错误放进状态的 `error` 字段。
+每个监听单独限制。`max_connections` 默认 64，满了就立刻关掉新连接，不排队。`dial_timeout` 默认 10 秒。客户端在拨号期间断开，拨号的 goroutine 会跟着结束。`Accept` 遇到暂时错误会退避重试；致命错误把该监听的 `state` 写成 `failed`，并把错误放进状态的 `error` 字段。启动时 bind 失败不把进程停在协调之前：该监听记成 `failed`，`/v1/status` 的 `access_error` 写出地址和错误（端口被占用时是操作系统的 bind 错误），每 30 秒再试，全部绑上之后字段消失。已经绑上的其他监听继续接受连接。相对路径、全员可写的父目录、符号链接、不是套接字的路径，以及不合格的 SOCKS 凭据，在任何 `net.Listen` 之前返回错误，守护进程不进入协调。`TestR5CBindConflictRetriesAndMembershipConnects` 在本机占用两个回环端口（转发和 SOCKS5），假后端在端口仍被占时到 `connected`，放开端口后两个监听变为 `listening` 且 `access_error` 为空。已经有进程在听的 unix 套接字不会被替换，原进程仍能 accept。
 
 系统模式如果还没有连上本组织的控制面，Gate 关闭。状态是 `suspended`（`failed` 和 `closed` 优先，只改写 `listening`）。新连接马上关掉，不会向外拨号。启动时 `accessOptions` 把 `AccessOpen` 接成 Gate。嵌入式模式始终打开。系统模式只在协调器快照的 `current_control_url` 与本进程的控制 URL 被 `SameControlURL` 判成同一台（忽略大小写、末尾斜杠、默认端口；Tailscale SaaS 的同义地址也算），并且 phase 是 `connected` 或 `routes-pending-approval` 时打开。状态里的 `control_url` 永远是本进程想要的地址，不拿来做这比较。其他模式关闭。
 
