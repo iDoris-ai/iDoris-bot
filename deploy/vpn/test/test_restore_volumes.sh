@@ -35,7 +35,7 @@ keep_snap="$(mktemp "$tmp/keep-snap.XXXXXX")"
 printf 'x\n' > "$keep_host/marker"
 (
   # _restore_on_exit calls this override.
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   _restore_rollback() { return 1; }
   _restore_ok=0
   _restore_phase=2
