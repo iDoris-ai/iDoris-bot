@@ -671,3 +671,30 @@ func TestR4WRelativeConfigBecomesAbsolute(t *testing.T) {
 		t.Fatalf("stdout:\n%s", d.out())
 	}
 }
+
+func TestR4WExplicitConfigDoesNotNeedHome(t *testing.T) {
+	t.Setenv("HOME", "")
+	t.Setenv("USERPROFILE", "")
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "office.json")
+	host := newFakeOS(false, "linux")
+	code := codeFor(t, join.RoleMember, "https://enroll.example.org", false)
+	codePath := filepath.Join(dir, "code.txt")
+	host.files[codePath] = []byte(code + "\n")
+	d := testDeps(host, "")
+	d.home = func() (string, error) { return "", os.ErrNotExist }
+	if err := joinCmd([]string{"--yes", "--no-service", "--config", cfg, "--code-file", codePath}, d); err != nil {
+		t.Fatal(err)
+	}
+	tok := cfg + ".enroll-token"
+	if !bytes.Contains(host.files[cfg], []byte(tok)) || string(host.files[tok]) == "" {
+		t.Fatalf("config %s token %q", host.files[cfg], host.files[tok])
+	}
+	bare := testDeps(newFakeOS(false, "linux"), "")
+	bare.home = d.home
+	bare.host.(*fakeOS).files[codePath] = []byte(code + "\n")
+	err := joinCmd([]string{"--yes", "--no-service", "--code-file", codePath}, bare)
+	if err == nil || !strings.Contains(err.Error(), "home directory") {
+		t.Fatalf("default config without home: %v", err)
+	}
+}
