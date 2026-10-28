@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -507,6 +508,14 @@ type idorisPaths struct {
 }
 
 func (d *deps) paths(config string) (idorisPaths, error) {
+	config = strings.TrimSpace(config)
+	if config != "" {
+		abs, err := filepath.Abs(config)
+		if err != nil {
+			return idorisPaths{}, fmt.Errorf("config path: %w", err)
+		}
+		config = abs
+	}
 	home, err := d.home()
 	if err != nil || home == "" {
 		return idorisPaths{}, fmt.Errorf("home directory: %w", err)
