@@ -116,10 +116,12 @@ type bound struct {
 	max     int
 }
 
-// Deprecated: StartLocalAccess opens an anonymous SOCKS5 listener. The daemon
-// calls StartAccess with credentials. A non-nil logger receives
+// startLocalAccess opens an anonymous SOCKS5 listener. Nothing in the daemon
+// wiring calls it. cmd/idoris-vpnd uses StartAccess and sets AllowAnonymous
+// only from the explicit socks5_allow_anonymous config. The helper remains so
+// tests can open the old listener. A non-nil logger receives
 // anonymousSOCKSWarning when socksAddr is set.
-func StartLocalAccess(dial Dialer, forwards []Forward, socksAddr string, log *slog.Logger) (*LocalAccess, error) {
+func startLocalAccess(dial Dialer, forwards []Forward, socksAddr string, log *slog.Logger) (*LocalAccess, error) {
 	return StartAccess(dial, forwards, socksAddr, AccessOptions{AllowAnonymous: true}, log)
 }
 

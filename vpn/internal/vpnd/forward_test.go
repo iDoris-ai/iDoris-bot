@@ -71,7 +71,7 @@ func startEcho(t *testing.T) string {
 func TestForwardHalfCloseAndLargePayload(t *testing.T) {
 	echo := startEcho(t)
 	dialer := &fakeDialer{dest: echo}
-	access, err := StartLocalAccess(dialer, []Forward{{Listen: "127.0.0.1:0", Target: "acme-local-ai:11434"}}, "", nil)
+	access, err := startLocalAccess(dialer, []Forward{{Listen: "127.0.0.1:0", Target: "acme-local-ai:11434"}}, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestForwardHalfCloseAndLargePayload(t *testing.T) {
 
 func TestForwardDialFailureKeepsListening(t *testing.T) {
 	dialer := &fakeDialer{err: errors.New("no route")}
-	access, err := StartLocalAccess(dialer, []Forward{{Listen: "127.0.0.1:0", Target: "missing:9"}}, "", nil)
+	access, err := startLocalAccess(dialer, []Forward{{Listen: "127.0.0.1:0", Target: "missing:9"}}, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func TestForwardDialFailureKeepsListening(t *testing.T) {
 func TestForwardCloseUnblocksAndDoesNotLeak(t *testing.T) {
 	before := runtime.NumGoroutine()
 	dialer := &fakeDialer{block: true}
-	access, err := StartLocalAccess(dialer, []Forward{{Listen: "127.0.0.1:0", Target: "peer:1"}}, "", nil)
+	access, err := startLocalAccess(dialer, []Forward{{Listen: "127.0.0.1:0", Target: "peer:1"}}, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestForwardCloseUnblocksAndDoesNotLeak(t *testing.T) {
 
 func TestSOCKS5ReachesEcho(t *testing.T) {
 	echo := startEcho(t)
-	access, err := StartLocalAccess(&net.Dialer{}, nil, "127.0.0.1:0", nil)
+	access, err := startLocalAccess(&net.Dialer{}, nil, "127.0.0.1:0", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
