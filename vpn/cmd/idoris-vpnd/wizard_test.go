@@ -546,13 +546,14 @@ func TestR4WServiceInstallSeesTheNewIdentity(t *testing.T) {
 	if host.installs != 1 || len(host.installed) != 1 {
 		t.Fatalf("installs %d", host.installs)
 	}
-	if !bytes.Contains(host.installed[0], []byte("https://b.example")) || bytes.Contains(host.installed[0], []byte("https://a.example")) {
+	if !bytes.Contains(host.installed[0], []byte("https://b.example")) || bytes.Contains(host.installed[0], []byte("https://a.example")) || bytes.Contains(host.installed[0], []byte("control_url")) {
 		t.Fatalf("service saw the old config:\n%s", host.installed[0])
 	}
 	out := d.out()
 	for _, want := range []string{
 		"identity: role=member hostname=office-gw enroll=https://b.example",
 		"service: installed role=member hostname=office-gw enroll=https://b.example",
+		gateway.DropControlPinText,
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("missing %q in\n%s", want, out)

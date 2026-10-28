@@ -83,6 +83,20 @@ func BuildPlan(req Request) (Plan, error) {
 	return gatewayPlan(req)
 }
 
+// DropControlPinText is the plan warning shown when an enrollment authority
+// is replaced. The old control server pin is not kept.
+const DropControlPinText = "replacing the enrollment authority removes the previous control server pin; the next start discovers the new server and pins it; the old pin is not kept"
+
+// NoteControlPinDrop appends that warning when previousEnrollURL is a different
+// authority from the one this plan will write.
+func NoteControlPinDrop(plan *Plan, previousEnrollURL string) {
+	previousEnrollURL = strings.TrimSpace(previousEnrollURL)
+	if plan == nil || previousEnrollURL == "" || previousEnrollURL == plan.EnrollURL {
+		return
+	}
+	plan.Warnings = append(plan.Warnings, netdetect.Notice{Code: "drop-control-pin", Text: DropControlPinText})
+}
+
 // SimplePlan is a member or admin join: no routes, accept other people's routes.
 func SimplePlan(role, tenant, hostname string) (Plan, error) {
 	if role != join.RoleMember && role != join.RoleAdmin {
