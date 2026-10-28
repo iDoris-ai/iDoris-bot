@@ -23,6 +23,9 @@ var rmwAfterLoad func()
 // updateConfig holds the config lock for the whole read-modify-write.
 // fn may return an error to leave the file untouched.
 func updateConfig(path string, fn func(*Config) error) error {
+	if err := refuseForeignConfig(path); err != nil {
+		return err
+	}
 	release, err := acquireConfigLock(path)
 	if err != nil {
 		return err
