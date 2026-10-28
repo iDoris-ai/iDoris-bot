@@ -245,7 +245,7 @@ idoris-vpn-enroll list-credentials --config F --entry E
 - 加入码不证明登记主机属于本组织。核对打印出来的 `enrollment-authority`，或传 `--expect-authority`。
 - 换一份配置的登记 URL 要 `--replace`。不带它时，原文件不动。
 - 同一台 Headscale（相同 `control_url`）、相同角色、不同租户时，页面仍会把正在运行的旧守护进程当成完成。本轮没有改守护进程的状态快照；快照没有 `tenant`，也没有 `token_fingerprint`。
-- 成员和管理员的 auto/embedded 配置默认有回环 SOCKS5。网关和 local-ai 没有。本轮没有把这个代理真正连到一台 Local AI 上。
+- 成员和管理员的 auto/embedded 配置默认有回环 SOCKS5。网关和 local-ai 没有。2026-10-28 `TestR5WWizardMemberSOCKS`（compose 项目 `idoris-vpn-r5w-64f1d4e0`，15.60s PASS）把向导的 `SimplePlan` / `Apply` 写出的成员配置跑了起来。登记令牌来自宿主机 `idoris-vpn-enroll invite`，条目是租户 `acme`、角色 member、没有 ACL 标签。计划把 `mode` 写成 `embedded`：这套夹具里的 userspace tailscaled 已经在跑且未登录，auto 会选 system。`listen` 写成 `tcp:127.0.0.1:7845`，因为空的 listen 在设了 `HOME` 时变成 unix socket，状态探针读不到。种子配置留下 `state_dir` `/var/lib/idoris/vpn-state`。容器里 `idoris-vpnd run --config` 到达 `connected`，模式 `embedded`，SOCKS5 为 `listening`。`AccessInfo` 给出 `127.0.0.1:1080` 和凭据文件 `/var/lib/idoris/vpn-state/socks5.auth`。匿名连接被拒绝。用该凭据经 SOCKS5 访问 Local AI 节点 `acme-local-ai:11434` 的回声（1024 字节），输出含 `echoed`。没有在宿主机上另起一条 tailnet。同一用例再跑一次：项目 `idoris-vpn-r5w-5b47384e`，15.64s PASS。这两次都是单独跑的，全套 `make integration` 的计时仍以第 8 节为准。
 - 不是整段落在 RFC1918 里的前缀不会被广告。默认路由必须是 /0。隧道网卡不当办公室网。
 - 客户端不能批准自己的路由。
 - 空的 ControlURL 加上已登录状态（`Running` / `Starting` / `Stopped`）视为别人的 Tailscale SaaS，自动模式不接管。`NeedsMachineAuth` 加空 URL 仍当作全新安装。
