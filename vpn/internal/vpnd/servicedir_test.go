@@ -61,7 +61,7 @@ func TestR3svcStateDirectoryResolution(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if lock != filepath.Join(state, "locks") {
+		if lock != r4cWantLockDir(t, filepath.Join(state, "locks")) {
 			t.Fatalf("lock dir %s", lock)
 		}
 		if got := DefaultListen(); got != "unix:"+filepath.Join(state, "vpnd.sock") {
@@ -104,7 +104,11 @@ func TestR3svcStateDirectoryResolution(t *testing.T) {
 			t.Fatalf("state dir %q err %v", dir, err)
 		}
 		lock, err := systemLockDir()
-		if err == nil || lock != "" || !strings.Contains(err.Error(), "STATE_DIRECTORY") {
+		if currentIsMachineController() {
+			if err != nil || lock == "" {
+				t.Fatalf("root lock dir %q err %v", lock, err)
+			}
+		} else if err == nil || lock != "" || !strings.Contains(err.Error(), "STATE_DIRECTORY") {
 			t.Fatalf("lock dir %q err %v", lock, err)
 		}
 	})
@@ -148,7 +152,7 @@ func TestR3svcStateDirectoryResolution(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if lock != filepath.Join(cache, "idoris", "locks") {
+		if lock != r4cWantLockDir(t, filepath.Join(cache, "idoris", "locks")) {
 			t.Fatalf("lock dir %s, cache %s", lock, cache)
 		}
 	})
@@ -164,7 +168,11 @@ func TestR3svcStateDirectoryResolution(t *testing.T) {
 			t.Fatalf("state dir %q err %v", dir, err)
 		}
 		lock, err := systemLockDir()
-		if err == nil || lock != "" || !strings.Contains(err.Error(), "STATE_DIRECTORY") {
+		if currentIsMachineController() {
+			if err != nil || lock == "" {
+				t.Fatalf("root lock dir %q err %v", lock, err)
+			}
+		} else if err == nil || lock != "" || !strings.Contains(err.Error(), "STATE_DIRECTORY") {
 			t.Fatalf("lock dir %q err %v", lock, err)
 		}
 	})
