@@ -210,10 +210,13 @@ type Reconciler struct {
 	mismatchNode string
 	mismatchKey  string
 	loginProfile string
-	owner        *LiveOwner
-	ownKey       string
-	seenNode     string
-	seenProfile  string
+	// lastDiscovery is when a Running pass last tried /v1/discover while the
+	// identity was still unknown. Zero means this process has not tried yet.
+	lastDiscovery time.Time
+	owner         *LiveOwner
+	ownKey        string
+	seenNode      string
+	seenProfile   string
 }
 
 const (
@@ -222,6 +225,9 @@ const (
 	loginGrace = 20 * time.Second
 	// maxLoginGrace caps the exponential growth of the grace period.
 	maxLoginGrace = 10 * time.Minute
+	// discoveryRetryInterval is how often a Running pass retries /v1/discover
+	// while the enrollment identity is still unknown. It is not a login backoff.
+	discoveryRetryInterval = 30 * time.Second
 	// persistedLoginSettle is how long a NeedsLogin state may last when a
 	// node key is already stored before it is treated as expiry. Observed on
 	// tailscale.com v1.104.2: tsnet.Server.Start resumes that key itself
@@ -514,10 +520,14 @@ func (r *Reconciler) Step(ctx context.Context) (Snapshot, error) {
 	case ipn.Running.String():
 		r.markRegistered()
 		r.recoverSince = time.Time{}
-		if r.unconfirmedIdentity() {
-			// Discovery is what can confirm a changed token. A failure here
-			// leaves access closed; it is not a reason to mint.
-			_ = r.refreshIdentity(ctx)
+		if r.unconfirmedIdentity() && r.discoveryDue() {
+			// Discovery is what can confirm a changed token, and what can
+			// fill an empty binding after a restart. A failure leaves access
+			// closed; it is not a reason to mint. Repeats wait out the interval.
+			r.noteDiscovery()
+			if err := r.refreshIdentity(ctx); err != nil {
+				r.log.Warn("enrollment discovery retry failed", "err", err)
+			}
 			profileID = r.observedProfile(ctx)
 		}
 		if snap, err, handled := r.settleIdentity(ctx, st, prefs, profileID); handled {
@@ -969,7 +979,7 @@ func (r *Reconciler) settleIdentity(ctx context.Context, st *ipnstate.Status, pr
 	}
 	awaiting, loginOK := r.identityFlags()
 	if !awaiting {
-		if err := r.writeIdentity(nodeID, profileID); err != nil {
+		if _, err := r.writeIdentity(nodeID, profileID); err != nil {
 			return r.fail(fmt.Errorf("save identity: %w", err)), err, true
 		}
 		return Snapshot{}, nil, false
@@ -1006,13 +1016,35 @@ func (r *Reconciler) settleIdentity(ctx context.Context, st *ipnstate.Status, pr
 		}
 		return Snapshot{}, nil, false
 	}
-	if err := r.writeIdentity(nodeID, profileID); err != nil {
+	persisted, err := r.writeIdentity(nodeID, profileID)
+	if err != nil {
 		return r.fail(fmt.Errorf("save identity: %w", err)), err, true
+	}
+	// Discovery was down, so the binding was not written. Keep the pending
+	// login; the next Running pass retries discovery and must not treat this
+	// node as already enrolled.
+	if !persisted {
+		return Snapshot{}, nil, false
 	}
 	if err := r.clearIdentityTransition(); err != nil {
 		return r.fail(fmt.Errorf("clear identity transition: %w", err)), err, true
 	}
 	return Snapshot{}, nil, false
+}
+
+func (r *Reconciler) discoveryDue() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.lastDiscovery.IsZero() {
+		return true
+	}
+	return !r.now().Before(r.lastDiscovery.Add(discoveryRetryInterval))
+}
+
+func (r *Reconciler) noteDiscovery() {
+	r.mu.Lock()
+	r.lastDiscovery = r.now()
+	r.mu.Unlock()
 }
 
 func (r *Reconciler) identityFlags() (awaiting, loginOK bool) {
@@ -1284,10 +1316,13 @@ func (r *Reconciler) boundIdentity() Identity {
 	return r.opt.Identity
 }
 
-func (r *Reconciler) writeIdentity(nodeID, profileID string) error {
+// writeIdentity persists the binding. persisted is false when discovery has
+// not produced an identity yet: the caller must not treat that as success
+// and must not clear a pending login.
+func (r *Reconciler) writeIdentity(nodeID, profileID string) (persisted bool, err error) {
 	ident := r.boundIdentity()
 	if r.opt.State == nil || (!ident.Known && !ident.Static) {
-		return nil
+		return false, nil
 	}
 	bound := r.opt.State.Get()
 	if nodeID == "" {
@@ -1302,9 +1337,15 @@ func (r *Reconciler) writeIdentity(nodeID, profileID string) error {
 		profileID = ""
 	}
 	if ident.Static {
-		return r.opt.State.SetStaticIdentity(r.opt.ControlURL, nodeID, profileID)
+		if err := r.opt.State.SetStaticIdentity(r.opt.ControlURL, nodeID, profileID); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
-	return r.opt.State.SetIdentity(r.opt.ControlURL, ident.Tenant, ident.Role, ident.TokenFingerprint, nodeID, profileID)
+	if err := r.opt.State.SetIdentity(r.opt.ControlURL, ident.Tenant, ident.Role, ident.TokenFingerprint, nodeID, profileID); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // AccessIdentityOK is the gate's view of enrollment. It is false during an
@@ -1378,8 +1419,10 @@ func (r *Reconciler) unconfirmedLocked() bool {
 		return false
 	}
 	b := r.opt.State.Get()
+	// An empty binding has not been confirmed. Access stays closed and a
+	// Running pass retries discovery instead of forgetting a pending login.
 	if b.Tenant == "" && b.Role == "" && b.NodeID == "" && b.ProfileID == "" && !b.Static {
-		return false
+		return true
 	}
 	return !degradedContinuity(ident, b, r.opt.Mode, r.seenNode, r.seenProfile)
 }
