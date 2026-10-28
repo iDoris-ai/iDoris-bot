@@ -39,6 +39,8 @@ Headscale v0.29 的 `policy check` 打到正在运行的服务器上的 gRPC，�
 
 Headplane 镜像的用户是 `0`（root），cookie 文件保持 0600，不改属主。这次在 macOS 上以非 root 操作员跑通了探针和登录证明；没有在一台以 root 执行 `bootstrap.sh` 的 Linux 上再跑一遍 chown。
 
+`probe.sh` 和 `restore-drill.sh` 写 `.env` 的 `ENROLL_UID` / `ENROLL_GID` 时用同一个 `select_enroll_runtime`。root 改成 `65532:65532`，stderr 是 `<名字>: refusing to run enroll as root; using uid 65532 (the image USER)`。非 root 保留自己的 uid/gid。root 在拉起 `enroll` 之前把 `enroll/` 交给这个 uid，目录 0700，文件 0600，不改 `headplane/cookie_secret`。演练里只读凭证夹具的属主和注册运行 uid 分开：root 把夹具 chown 成 65534；运行 uid 已经是 65534 时用 65531。非 root 不能 chown，夹具沿用文件现有属主。`deploy/vpn/test/test_r5o_runtime_id.sh` 在这台 Mac 上用替身 `id` 和 `chown` 看过：假 uid 0 得到 `65532 65532` 和 bootstrap 那句日志；拿掉 uid/gid 改写后得到 `0 0`。假 uid 501 得到 `501 20`，没有那句日志，也不 chown。随后在这台 Docker Desktop 上以当前非 root 用户跑了整套探针（项目 `idoris-vpn-r2d-393130`，`probe: 58 passed, 0 failed`，`probe: ok`）和演练（项目 `idoris-vpn-r2d-117620`，`ownership ok`，`credential shapes ok`，`drill: ok`）。没有在原生 Linux 上以 root 跑过探针或演练。
+
 `restore` 用包里校验过的 `ENROLL_UID` / `ENROLL_GID`（缺省 65532，拒绝 0）做同样的属主处理，目录也算在内：不跟随符号链接，目录 0700，文件 0600。操作员不是 root、而且 id 已经一致时只 `chmod`。不是 root 且 id 对不上时拒绝，提示以 root 再跑 `restore`。这次的 root 属主检查跑在一个临时 Alpine 容器里（容器自己的文件系统，不是 macOS 绑定挂载）：65532 和另一个 uid 都能读到密钥，非 root 去改成别的 uid 会被拒绝。演练见第 6 节。
 
 ## 3. 管理员、MagicDNS、反向规则

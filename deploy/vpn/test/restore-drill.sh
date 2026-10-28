@@ -26,6 +26,10 @@ bundle="$bundle_root/bundle"
 
 die() { echo "drill: $*" >&2; exit 1; }
 
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../ops-lib.sh
+source "$origin/ops-lib.sh"
+
 command -v docker >/dev/null || die "docker not found"
 docker compose version >/dev/null 2>&1 || die "docker compose v2 is required"
 command -v python3 >/dev/null || die "python3 is required"
@@ -33,8 +37,7 @@ command -v rsync >/dev/null || die "rsync is required"
 
 PROJ="idoris-vpn-r2d-$(python3 -c 'import random; print(random.randint(100000, 999999))')"
 export COMPOSE_PROJECT_NAME="$PROJ"
-ENROLL_UID="$(id -u)"
-ENROLL_GID="$(id -g)"
+read -r ENROLL_UID ENROLL_GID < <(select_enroll_runtime drill)
 export ENROLL_UID ENROLL_GID
 
 free_port() {
@@ -345,15 +348,11 @@ with open(sys.argv[1], "w") as fh:
     json.dump(cfg, fh)
     fh.write("\n")
 PY
-shape_owner="$(python3 - "$bundle_root/shape/config.json" <<'PY'
-import os, sys
-st = os.stat(sys.argv[1])
-print("%d:%d" % (st.st_uid, st.st_gid))
-PY
-)"
-# The fixture is mode 0600. Run as its owner so a Linux host exercises the
-# read path that does not create <config>.lock. Docker Desktop bind mounts
-# may not keep that ownership; the drill still passes the same --user.
+# The fixture owner stays off the service uid. Root chowns it to 65534
+# (65531 when the runtime uid is already 65534). A non-root caller cannot
+# chown, so the printed id is the file's current owner. Docker Desktop bind
+# mounts may not keep that ownership; the drill still passes the same --user.
+shape_owner="$(listing_fixture_owner "$bundle_root/shape/config.json" "$ENROLL_UID")"
 shape_list="$(docker run --rm --network none --user "$shape_owner" -v "$bundle_root/shape:/work:ro" --entrypoint idoris-vpn-enroll "$image" list-credentials --config /work/config.json --entry acme)"
 printf '%s\n' "$shape_list" | python3 -c '
 import sys
@@ -402,6 +401,7 @@ with open(path, "w") as fh:
 PY
 chmod 600 "$src/enroll/config.json"
 unset HASH
+provision_enroll_tree "$ENROLL_UID" "$ENROLL_GID" "$src/enroll"
 
 docker compose up -d --wait --wait-timeout 180 enroll headplane
 docker compose exec -T enroll idoris-vpn-enroll check --config /etc/idoris/enroll.json
