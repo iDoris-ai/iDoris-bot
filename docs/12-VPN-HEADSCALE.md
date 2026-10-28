@@ -140,8 +140,8 @@ sequenceDiagram
 
 | 风险 | 控制 |
 |---|---|
-| Headscale API key 泄露 = 全网管理权 | 服务用 key 只存在于 `idoris-vpn-enroll` 容器挂载的文件里，容器以非 root（bootstrap 以当前用户的 uid/gid 运行它，**以 root 执行 bootstrap 会让注册服务也以 root 运行**，应改用专用普通用户）、只读根文件系统、`cap_drop: ALL` 运行；客户端拿到的是**一次性、10 分钟**的 preauthkey。运维登录 Headplane 用各自的 API key，需单独保管与轮换 |
-| 令牌泄露 | 令牌服务端只存 SHA-256（客户端保存的是**明文**令牌，被盗即可注册）；每台设备/每人单独签发邀请令牌（带标签），可单独撤销；按组织限流（默认 30/min）；每次签发写审计日志（tenant、hostname、令牌标签、来源地址） |
+| Headscale API key 泄露 = 全网管理权 | 服务用 key 只存在于 `idoris-vpn-enroll` 容器挂载的文件里。容器不以 root 运行：操作员不是 root 时用该操作员的 uid/gid；操作员是 root 时改成镜像 USER `65532:65532`，启动前把密钥文件交给这个用户（日志写 refusing to run enroll as root）。只读根文件系统、`cap_drop: ALL`。没有在原生 Linux 上以 root 跑过 `bootstrap.sh`；属主交接在临时 Alpine 容器里看过，见 [14](14-VPN-OPERATIONS.md) 第 2 节。客户端拿到的是**一次性、10 分钟**的 preauthkey。运维登录 Headplane 用各自的 API key，需单独保管与轮换 |
+| 令牌泄露 | 令牌服务端只存 SHA-256（客户端保存的是**明文**令牌，被盗即可注册）；每台设备/每人单独签发邀请令牌（带标签），可单独撤销；按组织限流（默认 30/min）；每次签发写审计日志（tenant、hostname、令牌标签、来源地址）。Headscale 已经铸出 key、响应还没返回时若配置被换掉，按当前代次再核对一次：凭证已废，或租户、Headscale 用户、tag 变了，就作废这把 key 并返回 401，不把 key 交出去。见第 8 节 |
 | 中间人改写 control_url | 注册 URL 强制 https（`enroll_allow_insecure` 仅限实验室）；客户端若固定了 `control_url`，服务端返回不一致即拒绝 |
 | 守护进程劫持用户私有 tailnet | `takeover` 默认 false；`auto` 发现外部登录时改用独立的嵌入式节点，原登录不动（集成测试断言它全程保持 Running）；只有显式 `takeover: true` 才切换并记录 previous_profile；状态 API 显示 `mode` 与 `mode_reason` |
 | 节点被盗/离职 | **先撤销该设备的邀请令牌，再 `expire`/`delete` 节点**（`ctl.sh offboard`）。只做 `expire` 或 `delete` 不够：守护进程会用同一枚令牌自动续期或重新注册，等于没撤销。成员节点 180 天过期来自本部署的 `node.expiry: 4320h`（Headscale 默认 0，即不过期），守护进程会自动续期；**带 tag 的 Local AI 节点永不过期**，失窃要撤销令牌后手动 expire/delete；ephemeral 租户用于临时设备。仍在使用整个组织共用的老令牌时，只能轮换这枚共用令牌，影响所有成员 |
@@ -198,6 +198,8 @@ sequenceDiagram
 6. **隔离回归**：`bash deploy/vpn/test/probe.sh`，两个组织加管理员加网关，47 项允许/拒绝断言。
 7. 备份内容：`db.sqlite`（含 `-wal`/`-shm`）、`noise_private.key`、`derp_server_private.key`、Headplane 数据卷。私钥必须和 sqlite 一起恢复。
 8. 观测：注册服务每次签发写一行审计日志（含令牌标签与来源地址；只有配置了 `trusted_proxies` 才信任 X-Forwarded-For，否则记录的是反代地址）；`/readyz` 检查 Headscale 连通与 API key 有效期；客户端用 `idoris-vpnd status`。
+9. **注册配置锁**：`bootstrap.sh`、`policy.py` 和 `idoris-vpn-enroll` 改 `config.json` 时共用 `<config>.lock` 上的 flock。只读（含 `list-credentials`）不创建这把锁。细节和这次实际跑过的范围见 [14](14-VPN-OPERATIONS.md) 第 5 节。
+10. **签发窗口**：Headscale 返回 pre-auth key 之后，注册服务在配置锁里再看当前代次。每次成功装入配置，代次加一。代次没变就发 key。代次变了，还要这枚凭证仍被接受，并且租户、Headscale 用户、tag 和签发前一致，才发 key。否则调用 Headscale `POST /api/v1/preauthkey/expire`（body 是 `{"id":"<十进制 id>"}`）作废刚铸的 key，HTTP 401 `{"error":"invalid token"}`，响应里没有 key。日志只记 key id。代次变了但凭证、用户和 tag 都没变（例如只改了全局限流）仍然发 key。这一项用假的 Headscale：铸 key 的调用堵住时重载配置，覆盖吊销、以及只改用户和 tag 两种拒绝，外加「只改限流仍返回 key」。没有对真的 Headscale v0.29.6 打过 expire。`ExpirePreAuthKey` 在 `vpn/internal/headscale`，不在 Minter 接口上；现有的假 Minter 不会去 expire。
 
 ## 9. 待决问题
 
