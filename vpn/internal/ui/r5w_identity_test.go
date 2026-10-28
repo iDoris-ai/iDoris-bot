@@ -123,9 +123,9 @@ func TestR5WSameRoleReplacementDoesNotReportTheOldDaemon(t *testing.T) {
 	}
 }
 
-// r5wIdentityDone is the page rule: a non-empty discovery URL (else the
-// written pin) must equal the daemon's control_url. Tenant and token
-// fingerprint count only when the status object already carries them.
+// r5wIdentityDone is the raw string check used by the HTTP test above.
+// The page canonicalises control URLs; TestR6WAppJSCanonicalControlURL
+// drives app.js for that.
 func r5wIdentityDone(res gateway.ApplyResult, st map[string]any) bool {
 	if res.Role != "" {
 		role, _ := st["role"].(string)
