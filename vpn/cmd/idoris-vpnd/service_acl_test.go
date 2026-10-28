@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/fsutil"
 )
 
 func TestR2GICACLSCommandGolden(t *testing.T) {
@@ -20,35 +22,51 @@ func TestR2GICACLSCommandGolden(t *testing.T) {
 	assertGolden(t, "testdata/idoris-vpnd.icacls.txt", renderICACLSCommands(cmds))
 }
 
-func TestR2GParseICACLS(t *testing.T) {
-	ok := "" +
-		`C:\ProgramData\idoris NT AUTHORITY\SYSTEM:(OI)(CI)(F)` + "\n" +
-		`                       BUILTIN\Administrators:(OI)(CI)(F)` + "\n" +
-		"\n" +
-		"Successfully processed 1 files; Failed processing 0 files\n"
-	if err := parseICACLSProtected(ok); err != nil {
-		t.Fatal(err)
+func TestR5CServiceDACLUsesSIDs(t *testing.T) {
+	sys := fsutil.SIDLocalSystem
+	adm := fsutil.SIDAdministrators
+	cases := []struct {
+		name string
+		view fsutil.ACLView
+		ok   bool
+	}{
+		{
+			name: "system and administrators",
+			view: fsutil.ACLView{OwnerSID: sys, ACEs: []fsutil.ACE{{SID: sys}, {SID: adm}}},
+			ok:   true,
+		},
+		{
+			name: "administrators owner",
+			view: fsutil.ACLView{OwnerSID: adm, ACEs: []fsutil.ACE{{SID: sys}, {SID: adm}}},
+			ok:   true,
+		},
+		{
+			name: "only system",
+			view: fsutil.ACLView{OwnerSID: sys, ACEs: []fsutil.ACE{{SID: sys}}},
+		},
+		{
+			name: "foreign ACE",
+			view: fsutil.ACLView{OwnerSID: sys, ACEs: []fsutil.ACE{{SID: sys}, {SID: adm}, {SID: "S-1-1-0"}}},
+		},
+		{
+			name: "inherited ACE",
+			view: fsutil.ACLView{OwnerSID: sys, ACEs: []fsutil.ACE{{SID: sys, Inherited: true}, {SID: adm}}},
+		},
+		{
+			name: "empty",
+			view: fsutil.ACLView{OwnerSID: sys},
+		},
 	}
-	sid := "" +
-		`C:\ProgramData\idoris\vpn.json S-1-5-18:(F)` + "\n" +
-		`                               *S-1-5-32-544:(F)` + "\n"
-	if err := parseICACLSProtected(sid); err != nil {
-		t.Fatal(err)
-	}
-	users := strings.Replace(ok, "Successfully", "                       BUILTIN\\Users:(OI)(CI)(RX)\nSuccessfully", 1)
-	if err := parseICACLSProtected(users); err == nil {
-		t.Fatal("Users ACE was accepted")
-	}
-	everyone := "C:\\ProgramData\\idoris Everyone:(RX)\n                       NT AUTHORITY\\SYSTEM:(F)\n                       BUILTIN\\Administrators:(F)\n"
-	if err := parseICACLSProtected(everyone); err == nil {
-		t.Fatal("Everyone ACE was accepted")
-	}
-	onlySystem := "C:\\ProgramData\\idoris NT AUTHORITY\\SYSTEM:(OI)(CI)(F)\nSuccessfully processed 1 files; Failed processing 0 files\n"
-	if err := parseICACLSProtected(onlySystem); err == nil {
-		t.Fatal("ACL without Administrators was accepted")
-	}
-	if err := parseICACLSProtected("Successfully processed 1 files; Failed processing 0 files\n"); err == nil {
-		t.Fatal("output with no ACE was accepted")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := verifyServiceDACL(tc.view)
+			if tc.ok && err != nil {
+				t.Fatal(err)
+			}
+			if !tc.ok && err == nil {
+				t.Fatal("DACL was accepted")
+			}
+		})
 	}
 }
 
