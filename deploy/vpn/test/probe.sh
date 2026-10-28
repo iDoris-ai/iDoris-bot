@@ -731,6 +731,30 @@ else
   echo "  ok   globex-member denied Headplane on ${vip}:3000"
 fi
 
+echo "probe: COMPOSE_PROFILES cannot run both Headplanes"
+COMPOSE_PROFILES=tailnet-admin bash "$root/ctl.sh" up --published --headplane-access tunnel
+pub_running="$(dc ps --status running -q headplane || true)"
+tail_running="$(dc --profile tailnet-admin ps --status running -q headplane-tailnet || true)"
+if [[ -n "$pub_running" && -z "$tail_running" ]]; then
+  pass=$((pass + 1))
+  echo "  ok   published up with COMPOSE_PROFILES=tailnet-admin left the tailnet Headplane stopped"
+else
+  fail=$((fail + 1))
+  echo "  FAIL published up published='$pub_running' tailnet='$tail_running'" >&2
+fi
+export VPN_SERVER_ENROLL_TOKEN="$vpn_token"
+COMPOSE_PROFILES=tailnet-admin bash "$root/ctl.sh" up --tailnet-admin
+unset VPN_SERVER_ENROLL_TOKEN
+pub_running="$(dc ps --status running -q headplane || true)"
+tail_running="$(dc --profile tailnet-admin ps --status running -q headplane-tailnet || true)"
+if [[ -z "$pub_running" && -n "$tail_running" ]]; then
+  pass=$((pass + 1))
+  echo "  ok   tailnet up stopped the published Headplane"
+else
+  fail=$((fail + 1))
+  echo "  FAIL tailnet up published='$pub_running' tailnet='$tail_running'" >&2
+fi
+
 echo "probe: credential lifecycle"
 # The copy's enroll directory is the file the running container has mounted.
 if ENROLL_DIR="$root/enroll" PROJ="$PROJ" bash "$root/test/credentials.sh"; then

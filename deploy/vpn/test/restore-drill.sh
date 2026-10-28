@@ -579,6 +579,12 @@ HEADPLANE_BIND=0.0.0.0 bash "$src/ctl.sh" up --headplane-access tunnel
 assert_bind 127.0.0.1
 grep -q '^mode=published$' "$src/.admin-mode" || die "tunnel did not record published mode"
 
+echo "drill: COMPOSE_PROFILES=tailnet-admin does not start the second Headplane"
+COMPOSE_PROFILES=tailnet-admin bash "$src/ctl.sh" up --headplane-access tunnel
+assert_bind 127.0.0.1
+tail_running="$(docker compose --project-directory "$src" --project-name "$PROJ" --profile tailnet-admin ps --status running -q headplane-tailnet || true)"
+[[ -z "$tail_running" ]] || die "tailnet Headplane started beside the published one"
+
 echo "drill: lan publishes 0.0.0.0 and restore puts the bundle bind back"
 HEADPLANE_BIND=0.0.0.0 bash "$src/ctl.sh" up --headplane-access lan
 assert_bind 0.0.0.0

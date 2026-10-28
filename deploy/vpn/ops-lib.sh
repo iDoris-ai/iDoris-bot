@@ -97,7 +97,7 @@ start_stack_for_mode() {
     fi
   else
     compose --profile tailnet-admin stop vpn-sidecar headplane-tailnet >/dev/null 2>&1 || true
-    compose up -d --wait --wait-timeout 180
+    compose up -d --wait --wait-timeout 180 headscale enroll headplane
     verify_published_bindings "$mode"
   fi
 }
@@ -667,10 +667,14 @@ assign_instance() {
   reject_project_collision
 }
 
-# Shell exports beat .env. Every compose invocation below re-applies the
-# keys from this directory's .env (or unsets them) so a stale HEADPLANE_BIND
-# cannot publish a port the mode file just turned off. VPN_SERVER_ENROLL_TOKEN
-# is a process credential and is left alone.
+# Shell exports beat .env for the keys listed below: every compose invocation
+# re-applies those keys from this directory's .env (or unsets them) so a stale
+# HEADPLANE_BIND cannot publish a port the mode file just turned off.
+# COMPOSE_PROFILES, COMPOSE_FILE and COMPOSE_PATH_SEPARATOR are always
+# removed. A profile has to be requested with --profile, or an inherited
+# COMPOSE_PROFILES=tailnet-admin starts the second Headplane. COMPOSE_PROJECT_NAME
+# is set to this deployment. VPN_SERVER_ENROLL_TOKEN is a process credential
+# and is left alone.
 _COMPOSE_FILE_KEYS="HEADPLANE_BIND HEADPLANE_PORT HEADSCALE_PORT ENROLL_PORT DERP_STUN_PORT ENROLL_UID ENROLL_GID HEADPLANE_ACCESS HEADPLANE_LAN_HOST HEADPLANE_BASE_URL HEADPLANE_ALLOW_PUBLIC_ADMIN ENROLL_PUBLIC_URL ENROLL_IMAGE IDORIS_VPN_VERSION VPN_SERVER_LOGIN_SERVER"
 
 dotenv_value() {
@@ -695,6 +699,9 @@ compose() {
   [[ "$project" =~ ^[a-z0-9][a-z0-9_-]{0,50}$ ]] || die "compose project name '$project' is not a safe label"
   local -a unset_args=() set_args=()
   set_args+=("COMPOSE_PROJECT_NAME=${project}")
+  # Always. These are not deployment settings, and a shell export must not
+  # select a second compose file or turn the tailnet-admin profile on.
+  unset_args+=("-u" "COMPOSE_PROFILES" "-u" "COMPOSE_FILE" "-u" "COMPOSE_PATH_SEPARATOR")
   for key in $_COMPOSE_FILE_KEYS; do
     if val="$(dotenv_value "$key")"; then
       set_args+=("${key}=${val}")
@@ -921,6 +928,9 @@ verify_published_bindings() {
       [[ -z "${out//[[:space:]]/}" ]] || die "vpn-sidecar published a host port ($out)"
     fi
     return 0
+  fi
+  if service_running headplane-tailnet; then
+    die "headplane-tailnet is running in published mode"
   fi
   if ! service_running headplane; then
     return 0
