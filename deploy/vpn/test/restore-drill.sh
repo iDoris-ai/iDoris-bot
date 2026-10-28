@@ -345,7 +345,16 @@ with open(sys.argv[1], "w") as fh:
     json.dump(cfg, fh)
     fh.write("\n")
 PY
-shape_list="$(docker run --rm --network none -v "$bundle_root/shape:/work:ro" --entrypoint idoris-vpn-enroll "$image" list-credentials --config /work/config.json --entry acme)"
+shape_owner="$(python3 - "$bundle_root/shape/config.json" <<'PY'
+import os, sys
+st = os.stat(sys.argv[1])
+print("%d:%d" % (st.st_uid, st.st_gid))
+PY
+)"
+# The fixture is mode 0600. Run as its owner so a Linux host exercises the
+# read path that does not create <config>.lock. Docker Desktop bind mounts
+# may not keep that ownership; the drill still passes the same --user.
+shape_list="$(docker run --rm --network none --user "$shape_owner" -v "$bundle_root/shape:/work:ro" --entrypoint idoris-vpn-enroll "$image" list-credentials --config /work/config.json --entry acme)"
 printf '%s\n' "$shape_list" | python3 -c '
 import sys
 text = sys.stdin.read()
