@@ -381,6 +381,44 @@ func (s *StateFile) ClearPending() error {
 	return s.SetPending(PendingLogin{})
 }
 
+// ClearCommittedBinding forgets the identity that would certify a running
+// node: tenant, role, fingerprint, node id, profile id, and static.
+// Control URL and login backoff stay. The pending transition is removed in
+// the same write. Two writes would let a crash drop the pending login and
+// leave the previous binding trusted.
+func (s *StateFile) ClearCommittedBinding() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := s.st
+	next.Tenant = ""
+	next.Role = ""
+	next.TokenFingerprint = ""
+	next.NodeID = ""
+	next.ProfileID = ""
+	next.Static = false
+	next.PendingNodeID = ""
+	next.PendingNodeKey = ""
+	next.PendingProfileID = ""
+	next.PendingStarted = time.Time{}
+	next.PendingLoginOK = false
+	next.PendingTokenFingerprint = ""
+	next.PendingTenant = ""
+	next.PendingRole = ""
+	next.PendingControlURL = ""
+	next.PendingMode = ""
+	if next == s.st {
+		return nil
+	}
+	if err := s.saveLocked(next); err != nil {
+		return err
+	}
+	s.st = next
+	return nil
+}
+
 // Pending returns the persisted identity transition. The bool is false when
 // no transition was saved.
 func (s *StateFile) Pending() (PendingLogin, bool) {
