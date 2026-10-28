@@ -31,6 +31,12 @@ func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 		_ = tmp.Close()
 		return err
 	}
+	// On Windows the mode bits are not a DACL. Lock the empty temp file
+	// before the first secret byte. Unix has nothing further to do here.
+	if err := protectSecretBeforeWrite(name); err != nil {
+		_ = tmp.Close()
+		return err
+	}
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
 		return err
@@ -54,6 +60,11 @@ func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 // (Unix), or is writable by anyone else. It does not silently chmod somebody
 // else's directory: a pre-populated shared directory is an error.
 func EnsurePrivateDir(dir string) error {
+	_, statErr := os.Lstat(dir)
+	existed := statErr == nil
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return statErr
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
@@ -73,5 +84,8 @@ func EnsurePrivateDir(dir string) error {
 	if perm := st.Mode().Perm(); perm&0o022 != 0 && supportsUnixModes() {
 		return fmt.Errorf("fsutil: %s is writable by group or others (mode %o)", dir, perm)
 	}
-	return nil
+	// Windows: a directory this call created gets a restrictive DACL before
+	// any secret is written into it. An existing directory is checked and
+	// left alone when the ACL already lets other users read.
+	return protectPrivateDir(dir, !existed)
 }
