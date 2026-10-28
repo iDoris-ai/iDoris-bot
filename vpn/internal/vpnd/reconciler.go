@@ -159,6 +159,9 @@ type Snapshot struct {
 	// it just applied from one that still runs the previous credential.
 	Tenant           string `json:"tenant,omitempty"`
 	TokenFingerprint string `json:"token_fingerprint,omitempty"`
+	// IdentityUnconfirmed is true only while discovery has not confirmed the
+	// identity for the token now in hand. The wizard reads this key.
+	IdentityUnconfirmed bool `json:"identity_unconfirmed,omitempty"`
 	// Warnings are operator-facing notices that do not by themselves change
 	// phase. Missing tags uses both a phase and a warning.
 	Warnings []string `json:"warnings,omitempty"`
@@ -289,12 +292,14 @@ func New(be Backend, keys KeySource, opt Options, log *slog.Logger) (*Reconciler
 }
 
 // dropMismatchedPending forgets a persisted login whose target is not the
-// configuration this process was given. The running node is then judged by
-// the ordinary binding rules, so a login started for one credential cannot
-// certify another. An unknown tenant or role (discovery has not run) is not
-// a mismatch; the token fingerprint, control URL, and backend mode still are.
-// System-mode profile changes are refused later by profileMoved, which does
-// not certify the other profile.
+// configuration this process was given. The committed binding is cleared in
+// that same write: the login may already have rotated the node key, and the
+// previous binding must not certify the node that is up now. An empty
+// binding does not certify a node that was already up, so the restored
+// credential has to log in again. An unknown tenant or role (discovery has
+// not run) is not a mismatch; the token fingerprint, control URL, and
+// backend mode still are. System-mode profile changes are refused later by
+// profileMoved, which does not certify the other profile.
 func (r *Reconciler) dropMismatchedPending() error {
 	if r.opt.State == nil {
 		return nil
@@ -308,7 +313,7 @@ func (r *Reconciler) dropMismatchedPending() error {
 		return nil
 	}
 	r.log.Warn("discarding pending login", "reason", why)
-	if err := r.opt.State.ClearPending(); err != nil {
+	if err := r.opt.State.ClearCommittedBinding(); err != nil {
 		return err
 	}
 	r.mu.Lock()
@@ -399,6 +404,7 @@ func (r *Reconciler) set(mutate func(s *Snapshot)) Snapshot {
 	r.snap.Role = r.opt.Role
 	r.snap.Tenant = r.opt.Identity.Tenant
 	r.snap.TokenFingerprint = r.opt.Identity.TokenFingerprint
+	r.snap.IdentityUnconfirmed = r.unconfirmedLocked()
 	r.snap.Attempts = r.attempts
 	r.snap.PreviousProfile = string(r.previousProfile)
 	r.snap.UpdatedAt = r.now()

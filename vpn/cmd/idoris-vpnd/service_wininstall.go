@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -25,6 +26,11 @@ var (
 	windowsSleep = time.Sleep
 )
 
+// protectWindowsInstallFn applies the machine DACL. Tests replace it to
+// record whether the staging directory was still empty. Production is
+// protectWindowsInstall.
+var protectWindowsInstallFn = protectWindowsInstall
+
 // windowsReplaceSpec is one Windows install with explicit paths, so the
 // order can be tested on a non-Windows host. StagingDir is a sibling of the
 // live tree, never a directory inside it.
@@ -38,8 +44,12 @@ type windowsReplaceSpec struct {
 	StagingDir string
 	Active     bool
 	// SelfPID is set when this process is running the installed image.
-	// The wait treats that pid as the installer and does not replace LiveExe.
+	// That path stays mapped, so the task is pointed at a versioned copy.
 	SelfPID int
+	// ExcludePID is this process. tasklist filters by image name, so an
+	// installer that is not the installed file is still listed under that
+	// name. The wait ignores this pid. It does not keep LiveExe.
+	ExcludePID int
 }
 
 func windowsStagingPath() (string, error) {
@@ -81,6 +91,13 @@ func replaceWindowsTask(spec windowsReplaceSpec) error {
 	if err := os.Mkdir(stage, 0o750); err != nil {
 		return err
 	}
+	// Windows ignores the 0750 mode. The inherited ProgramData ACL would
+	// let another local user read credential bytes, so the empty directory
+	// is restricted and verified before any file is copied in. Per-file
+	// ACLs are applied again once the staged files exist.
+	if err := protectWindowsInstallFn(stage, "", "", "", nil); err != nil {
+		return err
+	}
 	commit := false
 	defer func() {
 		if !commit {
@@ -116,7 +133,7 @@ func replaceWindowsTask(spec windowsReplaceSpec) error {
 	}
 	// Secrets exist only in the staging directory. Protect that directory
 	// before the task is stopped. On non-Windows this is a no-op.
-	if err := protectWindowsInstall(stage, stagedConfig, "", stagedExe, creds); err != nil {
+	if err := protectWindowsInstallFn(stage, stagedConfig, "", stagedExe, creds); err != nil {
 		return err
 	}
 
@@ -126,7 +143,7 @@ func replaceWindowsTask(spec windowsReplaceSpec) error {
 			return fmt.Errorf("schtasks /End: %w: %s", err, strings.TrimSpace(string(out)))
 		}
 		ended = true
-		if err := waitWindowsImageExit(filepath.Base(spec.LiveExe), spec.SelfPID); err != nil {
+		if err := waitWindowsImageExit(filepath.Base(spec.LiveExe), spec.ExcludePID); err != nil {
 			_, _ = runServiceCommand("schtasks", "/Run", "/TN", windowsTaskName)
 			return err
 		}
@@ -161,7 +178,7 @@ func replaceWindowsTask(spec windowsReplaceSpec) error {
 	if err := replaceFile(stagedConfig, spec.LiveConfig); err != nil {
 		return err
 	}
-	if err := protectWindowsInstall(spec.LiveDir, spec.LiveConfig, spec.ExeDir, runExe, liveCreds); err != nil {
+	if err := protectWindowsInstallFn(spec.LiveDir, spec.LiveConfig, spec.ExeDir, runExe, liveCreds); err != nil {
 		return err
 	}
 	args := renderSchtasksCreateIn(runExe, spec.LiveConfig, spec.LiveDir)
@@ -215,23 +232,40 @@ func replaceFile(src, dest string) error {
 }
 
 func retargetStagedConfig(body []byte, staging, live string) ([]byte, error) {
-	if !strings.Contains(string(body), staging) {
-		return body, nil
-	}
+	// Compare decoded paths. On Windows a staging path is written into JSON
+	// with escaped backslashes, so it is not a substring of the raw text.
+	// filepath.Dir also uses the host separator, which does not split a
+	// Windows path when this function is tested on macOS or Linux.
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
 	var probe map[string]any
-	if err := json.Unmarshal(body, &probe); err != nil {
+	if err := dec.Decode(&probe); err != nil {
 		return nil, err
 	}
+	stageDir := parseInstallPath(staging)
 	changed := false
-	for k, v := range probe {
-		s, ok := v.(string)
+	for _, it := range stagedCredentialFiles {
+		raw, ok := probe[it.key]
+		if !ok || raw == nil {
+			continue
+		}
+		s, ok := raw.(string)
 		if !ok {
 			continue
 		}
-		if filepath.Clean(filepath.Dir(s)) != filepath.Clean(staging) {
+		s = strings.TrimSpace(s)
+		if s == "" {
 			continue
 		}
-		probe[k] = filepath.Join(live, filepath.Base(s))
+		parsed := parseInstallPath(s)
+		if !sameInstallDir(installParent(parsed), stageDir) {
+			continue
+		}
+		base := installBase(parsed)
+		if base == "" {
+			continue
+		}
+		probe[it.key] = joinInstallPath(live, base)
 		changed = true
 	}
 	if !changed {
@@ -244,16 +278,148 @@ func retargetStagedConfig(body []byte, staging, live string) ([]byte, error) {
 	return append(out, '\n'), nil
 }
 
+// isWindowsInstallPath reports a path whose separator or volume is Windows
+// syntax, including when this process is not running on Windows.
+func isWindowsInstallPath(p string) bool {
+	if strings.Contains(p, `\`) {
+		return true
+	}
+	return len(p) >= 2 && p[1] == ':' && isASCIILetter(p[0])
+}
+
+func isASCIILetter(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+}
+
+type installPathParts struct {
+	windows bool
+	volume  string
+	elems   []string
+}
+
+func parseInstallPath(p string) installPathParts {
+	if isWindowsInstallPath(p) {
+		return parseWindowsInstallPath(p)
+	}
+	clean := filepath.Clean(p)
+	vol := filepath.VolumeName(clean)
+	rest := clean
+	if vol != "" {
+		rest = strings.TrimPrefix(clean, vol)
+	}
+	rest = strings.Trim(rest, string(filepath.Separator))
+	var elems []string
+	if rest != "" && rest != "." {
+		elems = strings.Split(rest, string(filepath.Separator))
+	}
+	return installPathParts{windows: false, volume: vol, elems: elems}
+}
+
+func parseWindowsInstallPath(p string) installPathParts {
+	p = strings.ReplaceAll(p, `/`, `\`)
+	if strings.HasPrefix(p, `\\`) {
+		parts := cleanInstallElems(strings.Split(strings.TrimPrefix(p, `\\`), `\`))
+		if len(parts) >= 2 {
+			return installPathParts{
+				windows: true,
+				volume:  `\\` + parts[0] + `\` + parts[1],
+				elems:   parts[2:],
+			}
+		}
+		return installPathParts{windows: true, volume: p}
+	}
+	vol := ""
+	rest := p
+	if len(p) >= 2 && p[1] == ':' && isASCIILetter(p[0]) {
+		vol = p[:2]
+		rest = p[2:]
+	}
+	return installPathParts{
+		windows: true,
+		volume:  vol,
+		elems:   cleanInstallElems(strings.Split(rest, `\`)),
+	}
+}
+
+func cleanInstallElems(in []string) []string {
+	var out []string
+	for _, e := range in {
+		if e == "" || e == "." {
+			continue
+		}
+		if e == ".." && len(out) > 0 {
+			out = out[:len(out)-1]
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+func installParent(p installPathParts) installPathParts {
+	if len(p.elems) == 0 {
+		return p
+	}
+	parent := p
+	parent.elems = append([]string(nil), p.elems[:len(p.elems)-1]...)
+	return parent
+}
+
+func installBase(p installPathParts) string {
+	if len(p.elems) == 0 {
+		return ""
+	}
+	return p.elems[len(p.elems)-1]
+}
+
+func sameInstallDir(a, b installPathParts) bool {
+	if a.windows != b.windows {
+		return false
+	}
+	if a.windows {
+		if !strings.EqualFold(a.volume, b.volume) {
+			return false
+		}
+	} else if a.volume != b.volume {
+		return false
+	}
+	if len(a.elems) != len(b.elems) {
+		return false
+	}
+	for i := range a.elems {
+		if a.windows {
+			if !strings.EqualFold(a.elems[i], b.elems[i]) {
+				return false
+			}
+			continue
+		}
+		if a.elems[i] != b.elems[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func joinInstallPath(dir, base string) string {
+	if isWindowsInstallPath(dir) {
+		dir = strings.TrimRight(strings.ReplaceAll(dir, `/`, `\`), `\`)
+		return dir + `\` + base
+	}
+	return filepath.Join(dir, base)
+}
+
 // waitWindowsImageExit polls tasklist until image has no process left, or
-// until the only process left is selfPID. selfPID 0 waits for none.
-func waitWindowsImageExit(image string, selfPID int) error {
+// until the only process left is excludePID. excludePID 0 waits for none.
+// The installer is excluded even when it is not the installed image:
+// tasklist matches the image name, not the path.
+func waitWindowsImageExit(image string, excludePID int) error {
 	deadline := windowsNow().Add(windowsExitWait)
 	for {
 		out, err := runServiceCommand("tasklist", "/FI", "IMAGENAME eq "+image, "/FO", "CSV", "/NH")
 		text := string(out)
 		pids := tasklistPIDs(text)
 		noMatch := strings.Contains(strings.ToLower(text), "no tasks are running")
-		if (err == nil || noMatch) && windowsImageClear(pids, selfPID) {
+		if (err == nil || noMatch) && windowsImageClear(pids, excludePID) {
 			return nil
 		}
 		if !windowsNow().Before(deadline) {
