@@ -246,9 +246,10 @@ func ParseListen(s string) (network, address string, err error) {
 }
 
 // Listen opens the status listener. A unix socket is created mode 0600.
-// Before anything is deleted, Listen takes a status-path flock under
-// $STATE_DIRECTORY/locks, or os.UserCacheDir()/idoris/locks when that
-// variable is unset. That flock is not the backend controller lock (main
+// Before anything is deleted, Listen takes a status-path flock in the
+// controller lock directory (the machine-wide directory for root, otherwise
+// $STATE_DIRECTORY/locks or os.UserCacheDir()/idoris/locks). That flock is
+// not the backend controller lock (main
 // still takes that later, because status must be up while the daemon waits
 // for tailscaled). Only a socket that refuses connections and is owned by
 // this user is removed. Regular files and symlinks are left in place and
