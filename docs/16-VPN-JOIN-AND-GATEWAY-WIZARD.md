@@ -25,10 +25,10 @@
 
 | 角色 | 命令 | 守护进程配置 |
 |---|---|---|
-| 成员 | `idoris-vpnd join --yes --code-file <path>`，或 `--code-stdin` | `mode=auto`，`accept_routes=true`，不广告路由，并写回环 SOCKS5 `127.0.0.1:1080` |
+| 成员 | `idoris-vpnd join --yes --code-file <path>`，或 `--code-stdin` | `mode=auto`，`accept_routes=true`，不广告路由。回环 SOCKS5 优先 `127.0.0.1:1080`，被占用则用 1081–1096 中第一个能听的端口，并写进配置 |
 | 本机就是 Local AI | 加入码角色为 `local-ai`，同样用 `--code-file` 或 `--code-stdin` | `mode=auto`，不广告路由，`accept_routes=false`，记录 tag `tag:<租户>-local-ai`。不写 SOCKS5 |
 | 办公室网关 | `idoris-vpnd join --yes --device <IP> --code-file <path>`，或 `gateway setup` | `mode=system`，只广告该 IP 的 `/32`，`accept_routes=false`。不写 SOCKS5 |
-| 管理员 | `join --yes --code-file <path>`（角色 `admin`） | 与成员相同：接受路由，不广告，并写回环 SOCKS5 |
+| 管理员 | `join --yes --code-file <path>`（角色 `admin`） | 与成员相同：接受路由，不广告，回环 SOCKS5 同样按空闲端口选择 |
 
 位置参数 `idoris-vpnd join --yes <code>` 仍能用。stderr 会警告：别的用户可以从进程列表和 shell 历史读到这串码。`--code-file`、`--code-stdin` 和位置参数只能给一个。标准输入只读一行，后面的行仍留给确认问题。终端上什么都没给时，提示输入且不回显。
 
@@ -45,7 +45,7 @@ idoris-vpnd ui [--no-open]
 
 `gateway setup --yes` 的意思是：这台机器**不是** Local AI，并且已经用 `--device` 或 `--whole-subnet` 说清要广告什么。两者不能同时给。
 
-本地页面（中文）三步：识别网络 → 使用建议 → 启用。第一问原文是「这台机器就是 Local AI 吗？」。页面上选「是」只在加入码本身是 `local-ai` 时生效，选「否」只在加入码是 `gateway` 时生效；不符会被 `ValidateRoleChoice` 拒绝并提示向管理员要对应角色的码（加入码绑定一个角色，页面改不了它）。成员加入仍用命令行。
+本地页面（中文）三步：识别网络 → 使用建议 → 启用。第一问原文是「这台机器就是 Local AI 吗？」。gateway 码选「是」、local-ai 码选「否」会被 `ValidateRoleChoice` 拒绝，并且发生在 `Discover` 之前。成员码和管理员码不问这一题：页面藏起网关相关控件，直接用 `gateway.SimplePlan`（`mode=auto`，接受路由，不广告），也不要求先识别网络。登记服务在 `/v1/discover` 里返回的 `role` 若和码不一致，计划接口返回 400，不生成计划。
 
 ## 3. 加入码的生命周期
 
@@ -107,11 +107,11 @@ idoris-vpn-enroll list-credentials --config F --entry E
 
 检查项：平台是 Linux、`ip_forward`、`/dev/net/tun`、root、`tailscaled` 可达、模式必须是 `system`（嵌入式节点不能当网关）。
 
-令牌和计划跟配置走。默认的 `~/.idoris/vpn.json` 仍用 `~/.idoris/enroll.token` 和 `~/.idoris/gateway-plan.json`。其它配置用同一目录下的 `<文件名去掉后缀>.enroll-token` 和 `<文件名去掉后缀>.gateway-plan.json`。两份配置不会写进同一个令牌文件。
+令牌和计划跟配置走。相对的 `--config` 先变成绝对路径，再派生旁边的文件；写进计划 JSON 的也是这条绝对路径。只有没写 `--config`、要用默认路径时才需要家目录。默认的 `~/.idoris/vpn.json`（路径以 `/.idoris/vpn.json` 结尾的也算）仍用同目录的 `enroll.token` 和 `gateway-plan.json`。其它配置用同一目录下、保留完整文件名（含后缀）的 `<文件名>.enroll-token` 和 `<文件名>.gateway-plan.json`，所以 `office.json` 和 `office.conf` 不会共用令牌。已有配置如果指着别的令牌文件（例如历史上的 `~/.idoris/enroll.token`），新令牌写到这份配置自己的路径，并改配置指向那里；那个历史共享文件不被覆盖。
 
-应用是读改写，只动向导拥有的键：`enroll_url`、`enroll_token_file`、`enroll_allow_insecure`、`hostname`、`accept_routes`、`advertise_tags`、`mode`、`role`、`listen`、`advertise_routes`。已有的 `control_url`、`accept_dns`、`tailscale_socket`、`state_dir`、`forwards`、`takeover` 以及不认识的键原样留下。写出前用 `vpnd.LoadConfig` 检查认识的字段；不认识的键不送进这个加载器，所以写进文件的未知键在加载器放宽之前，守护进程直接读该文件仍会拒绝。同一 `enroll_url` 再应用一次，配置字节不变。`enroll_url` 不同则拒绝，除非 `--replace`。文件用临时文件加 rename 写成 0600，不跟随已有的符号链接。`.idoris` 目录若已经是组或其它人可写，则拒绝，而不是把它 chmod 成 0700。
+应用是读改写。向导拥有的键是 `enroll_url`、`enroll_token_file`、`enroll_allow_insecure`、`hostname`、`accept_routes`、`advertise_tags`、`mode`、`role`、`listen`、`advertise_routes`。`enroll_token` 和 `enroll_token_file` 是同一个设置：装上令牌文件就去掉内联 `enroll_token`。配置里已经有 `auth_key_file` 时，内联 `auth_key` 同样去掉。已有的 `accept_dns`、`tailscale_socket`、`state_dir`、`forwards`、`takeover` 留下。`control_url` 在登记主机没变时留下；`--replace` 换了登记主机时删掉。计划警告原文是 `replacing the enrollment authority removes the previous control server pin; the next start discovers the new server and pins it; the old pin is not kept`。下一次启动发现新服务器并钉住它。不认识的键在写任何文件、安装任何服务之前拒绝，错误列出键名，以 `gateway: config has unsupported keys:` 开头。校验把这份字节交给 `vpnd.LoadConfig`（`DisallowUnknownFields`）。同一 `enroll_url` 再应用一次，配置字节不变。`enroll_url` 不同则拒绝，除非 `--replace`。文件用临时文件加 rename 写成 0600，不跟随已有的符号链接。`.idoris` 目录若已经是组或其它人可写，则拒绝，而不是把它 chmod 成 0700。Windows 上，私有目录和临时秘密文件在写入任何秘密字节之前先设当前用户的 DACL（`icacls` 重置、关掉继承、按该用户 SID 授予完全控制）。已有目录的 ACE 必须只属于该用户、SYSTEM 或 Administrators。命令顺序用注入的运行器测过。没有在真实 Windows 上执行 `icacls`。
 
-成员和管理员在 `mode` 为 `auto`、`embedded` 或空时，若配置里还没有 `socks5_listen`，写入 `127.0.0.1:1080`，不写 `socks5_auth_file`。守护进程会在 `<state_dir>/socks5.auth` 里生成凭据（配置目录在 `.idoris` 下且没写 `state_dir` 时，状态目录是旁边的 `vpn-state`）。显式 `system` 不添加。local-ai 和网关不添加。成功时 stdout 有 `access:` 行：SOCKS5 地址、凭据文件路径（不是内容）、以及用 MagicDNS 名 `<hostname>.idoris.internal` 经这个代理访问 Local AI。本轮没有把这个代理真正连到一台 Local AI 上。
+成员和管理员在 `mode` 为 `auto`、`embedded` 或空时，若配置里还没有 `socks5_listen`，先试听 `127.0.0.1:1080`，被占用就继续到 1096，把选中的地址写进配置和 `access:`。不写 `socks5_allow_anonymous`。凭据路径：已有 `socks5_auth_file` 就用它；否则是显式 `state_dir` 下的 `socks5.auth`，再否则是 `$STATE_DIRECTORY/node/socks5.auth`，再否则是 `~/.idoris/vpn-state/socks5.auth`。配置放在 `.idoris` 下面也不改变这个顺序。单元测试设 `STATE_DIRECTORY=/var/lib/idoris`、配置为 `/root/.idoris/vpn.json`，`access:` 给出 `/var/lib/idoris/node/socks5.auth`。显式 `system` 不添加 SOCKS。local-ai 和网关不添加。成功时 stdout 有 `access:` 行：SOCKS5 地址、凭据文件路径（不是内容）、以及 MagicDNS 名 `<local-ai-hostname>.idoris.internal`（向导不知道那台机器的主机名）。本轮没有把这个代理真正连到一台 Local AI 上。文件写完并安装服务之后，stdout 还有 `identity: role=… hostname=… enroll=…`；装了服务时另有 `service: installed`，这三样是刚写进去的身份。
 
 应用时写入配置和模式 `0600` 的令牌文件；计划 JSON 本身不含令牌。Linux 上且是 root 时，写 `/etc/sysctl.d/99-idoris-vpn.conf` 并尝试打开转发。`/proc/sys/net/ipv4/ip_forward` 已经是 `1` 就算成功，即使 `sysctl -w` 失败。不是 root 时，其余文件照写，并打印。计划路径用 POSIX 单引号，`$(id)`、反引号、空格、引号和换行都按字面处理：
 
@@ -119,7 +119,9 @@ idoris-vpn-enroll list-credentials --config F --entry E
 sudo idoris-vpnd gateway apply --plan <计划文件>
 ```
 
-`join` 和 `gateway apply` 在没有 `--no-service` 时仍安装用户级服务（systemd `--user` / LaunchAgent），不会改成系统级单元。登录前就要跑，另执行第 12 节的 `service install --system`。向导自己提权的只有 `ip_forward` 这一步。
+`join` 和 `gateway apply` 在没有 `--no-service` 时仍安装用户级服务（systemd `--user` / LaunchAgent），不会改成系统级单元。登录前就要跑，另执行第 12 节的 `service install --system`。安装发生在配置和令牌写完之后。向导自己提权的只有 `ip_forward` 这一步。
+
+以 root 跑 `sudo idoris-vpnd gateway apply` 只做这一步：计划要开转发并且是 Linux 时调用 `EnableIPForward`。它不创建目录、不改用户的配置和令牌、不安装服务。计划文件必须是普通文件、不是符号链接、权限不宽于 0600、所在目录不能被组或其它人写，属主是 root，或者进程是 root 且属主等于 `SUDO_UID`。不要求用户的 `.idoris` 属主是 root。`SUDO_UID` 只在进程是 root 时才认。Docker 里用 uid 1000 建文件、再以 root 跑通过；属主不对、符号链接和 0666 会拒绝。没有在 Windows 上跑这条路径。
 
 ## 5. 预批准名单必须和策略逐条对齐
 
@@ -190,15 +192,15 @@ Error: invalid argument "wiz-gw-wait" for "-i, --identifier" flag: strconv.Parse
 
 容器入口脚本里的 `sysctl -w net.ipv4.ip_forward=1` 在这台 OrbStack 上是 `Read-only file system`。向导仍打印 `ip-forward: enabled`：`/proc` 里已经是 `1` 时，守护进程把这一步当作成功。
 
-2026-10-28 的 `make integration` 全绿（286s）。向导用例是项目 `idoris-vpn-r3w2-wizard-c11edc`，`TestWizardGatewayJoin` 39.8s PASS。加入码经 stdin 写入 `/root/.idoris/join.code`，命令用 `--code-file` 和 `--expect-authority`，参数里没有码。自动批准和等待批准两条旧路径仍通过。结束后在 `wiz-gw` 上用旁路文件又核了三件事：`/root/.idoris/keep.json` 里的 `control_url`、`accept_dns`、`tailscale_socket`、`state_dir`、`takeover`、`forwards` 和未知键 `extra_kept` 在应用后还在；同一 URL 再加入一次字节不变；换成 `http://attacker.invalid:9` 时不带 `--replace` 失败且文件不变，带 `--replace` 后 `control_url` 仍是 `https://headscale`。成员码（令牌未登记，发现失败后按码里的 member 继续）写到 `/root/.idoris/member.json`，有 `socks5_listen` `127.0.0.1:1080`，stdout 有 SOCKS5 地址、凭据路径 `/root/.idoris/vpn-state/socks5.auth` 和 `side-member.idoris.internal`。没有经这个代理去连一台 Local AI。正在跑的 `/root/.idoris/vpn.json` 和它的令牌没有被旁路加入改掉。
+2026-10-28 早先一轮 `make integration` 全绿（286s，项目 `idoris-vpn-r3w2-wizard-c11edc`）。那一轮旁路断言里「未知键 `extra_kept` 会留下」和「`--replace` 后 `control_url` 仍是 `https://headscale`」已经不是现在的行为。当前用例期待：种子没有未知键；第一次加入（种子有 `control_url`、没有 `enroll_url`）仍留下 `control_url`；换成 `http://attacker.invalid:9` 时不带 `--replace` 失败且文件不变，带 `--replace` 后配置里没有 `control_url`，stdout 有上面那句删钉警告；令牌文件是 `keep.json.enroll-token` 和 `member.json.enroll-token`。成员码在容器 `HOME=/root` 且没有 `STATE_DIRECTORY` 时，SOCKS 仍是 `127.0.0.1:1080`（端口空闲），凭据路径是 `/root/.idoris/vpn-state/socks5.auth`。2026-10-28 本轮 `make integration` 全绿（`ok .../integration` 334.718s）。向导项目 `idoris-vpn-r3w2-wizard-7aac60`，`TestWizardGatewayJoin` 38.19s PASS，旁路日志是 `EVIDENCE first join kept control_url; --replace dropped it; member SOCKS5 default written`。`TestR4WSudoApplyHonoursUserOwnedPlan` 2.58s PASS，输出含 `R4W_HANDOFF_OK`。
 
 ## 9. 本地页面的安全模型
 
-`idoris-vpnd ui` 只听 `127.0.0.1` 的随机端口。页面本身是静态的，HTML / JS / CSS 里没有秘密。自动打开时，先在用户缓存目录下的 `idoris/ui-launch`（目录 `0700`）写一个 `0600` 的启动页，该页向 `http://127.0.0.1:端口/bootstrap` 用 POST 提交一次性引导秘密；`open` / `xdg-open` 的参数只有这个文件路径。stdout 打出的是不带秘密的页面 URL。`--no-open` 不启动浏览器，stdout 打出的 URL 把引导秘密放在片段 `#k=` 里（浏览器不会把片段发给服务器）。`app.js` 读到片段后向 `/api/bootstrap` POST 一次，再用 `history.replaceState` 清掉片段。成功交换后，引导秘密作废，启动页在交换成功时和进程退出时删除。
+`idoris-vpnd ui` 只听 `127.0.0.1` 的随机端口。页面本身是静态的，HTML / JS / CSS 里没有秘密。自动打开时，先在用户缓存目录下的 `idoris/ui-launch`（目录 `0700`）写一个 `0600` 的启动页，该页向 `http://127.0.0.1:端口/bootstrap` 用 POST 提交一次性引导秘密。macOS 用 `open`，Linux 用 `xdg-open`，Windows 用 `rundll32 url.dll,FileProtocolHandler`。参数只有这个文件路径，没有秘密，也没有页面 URL。打开成功时 stdout 是不带秘密的页面 URL。没有对应的打开程序，或者打开失败时，stdout 改为说明要自己用浏览器打开这个文件（它会登录再进入页面；只打开页面 URL 不能登录），并给出文件路径。`--no-open` 不启动浏览器，stdout 打出的 URL 把引导秘密放在片段 `#k=` 里（浏览器不会把片段发给服务器）。`app.js` 读到片段后向 `/api/bootstrap` POST 一次，再用 `history.replaceState` 清掉片段。成功交换后，引导秘密作废，启动页在交换成功时和进程退出时删除。Windows 的参数在 macOS 上用注入的 `GOOS=windows` 核对过。没有在真实 Windows 上打开浏览器。
 
 引导秘密两分钟过期，且只能用一次。换到的会话能力放在 `sessionStorage`（按源隔离，包含端口），之后每个 API 请求带请求头 `X-Idoris-UI`。CSRF 令牌同一次交换发出，放在 `sessionStorage`，不写进 HTML。响应不设 cookie。查询参数 `?k=` 和 cookie 都不参与认证，所以旧的 `idoris_ui` cookie 既不能登录，也不会让下一次启动的正确引导失败。另一个听在 `127.0.0.1` 上的服务器收不到这个会话能力。
 
-保存加入码只解码，不联系登记服务。页面显示登记 URL 的 `host[:port]`，并写明加入码不能证明签发者，必须来自组织管理员、经用户信任的渠道。未勾选「这是我组织的服务器」时，「使用建议」和「启用」都被拒绝，`Discover` 不会发出。计划绑定它生成时的加入码版本和检测版本；加入码、检测、答案或角色再变，旧计划作废。第二次并发的「启用」被拒绝。角色与加入码不一致时，页面拿到 `gateway.ValidateRoleChoice` 的原文，不会生成那份计划。配置路径用 `gateway.PathsFor(home, "")` 的默认名。「替换另一组织的现有配置」默认不勾；勾选才把 `replace_existing` 交给 `Apply`。`Apply` 的错误原文放在响应的 `error` 里，成功时响应带上 `AccessInfo`（若有）。这两项由 Go 测试核对。页面脚本把 `error` 写到错误区，并把 `access_info` 逐行写到结果区；脚本这一跳没有在图形浏览器里点过。不是 root 时，「启用」返回 `sudo` 命令，不提权。之后页面轮询状态，直到已连接或等待批准。
+保存加入码只解码，不联系登记服务，并清掉勾选。页面显示登记 URL 的 `host[:port]`，并写明加入码不能证明签发者，必须来自组织管理员、经用户信任的渠道。确认要同时带上勾选、当时显示的登记主机，以及这次加入的 `join_rev`。未勾选，或主机、版本对不上时，「使用建议」和「启用」都被拒绝，`Discover` 不会发出。计划绑定它生成时的加入码版本和检测版本；加入码、检测、答案或角色再变，旧计划作废。第二次并发的「启用」被拒绝。gateway 与 local-ai 的答案和码不一致时，页面在 `Discover` 之前拿到 `gateway.ValidateRoleChoice` 的原文。发现返回的角色和码不一致时，计划接口 400。成员和管理员走 `SimplePlan`。配置路径用 `gateway.PathsFor(home, "")` 的默认名。「替换另一组织的现有配置」默认不勾；勾选才把 `replace_existing` 交给 `Apply`。换了登记主机时，计划带上删掉控制服务器钉的警告。`Apply` 的错误原文放在响应的 `error` 里，成功时响应带上 `AccessInfo`（若有）以及刚写入的 `role`、`hostname`、`enroll_url`。页面轮询时，状态里的 `role`（以及非空的 `control_url`）要对上这份身份，才把已连接或等待批准当成完成。这些由真实回环上的 HTTP 测试和 Node 冒烟核对。脚本没有在图形浏览器里点过。不是 root 时，「启用」返回 `sudo` 命令，不提权。
 
 这些由真实回环监听上的 `net/http` 客户端（带 cookie jar）测过，`app.js` 的引导交换另有 Node 假 `fetch` / `sessionStorage` 冒烟。没有在图形浏览器里点过。
 
@@ -239,7 +241,7 @@ idoris-vpn-enroll list-credentials --config F --entry E
 
 ## 11. 边界
 
-- 加入码放在命令参数里时，进程列表和 shell 历史能读到它。用 `--code-file` 或 `--code-stdin`。
+- 加入码放在命令参数里时，进程列表和 shell 历史能读到它。文档上的入口是 `--code-file`、`--code-stdin`，或终端上什么都没给时的不回显提示。位置参数仍接受，并在 stderr 警告。`join` 的 usage 文本在 `main.go`，本轮没有改那个文件。
 - 加入码不证明登记主机属于本组织。核对打印出来的 `enrollment-authority`，或传 `--expect-authority`。
 - 换一份配置的登记 URL 要 `--replace`。不带它时，原文件不动。
 - 成员和管理员的 auto/embedded 配置默认有回环 SOCKS5。网关和 local-ai 没有。本轮没有把这个代理真正连到一台 Local AI 上。
@@ -250,10 +252,10 @@ idoris-vpn-enroll list-credentials --config F --entry E
 - 守护进程的 `/healthz` 在等待批准时是 503。登记服务的 `/healthz` 不探 Headscale；那要看 `/readyz`。
 - 嵌入式模式不能当网关。macOS / Windows 不推荐网关；本轮没有在那两个系统上跑网关。
 - `join` 默认安装的是用户级服务，登录前不跑。开机即跑用第 12 节的 `--system`。
-- 本地页面已不使用 cookie，认证方式见第 9 节；回环地址上的页面也不使用 HTTPS。角色以加入码为准：页面回答和加入码角色不符时拒绝，不再强行改角色。
+- 本地页面已不使用 cookie，认证方式见第 9 节；回环地址上的页面也不使用 HTTPS。gateway 与 local-ai 的页面答案必须和码一致。登记服务返回了角色时以它为准，和码不一致就拒绝。成员和管理员不回答网关问题。
 - 更宽的 `autoApprovers` 前缀是否覆盖更窄的 `/32`，本轮没有验证。
-- 没有在图形浏览器里点本地页面。
-- 第 8 节的数字来自项目 `idoris-vpn-wizard-1e19b7`。本轮没有另起同名 compose 项目重跑那一节。
+- 没有在图形浏览器里点本地页面。没有在真实 Windows 上执行 `icacls`，也没有在真实 Windows 上打开浏览器。
+- 第 8 节开头那些 `10.211.81.*` 的数字来自项目 `idoris-vpn-wizard-1e19b7`。本轮没有另起同名 compose 项目重跑那一次。本轮全套 `make integration` 是项目 `idoris-vpn-r3w2-wizard-7aac60`。
 
 ## 12. 机器服务：`service install --system`
 
