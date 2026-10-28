@@ -385,6 +385,25 @@ func aclTag(tenant, suffix string) (string, error) {
 	return "tag:" + tenant + "-" + suffix, nil
 }
 
+// ReconcileRole prefers an authenticated discovery role. A disagreement
+// between that role and the code, or an override, is an error and not a plan.
+// With no discovery role, an explicit override is kept.
+func ReconcileRole(codeRole, override, discovered string) (string, error) {
+	if discovered != "" {
+		if codeRole != "" && codeRole != discovered {
+			return "", fmt.Errorf("join: the enrollment server says this code is for a %q machine, but the code says %q", discovered, codeRole)
+		}
+		if override != "" && override != discovered {
+			return "", fmt.Errorf("join: --role-override %q does not match the enrollment server role %q", override, discovered)
+		}
+		return discovered, nil
+	}
+	if override != "" {
+		return override, nil
+	}
+	return codeRole, nil
+}
+
 // ValidateRoleChoice refuses a wizard answer that the credential cannot carry
 // out. A join code is bound to one role (its enrollment entry's tags), so a
 // gateway code cannot make this machine the Local AI and the other way round.
