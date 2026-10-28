@@ -404,6 +404,7 @@ func runCmd(args []string) error {
 		RecoverUnregistered: node.RecoverUnregistered,
 		MarkRegistered:      node.markRegistered,
 		Role:                cfg.Role,
+		Mode:                node.Mode,
 		Identity:            ident,
 		State:               binding,
 		EnrollUnreachable:   !enrollReachable,
@@ -417,6 +418,10 @@ func runCmd(args []string) error {
 	if err != nil {
 		return err
 	}
+	// A listener that cannot bind does not fail this call. StartAccess keeps
+	// that listener failed, reports it on access_error, and retries. An
+	// unparseable address, an unsafe path, or a bad credentials file still
+	// returns here, before reconcile starts.
 	access, err := vpnd.StartAccess(node.Dialer, cfg.Forwards, cfg.SOCKS5Listen, opt, log)
 	if err != nil {
 		return err
@@ -518,7 +523,9 @@ func openBinding(cfg *vpnd.Config) (*vpnd.StateFile, error) {
 func accessOptions(cfg *vpnd.Config, mode, ourControl string, src vpnd.StatusSource, be vpnd.Backend, binding *vpnd.StateFile) (vpnd.AccessOptions, error) {
 	var owner *vpnd.LiveOwner
 	if rec, ok := src.(*vpnd.Reconciler); ok {
-		rec.SetRunMode(mode)
+		if err := rec.SetRunMode(mode); err != nil {
+			return vpnd.AccessOptions{}, err
+		}
 		owner = vpnd.NewLiveOwner(vpnd.LiveOwnerConfig{
 			Backend:    be,
 			Mode:       mode,

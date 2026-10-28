@@ -160,6 +160,12 @@ type Snapshot struct {
 	// contacted at startup and the daemon is using a saved control URL.
 	// A static auth key (no enrollment URL) stays true.
 	EnrollReachable bool `json:"enroll_reachable"`
+	// AccessError is set while a configured forward or SOCKS5 listener could
+	// not bind. It contains the address and the OS (or socket) error.
+	// Membership keeps running. The field clears once every listener binds.
+	// An unparseable address, an unsafe path, or a bad credentials file never
+	// reaches here: those stop startup before a socket is opened.
+	AccessError string `json:"access_error,omitempty"`
 }
 
 // Reconciler converges tailscaled onto the configured control server.
@@ -210,10 +216,13 @@ type Reconciler struct {
 	mismatchNode string
 	mismatchKey  string
 	loginProfile string
-	owner        *LiveOwner
-	ownKey       string
-	seenNode     string
-	seenProfile  string
+	// lastDiscovery is when a Running pass last tried /v1/discover while the
+	// identity was still unknown. Zero means this process has not tried yet.
+	lastDiscovery time.Time
+	owner         *LiveOwner
+	ownKey        string
+	seenNode      string
+	seenProfile   string
 }
 
 const (
@@ -222,6 +231,9 @@ const (
 	loginGrace = 20 * time.Second
 	// maxLoginGrace caps the exponential growth of the grace period.
 	maxLoginGrace = 10 * time.Minute
+	// discoveryRetryInterval is how often a Running pass retries /v1/discover
+	// while the enrollment identity is still unknown. It is not a login backoff.
+	discoveryRetryInterval = 30 * time.Second
 	// persistedLoginSettle is how long a NeedsLogin state may last when a
 	// node key is already stored before it is treated as expiry. Observed on
 	// tailscale.com v1.104.2: tsnet.Server.Start resumes that key itself
@@ -264,7 +276,81 @@ func New(be Backend, keys KeySource, opt Options, log *slog.Logger) (*Reconciler
 		r.loginProfile = p.ProfileID
 		r.loginStarted = p.Started
 	}
+	if err := r.dropMismatchedPending(); err != nil {
+		return nil, err
+	}
 	return r, nil
+}
+
+// dropMismatchedPending forgets a persisted login whose target is not the
+// configuration this process was given. The running node is then judged by
+// the ordinary binding rules, so a login started for one credential cannot
+// certify another. An unknown tenant or role (discovery has not run) is not
+// a mismatch; the token fingerprint, control URL, and backend mode still are.
+// System-mode profile changes are refused later by profileMoved, which does
+// not certify the other profile.
+func (r *Reconciler) dropMismatchedPending() error {
+	if r.opt.State == nil {
+		return nil
+	}
+	p, ok := r.opt.State.Pending()
+	if !ok {
+		return nil
+	}
+	why := pendingLoginMismatch(p, r.opt)
+	if why == "" {
+		return nil
+	}
+	r.log.Warn("discarding pending login", "reason", why)
+	if err := r.opt.State.ClearPending(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.awaitingIdentity = false
+	r.identityLoginOK = false
+	r.mismatchNode = ""
+	r.mismatchKey = ""
+	r.loginProfile = ""
+	r.loginStarted = time.Time{}
+	r.mu.Unlock()
+	return nil
+}
+
+// pendingLoginMismatch reports why p must not be resumed under opt.
+// An empty string means the target still matches.
+func pendingLoginMismatch(p PendingLogin, opt Options) string {
+	if strings.TrimSpace(p.TokenFingerprint) == "" {
+		return "pending login has no target credential"
+	}
+	if p.TokenFingerprint != opt.Identity.TokenFingerprint {
+		return "token fingerprint differs"
+	}
+	if strings.TrimSpace(p.ControlURL) == "" || !SameControlURL(p.ControlURL, opt.ControlURL) {
+		return "control url differs"
+	}
+	// Mode is recorded when the transition starts. An empty mode on the
+	// current options means the caller has not applied it yet (SetRunMode);
+	// that is checked again once the mode is known. A recorded mode against
+	// a different known mode does not resume.
+	if p.Mode != "" && opt.Mode != "" && p.Mode != opt.Mode {
+		return "backend mode differs"
+	}
+	if p.Mode == "" && opt.Mode != "" {
+		return "pending login has no backend mode"
+	}
+	if opt.Identity.Static {
+		return "static configuration cannot resume an enrollment login"
+	}
+	if !opt.Identity.Known {
+		return ""
+	}
+	if p.Tenant != opt.Identity.Tenant {
+		return "tenant differs"
+	}
+	if !strings.EqualFold(strings.TrimSpace(p.Role), strings.TrimSpace(opt.Identity.Role)) {
+		return "role differs"
+	}
+	return ""
 }
 
 // Snapshot returns the latest observed state. Slices are copied under the
@@ -346,10 +432,11 @@ func (r *Reconciler) SetOwner(o *LiveOwner) {
 
 // SetRunMode records system or embedded before the first reconcile pass.
 // System mode is what makes the profile ID part of the identity binding.
-func (r *Reconciler) SetRunMode(mode string) {
+func (r *Reconciler) SetRunMode(mode string) error {
 	r.mu.Lock()
 	r.opt.Mode = mode
 	r.mu.Unlock()
+	return r.dropMismatchedPending()
 }
 
 // Run loops Step until ctx is cancelled.
@@ -439,10 +526,14 @@ func (r *Reconciler) Step(ctx context.Context) (Snapshot, error) {
 	case ipn.Running.String():
 		r.markRegistered()
 		r.recoverSince = time.Time{}
-		if r.unconfirmedIdentity() {
-			// Discovery is what can confirm a changed token. A failure here
-			// leaves access closed; it is not a reason to mint.
-			_ = r.refreshIdentity(ctx)
+		if r.unconfirmedIdentity() && r.discoveryDue() {
+			// Discovery is what can confirm a changed token, and what can
+			// fill an empty binding after a restart. A failure leaves access
+			// closed; it is not a reason to mint. Repeats wait out the interval.
+			r.noteDiscovery()
+			if err := r.refreshIdentity(ctx); err != nil {
+				r.log.Warn("enrollment discovery retry failed", "err", err)
+			}
 			profileID = r.observedProfile(ctx)
 		}
 		if snap, err, handled := r.settleIdentity(ctx, st, prefs, profileID); handled {
@@ -894,7 +985,7 @@ func (r *Reconciler) settleIdentity(ctx context.Context, st *ipnstate.Status, pr
 	}
 	awaiting, loginOK := r.identityFlags()
 	if !awaiting {
-		if err := r.writeIdentity(nodeID, profileID); err != nil {
+		if _, err := r.writeIdentity(nodeID, profileID); err != nil {
 			return r.fail(fmt.Errorf("save identity: %w", err)), err, true
 		}
 		return Snapshot{}, nil, false
@@ -919,13 +1010,47 @@ func (r *Reconciler) settleIdentity(ctx context.Context, st *ipnstate.Status, pr
 		snap, err := r.login(ctx, "identity-mismatch", prefs, nodeID, nodeKey, profileID)
 		return snap, err, true
 	}
-	if err := r.writeIdentity(nodeID, profileID); err != nil {
+	// Discovery may have filled tenant and role since the process resumed
+	// the transition. Certify only when that identity is still the target.
+	if err := r.dropMismatchedPending(); err != nil {
+		return r.fail(fmt.Errorf("persist identity transition: %w", err)), err, true
+	}
+	if still, _ := r.identityFlags(); !still {
+		if r.shouldReenrollIdentity(nodeID, profileID) {
+			snap, err := r.login(ctx, "identity-mismatch", prefs, nodeID, nodeKey, profileID)
+			return snap, err, true
+		}
+		return Snapshot{}, nil, false
+	}
+	persisted, err := r.writeIdentity(nodeID, profileID)
+	if err != nil {
 		return r.fail(fmt.Errorf("save identity: %w", err)), err, true
+	}
+	// Discovery was down, so the binding was not written. Keep the pending
+	// login; the next Running pass retries discovery and must not treat this
+	// node as already enrolled.
+	if !persisted {
+		return Snapshot{}, nil, false
 	}
 	if err := r.clearIdentityTransition(); err != nil {
 		return r.fail(fmt.Errorf("clear identity transition: %w", err)), err, true
 	}
 	return Snapshot{}, nil, false
+}
+
+func (r *Reconciler) discoveryDue() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.lastDiscovery.IsZero() {
+		return true
+	}
+	return !r.now().Before(r.lastDiscovery.Add(discoveryRetryInterval))
+}
+
+func (r *Reconciler) noteDiscovery() {
+	r.mu.Lock()
+	r.lastDiscovery = r.now()
+	r.mu.Unlock()
 }
 
 func (r *Reconciler) identityFlags() (awaiting, loginOK bool) {
@@ -966,6 +1091,24 @@ func (r *Reconciler) profileMoved(current string) bool {
 	return r.loginProfile != "" && current != "" && r.loginProfile != current
 }
 
+// pendingForLocked builds the on-disk transition from the node being replaced
+// and the credential this process is enrolling. Caller holds r.mu.
+func (r *Reconciler) pendingForLocked(nodeID, nodeKey, profileID string, started time.Time, loginOK bool) PendingLogin {
+	ident := r.opt.Identity
+	return PendingLogin{
+		NodeID:           nodeID,
+		NodeKey:          nodeKey,
+		ProfileID:        profileID,
+		Started:          started,
+		LoginOK:          loginOK,
+		TokenFingerprint: ident.TokenFingerprint,
+		Tenant:           ident.Tenant,
+		Role:             ident.Role,
+		ControlURL:       r.opt.ControlURL,
+		Mode:             r.opt.Mode,
+	}
+}
+
 // markLoginOK records that Start and StartLoginInteractive both returned,
 // and the profile LocalAPI is showing now. That profile, not the one from
 // before the login, is what a later pass must still be on.
@@ -983,13 +1126,7 @@ func (r *Reconciler) markLoginOK(ctx context.Context) error {
 	if profile != "" {
 		r.loginProfile = profile
 	}
-	p := PendingLogin{
-		NodeID:    r.mismatchNode,
-		NodeKey:   r.mismatchKey,
-		ProfileID: r.loginProfile,
-		Started:   r.loginStarted,
-		LoginOK:   true,
-	}
+	p := r.pendingForLocked(r.mismatchNode, r.mismatchKey, r.loginProfile, r.loginStarted, true)
 	r.mu.Unlock()
 	if r.opt.State == nil {
 		return nil
@@ -1049,15 +1186,10 @@ func (r *Reconciler) beginIdentityTransition(nodeID, nodeKey, profileID string) 
 	r.loginProfile = profileID
 	r.loginStarted = started
 	wantTenant, wantRole := r.opt.Identity.Tenant, r.opt.Identity.Role
+	pending := r.pendingForLocked(nodeID, nodeKey, profileID, started, false)
 	r.mu.Unlock()
 	if r.opt.State != nil {
-		err := r.opt.State.SetPending(PendingLogin{
-			NodeID:    nodeID,
-			NodeKey:   nodeKey,
-			ProfileID: profileID,
-			Started:   started,
-			LoginOK:   false,
-		})
+		err := r.opt.State.SetPending(pending)
 		if err != nil {
 			r.restorePending(prev)
 			return false, err
@@ -1114,17 +1246,12 @@ func (r *Reconciler) restartIdentityTransition(nodeID, nodeKey, profileID string
 	r.mismatchKey = nodeKey
 	r.loginProfile = profileID
 	started := r.loginStarted
+	pending := r.pendingForLocked(nodeID, nodeKey, profileID, started, false)
 	r.mu.Unlock()
 	if r.opt.State == nil {
 		return nil
 	}
-	err := r.opt.State.SetPending(PendingLogin{
-		NodeID:    nodeID,
-		NodeKey:   nodeKey,
-		ProfileID: profileID,
-		Started:   started,
-		LoginOK:   false,
-	})
+	err := r.opt.State.SetPending(pending)
 	if err != nil {
 		r.restorePending(prev)
 	}
@@ -1195,10 +1322,13 @@ func (r *Reconciler) boundIdentity() Identity {
 	return r.opt.Identity
 }
 
-func (r *Reconciler) writeIdentity(nodeID, profileID string) error {
+// writeIdentity persists the binding. persisted is false when discovery has
+// not produced an identity yet: the caller must not treat that as success
+// and must not clear a pending login.
+func (r *Reconciler) writeIdentity(nodeID, profileID string) (persisted bool, err error) {
 	ident := r.boundIdentity()
 	if r.opt.State == nil || (!ident.Known && !ident.Static) {
-		return nil
+		return false, nil
 	}
 	bound := r.opt.State.Get()
 	if nodeID == "" {
@@ -1213,9 +1343,15 @@ func (r *Reconciler) writeIdentity(nodeID, profileID string) error {
 		profileID = ""
 	}
 	if ident.Static {
-		return r.opt.State.SetStaticIdentity(r.opt.ControlURL, nodeID, profileID)
+		if err := r.opt.State.SetStaticIdentity(r.opt.ControlURL, nodeID, profileID); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
-	return r.opt.State.SetIdentity(r.opt.ControlURL, ident.Tenant, ident.Role, ident.TokenFingerprint, nodeID, profileID)
+	if err := r.opt.State.SetIdentity(r.opt.ControlURL, ident.Tenant, ident.Role, ident.TokenFingerprint, nodeID, profileID); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // AccessIdentityOK is the gate's view of enrollment. It is false during an
@@ -1289,8 +1425,10 @@ func (r *Reconciler) unconfirmedLocked() bool {
 		return false
 	}
 	b := r.opt.State.Get()
+	// An empty binding has not been confirmed. Access stays closed and a
+	// Running pass retries discovery instead of forgetting a pending login.
 	if b.Tenant == "" && b.Role == "" && b.NodeID == "" && b.ProfileID == "" && !b.Static {
-		return false
+		return true
 	}
 	return !degradedContinuity(ident, b, r.opt.Mode, r.seenNode, r.seenProfile)
 }
