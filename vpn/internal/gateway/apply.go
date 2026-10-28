@@ -229,7 +229,7 @@ func ChooseLoopbackSOCKS() (string, error) {
 		}
 		return addr, nil
 	}
-	return "", fmt.Errorf("gateway: no free loopback port for the member SOCKS5 listener in %s-%d: %v; set socks5_listen before joining", defaultSOCKSListen, socksLastPort, lastErr)
+	return "", fmt.Errorf("gateway: no free loopback port for the member SOCKS5 listener in %s-%d: %w; set socks5_listen before joining", defaultSOCKSListen, socksLastPort, lastErr)
 }
 
 func mergeConfig(existing []byte, have bool, plan Plan) ([]byte, []string, error) {

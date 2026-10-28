@@ -3,20 +3,12 @@ package fsutil
 import (
 	"errors"
 	"fmt"
-	"os/exec"
 	"strings"
 )
 
 // CommandRunner runs one command. The Windows ACL path uses it for icacls
 // and whoami. Tests pass a runner and do not execute those programs.
 type CommandRunner func(name string, args ...string) ([]byte, error)
-
-func defaultCommandRunner(name string, args ...string) ([]byte, error) {
-	// G204: name is whoami or icacls. The arguments are the fixed sequence
-	// from OwnerDACLCommands, or a single path for the read-back query.
-	out, err := exec.Command(name, args...).CombinedOutput() //nolint:gosec
-	return out, err
-}
 
 // OwnerDACLCommands is the icacls sequence for one path. directory selects
 // object-inherit and container-inherit. The ACE is the current user's SID.
