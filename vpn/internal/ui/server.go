@@ -140,14 +140,16 @@ type Server struct {
 }
 
 type heldJoin struct {
-	EnrollURL     string
-	Token         string
-	Role          string
-	Tenant        string
-	Hostname      string
-	Approved      []string
-	AllowInsecure bool
-	discovered    bool
+	EnrollURL      string
+	Token          string
+	Role           string
+	DiscoveredRole string
+	ControlURL     string
+	Tenant         string
+	Hostname       string
+	Approved       []string
+	AllowInsecure  bool
+	discovered     bool
 }
 
 // boundPlan is one plan plus the inputs it was built from. Apply refuses
@@ -722,8 +724,13 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	discoverWarning := s.discoverInto(r.Context(), held)
+	role, err := gateway.ReconcileRole(held.Role, "", held.DiscoveredRole)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	held.Role = role
 	var plan gateway.Plan
-	var err error
 	if body.ThisMachineIsLocalAI {
 		plan, err = gateway.BuildPlan(gateway.Request{
 			ThisMachineIsLocalAI: true, Tenant: held.Tenant, Hostname: held.Hostname,
@@ -769,6 +776,8 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	if s.join != nil {
 		s.join.Approved = append([]string(nil), held.Approved...)
 		s.join.discovered = held.discovered
+		s.join.DiscoveredRole = held.DiscoveredRole
+		s.join.ControlURL = held.ControlURL
 	}
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, plan)
@@ -898,6 +907,8 @@ func (s *Server) discoverInto(ctx context.Context, held *heldJoin) string {
 	held.discovered = true
 	if disc != nil {
 		held.Approved = append([]string(nil), disc.LANCIDRs...)
+		held.DiscoveredRole = strings.TrimSpace(disc.Role)
+		held.ControlURL = strings.TrimSpace(disc.ControlURL)
 	}
 	return ""
 }
