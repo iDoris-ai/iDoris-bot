@@ -289,12 +289,14 @@ func New(be Backend, keys KeySource, opt Options, log *slog.Logger) (*Reconciler
 }
 
 // dropMismatchedPending forgets a persisted login whose target is not the
-// configuration this process was given. The running node is then judged by
-// the ordinary binding rules, so a login started for one credential cannot
-// certify another. An unknown tenant or role (discovery has not run) is not
-// a mismatch; the token fingerprint, control URL, and backend mode still are.
-// System-mode profile changes are refused later by profileMoved, which does
-// not certify the other profile.
+// configuration this process was given. The committed binding is cleared in
+// that same write: the login may already have rotated the node key, and the
+// previous binding must not certify the node that is up now. An empty
+// binding does not certify a node that was already up, so the restored
+// credential has to log in again. An unknown tenant or role (discovery has
+// not run) is not a mismatch; the token fingerprint, control URL, and
+// backend mode still are. System-mode profile changes are refused later by
+// profileMoved, which does not certify the other profile.
 func (r *Reconciler) dropMismatchedPending() error {
 	if r.opt.State == nil {
 		return nil
@@ -308,7 +310,7 @@ func (r *Reconciler) dropMismatchedPending() error {
 		return nil
 	}
 	r.log.Warn("discarding pending login", "reason", why)
-	if err := r.opt.State.ClearPending(); err != nil {
+	if err := r.opt.State.ClearCommittedBinding(); err != nil {
 		return err
 	}
 	r.mu.Lock()
