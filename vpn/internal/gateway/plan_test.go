@@ -183,8 +183,8 @@ func TestApplyIdempotentRootAndNonRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.EnrollURL = "https://enroll.example.org"
-	p.TokenFile = "/home/acme/.idoris/enroll.token"
 	p.ConfigPath = "/home/acme/.idoris/vpn.json"
+	p.TokenFile = PathsFor("", p.ConfigPath).Token
 	p.AllowInsecure = false
 	const token = "idv1_secretsecretsecretsecretsecretse"
 	const planPath = "/home/acme/.idoris/gateway-plan.json"
@@ -356,8 +356,8 @@ func TestR3W2ApplyPreservesUnownedKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.EnrollURL = "https://enroll.example.org"
-	p.TokenFile = "/home/acme/.idoris/enroll.token"
 	p.ConfigPath = "/home/acme/.idoris/vpn.json"
+	p.TokenFile = PathsFor("", p.ConfigPath).Token
 	const existing = `{
   "control_url": "https://hs.example/headscale",
   "accept_dns": false,
