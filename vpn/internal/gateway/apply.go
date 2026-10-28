@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 
 	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/join"
@@ -192,11 +194,43 @@ func wantsForward(plan Plan) bool {
 func PlanEnablesForward(plan Plan) bool { return wantsForward(plan) }
 
 // defaultSOCKSListen is the authenticated loopback proxy a member or admin
-// gets when the config is embedded, or auto (which becomes embedded when the
-// system tailnet is foreign or down). The daemon writes the credential to
-// <state_dir>/socks5.auth. local-ai and gateway stay on system mode and do
-// not get this listener.
-const defaultSOCKSListen = "127.0.0.1:1080"
+// prefers when the config is embedded, or auto (which becomes embedded when
+// the system tailnet is foreign or down). If that port is taken, ChooseLoopbackSOCKS
+// walks the next ports through socksLastPort. The daemon writes the credential
+// to <state_dir>/socks5.auth. local-ai and gateway stay on system mode and do
+// not get this listener. socks5_allow_anonymous stays unset.
+const (
+	defaultSOCKSListen = "127.0.0.1:1080"
+	socksLastPort      = 1096
+)
+
+// ChooseLoopbackSOCKS returns the first free 127.0.0.1 port from 1080 through
+// 1096. It listens and closes, so the port can be taken again before the
+// daemon binds it. An existing socks5_listen value is left alone by the caller.
+func ChooseLoopbackSOCKS() (string, error) {
+	host, portText, err := net.SplitHostPort(defaultSOCKSListen)
+	if err != nil {
+		return "", err
+	}
+	first, err := strconv.Atoi(portText)
+	if err != nil {
+		return "", err
+	}
+	var lastErr error
+	for port := first; port <= socksLastPort; port++ {
+		addr := net.JoinHostPort(host, strconv.Itoa(port))
+		ln, listenErr := net.Listen("tcp", addr)
+		if listenErr != nil {
+			lastErr = listenErr
+			continue
+		}
+		if err := ln.Close(); err != nil {
+			return "", fmt.Errorf("gateway: close SOCKS probe %s: %w", addr, err)
+		}
+		return addr, nil
+	}
+	return "", fmt.Errorf("gateway: no free loopback port for the member SOCKS5 listener in %s-%d: %v; set socks5_listen before joining", defaultSOCKSListen, socksLastPort, lastErr)
+}
 
 func mergeConfig(existing []byte, have bool, plan Plan) ([]byte, []string, error) {
 	var keys []string
@@ -215,7 +249,11 @@ func mergeConfig(existing []byte, have bool, plan Plan) ([]byte, []string, error
 	}
 	if memberEmbeddedAccess(plan) {
 		if _, ok := vals["socks5_listen"]; !ok {
-			keys, err = assignRaw(keys, vals, "socks5_listen", defaultSOCKSListen, true)
+			addr, err := ChooseLoopbackSOCKS()
+			if err != nil {
+				return nil, nil, err
+			}
+			keys, err = assignRaw(keys, vals, "socks5_listen", addr, true)
 			if err != nil {
 				return nil, nil, err
 			}
