@@ -866,6 +866,26 @@ else
   echo "  FAIL after volume-wipe restore, published headplane is running" >&2
 fi
 
+echo "probe: sidecar identity survives down and up without the enroll token"
+bash "$root/ctl.sh" down
+env -u VPN_SERVER_ENROLL_TOKEN bash "$root/ctl.sh" up
+sidecar_up=0
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  if dc --profile tailnet-admin ps --status running -q vpn-sidecar | grep -q . \
+    && dc --profile tailnet-admin ps --status running -q headplane-tailnet | grep -q .; then
+    sidecar_up=1
+    break
+  fi
+  sleep 3
+done
+if [[ "$sidecar_up" == 1 ]]; then
+  pass=$((pass + 1))
+  echo "  ok   ctl.sh up restarted the sidecar without VPN_SERVER_ENROLL_TOKEN"
+else
+  fail=$((fail + 1))
+  echo "  FAIL ctl.sh up did not restart the sidecar without a token" >&2
+fi
+
 echo "probe: ${pass} passed, ${fail} failed"
 [[ "$fail" == 0 ]] || die "${fail} probe(s) failed"
 echo "probe: ok"

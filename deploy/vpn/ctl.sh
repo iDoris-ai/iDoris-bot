@@ -664,7 +664,7 @@ EOF
     fi
     apply_headplane_access "${access:-tunnel}"
     mode="$(read_admin_mode)"
-    if [[ "$mode" == "tailnet-admin" && -z "${VPN_SERVER_ENROLL_TOKEN:-}" ]]; then
+    if [[ "$mode" == "tailnet-admin" && -z "${VPN_SERVER_ENROLL_TOKEN:-}" ]] && ! sidecar_has_identity; then
       die "export VPN_SERVER_ENROLL_TOKEN (the vpn-server enrollment token) first"
     fi
     write_admin_mode "$mode"
