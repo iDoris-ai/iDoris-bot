@@ -58,21 +58,34 @@ var uiStartBrowser = func(argv []string) error {
 	if len(argv) == 0 {
 		return nil
 	}
-	cmd := exec.Command(argv[0], argv[1:]...) //nolint:gosec // G204: argv[0] is open or xdg-open, chosen above
+	cmd := exec.Command(argv[0], argv[1:]...) //nolint:gosec // G204: argv[0] is open, xdg-open, or rundll32, chosen above
 	return cmd.Start()
 }
 
+// uiGOOS selects the browser opener. Tests set it to cover Windows on another OS.
+var uiGOOS = runtime.GOOS
+
+// uiLauncherHint is printed when the wizard cannot open the launcher file.
+// The page URL has no sign-in secret, so it is not a substitute.
+const uiLauncherHint = "Open this file in a browser. It signs in, then loads the page. Opening the page URL by itself does not sign in:"
+
 // uiBrowserArgv is the command line used to open the launcher file.
 // The secret is not an element: the file path is the only argument.
-func uiBrowserArgv(path string) []string {
-	switch runtime.GOOS {
+func uiBrowserArgv(goos, path string) []string {
+	switch goos {
 	case "darwin":
 		return []string{"open", path}
 	case "linux":
 		return []string{"xdg-open", path}
+	case "windows":
+		return []string{"rundll32", "url.dll,FileProtocolHandler", path}
 	default:
 		return nil
 	}
+}
+
+func uiLauncherInstructions(path string) string {
+	return uiLauncherHint + "\n" + path
 }
 
 // uiPrepareOpen starts the page. With noOpen it returns the hand-opened URL
@@ -94,10 +107,13 @@ func uiPrepareOpen(srv *ui.Server, noOpen bool, open func([]string) error) (stri
 	if err != nil {
 		return "", err
 	}
-	if argv := uiBrowserArgv(path); len(argv) > 0 && open != nil {
-		if err := open(argv); err != nil {
-			fmt.Fprintln(os.Stderr, "idoris-vpnd: browser:", err)
-		}
+	argv := uiBrowserArgv(uiGOOS, path)
+	if len(argv) == 0 || open == nil {
+		return uiLauncherInstructions(path), nil
+	}
+	if err := open(argv); err != nil {
+		fmt.Fprintln(os.Stderr, "idoris-vpnd: browser:", err)
+		return uiLauncherInstructions(path), nil
 	}
 	return srv.PageURL(), nil
 }
