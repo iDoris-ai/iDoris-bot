@@ -73,6 +73,14 @@ type LiveOwner struct {
 	cachedAt time.Time
 	have     bool
 	onLost   func()
+	// evalSeq orders evaluations that overlap. appliedSeq is the newest
+	// result that was allowed to update the cache. A result captured under
+	// an older generation, or an older sequence, is discarded.
+	evalSeq    uint64
+	appliedSeq uint64
+	// eval replaces evaluate in tests so one check can be held across a
+	// generation change. Production leaves it nil.
+	eval func(context.Context) bool
 }
 
 // NewLiveOwner builds a gate. A non-positive CacheTTL, or one above
@@ -186,14 +194,28 @@ func (o *LiveOwner) allow(ctx context.Context, force bool) bool {
 		o.mu.Unlock()
 		return ok
 	}
+	gen := o.gen
+	o.evalSeq++
+	seq := o.evalSeq
+	eval := o.evaluate
+	if o.eval != nil {
+		eval = o.eval
+	}
 	o.mu.Unlock()
-	ok := o.evaluate(ctx)
-	o.remember(ok)
-	return ok
+	ok := eval(ctx)
+	return o.remember(ok, gen, seq)
 }
 
-func (o *LiveOwner) remember(ok bool) {
+// remember publishes ok only when this evaluation is still the newest one
+// and the generation it observed is still current. A stale result is not
+// cached and is not returned as permission.
+func (o *LiveOwner) remember(ok bool, gen, seq uint64) bool {
 	o.mu.Lock()
+	if gen != o.gen || seq < o.appliedSeq {
+		o.mu.Unlock()
+		return false
+	}
+	o.appliedSeq = seq
 	wasOpen := !o.have || o.cachedOK
 	o.cachedOK = ok
 	o.cachedAt = o.now()
@@ -211,6 +233,7 @@ func (o *LiveOwner) remember(ok bool) {
 	if lost != nil {
 		lost()
 	}
+	return ok
 }
 
 func (o *LiveOwner) evaluate(ctx context.Context) bool {
