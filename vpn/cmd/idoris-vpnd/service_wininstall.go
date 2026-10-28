@@ -44,8 +44,12 @@ type windowsReplaceSpec struct {
 	StagingDir string
 	Active     bool
 	// SelfPID is set when this process is running the installed image.
-	// The wait treats that pid as the installer and does not replace LiveExe.
+	// That path stays mapped, so the task is pointed at a versioned copy.
 	SelfPID int
+	// ExcludePID is this process. tasklist filters by image name, so an
+	// installer that is not the installed file is still listed under that
+	// name. The wait ignores this pid. It does not keep LiveExe.
+	ExcludePID int
 }
 
 func windowsStagingPath() (string, error) {
@@ -139,7 +143,7 @@ func replaceWindowsTask(spec windowsReplaceSpec) error {
 			return fmt.Errorf("schtasks /End: %w: %s", err, strings.TrimSpace(string(out)))
 		}
 		ended = true
-		if err := waitWindowsImageExit(filepath.Base(spec.LiveExe), spec.SelfPID); err != nil {
+		if err := waitWindowsImageExit(filepath.Base(spec.LiveExe), spec.ExcludePID); err != nil {
 			_, _ = runServiceCommand("schtasks", "/Run", "/TN", windowsTaskName)
 			return err
 		}
@@ -405,15 +409,17 @@ func joinInstallPath(dir, base string) string {
 }
 
 // waitWindowsImageExit polls tasklist until image has no process left, or
-// until the only process left is selfPID. selfPID 0 waits for none.
-func waitWindowsImageExit(image string, selfPID int) error {
+// until the only process left is excludePID. excludePID 0 waits for none.
+// The installer is excluded even when it is not the installed image:
+// tasklist matches the image name, not the path.
+func waitWindowsImageExit(image string, excludePID int) error {
 	deadline := windowsNow().Add(windowsExitWait)
 	for {
 		out, err := runServiceCommand("tasklist", "/FI", "IMAGENAME eq "+image, "/FO", "CSV", "/NH")
 		text := string(out)
 		pids := tasklistPIDs(text)
 		noMatch := strings.Contains(strings.ToLower(text), "no tasks are running")
-		if (err == nil || noMatch) && windowsImageClear(pids, selfPID) {
+		if (err == nil || noMatch) && windowsImageClear(pids, excludePID) {
 			return nil
 		}
 		if !windowsNow().Before(deadline) {
