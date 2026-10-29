@@ -53,6 +53,9 @@ type Config struct {
 	// StateDir is the embedded node's private state directory (0700). Empty
 	// uses ~/.idoris/vpn-state.
 	StateDir string `json:"state_dir,omitempty"`
+	// StateFile is the identity binding (control URL, tenant, role, token
+	// fingerprint). Empty uses DefaultStateFile. Never stores the token.
+	StateFile string `json:"state_file,omitempty"`
 	// Forwards are loopback TCP listeners dialed through the tailnet. In
 	// embedded mode that is the only way other processes on the machine can
 	// reach tailnet addresses.
@@ -135,7 +138,9 @@ func LoadConfig(path string) (*Config, error) {
 	env("LISTEN", &cfg.Listen)
 	env("LOG_LEVEL", &cfg.LogLevel)
 	env("MODE", &cfg.Mode)
+	env("ROLE", &cfg.Role)
 	env("STATE_DIR", &cfg.StateDir)
+	env("STATE_FILE", &cfg.StateFile)
 	env("SOCKS5_LISTEN", &cfg.SOCKS5Listen)
 	if v, ok := os.LookupEnv("IDORIS_VPN_ENROLL_ALLOW_INSECURE"); ok {
 		cfg.EnrollAllowInsecure = v == "1" || strings.EqualFold(v, "true")
