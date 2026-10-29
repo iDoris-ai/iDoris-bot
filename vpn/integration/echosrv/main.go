@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -84,7 +85,12 @@ func dial(addr string, n int) error {
 	if n < 0 || n > maxFrame {
 		return fmt.Errorf("nbytes %d out of range", n)
 	}
-	c, err := net.DialTimeout("tcp", addr, 20*time.Second) //nolint:gosec // G704: addr is the fixture target supplied by the integration test
+	network := "tcp"
+	if path, ok := strings.CutPrefix(addr, "unix:"); ok {
+		network = "unix"
+		addr = path
+	}
+	c, err := net.DialTimeout(network, addr, 20*time.Second) //nolint:gosec // G704: addr is the fixture target supplied by the integration test
 	if err != nil {
 		return err
 	}
