@@ -625,3 +625,30 @@ PY
   fi
   echo "Headplane access: $mode base_url=$base cookie_secure=$secure bind=$bind"
 }
+
+# Persist the project name, then refuse a name some other directory already uses.
+assign_instance() {
+  local requested="${1:-}" existing name
+  existing=""
+  if [[ -f "$here/.env" ]]; then
+    existing="$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' "$here/.env" | head -n1 | tr -d "\"'" | tr -d '[:space:]')"
+  fi
+  if [[ -n "$requested" ]]; then
+    name="$(sanitize_instance_name "$requested")"
+    if [[ -n "$existing" && "$existing" != "$name" ]]; then
+      die "COMPOSE_PROJECT_NAME is already $existing; refusing to switch to $name"
+    fi
+  elif [[ -n "$existing" ]]; then
+    name="$existing"
+  elif [[ -n "${COMPOSE_PROJECT_NAME:-}" ]]; then
+    name="$(sanitize_instance_name "$COMPOSE_PROJECT_NAME")"
+  else
+    name="idoris-vpn"
+  fi
+  if [[ -n "${COMPOSE_PROJECT_NAME:-}" && "$COMPOSE_PROJECT_NAME" != "$name" ]]; then
+    die "COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME does not match this instance ($name)"
+  fi
+  write_env_var COMPOSE_PROJECT_NAME "$name"
+  export COMPOSE_PROJECT_NAME="$name"
+  reject_project_collision
+}

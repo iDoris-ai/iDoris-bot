@@ -53,16 +53,144 @@ def valid_name(name: str, what: str) -> str:
     return name
 
 
-def parse_cidr(text: str) -> str:
+# Tailscale CGNAT and the Headscale IPv6 prefix. A LAN grant that overlaps
+# either of these is a grant onto other nodes, not onto an office LAN.
+TAILNET_V4 = ipaddress.ip_network("100.64.0.0/10")
+TAILNET_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+RFC1918 = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
+ULA_V6 = ipaddress.ip_network("fc00::/7")
+_FORBIDDEN_V4 = (
+    ("unspecified", ipaddress.ip_network("0.0.0.0/8")),
+    ("loopback", ipaddress.ip_network("127.0.0.0/8")),
+    ("link-local", ipaddress.ip_network("169.254.0.0/16")),
+    ("multicast", ipaddress.ip_network("224.0.0.0/4")),
+    ("reserved", ipaddress.ip_network("240.0.0.0/4")),
+)
+_FORBIDDEN_V6 = (
+    ("unspecified", ipaddress.ip_network("::/128")),
+    ("loopback", ipaddress.ip_network("::1/128")),
+    ("link-local", ipaddress.ip_network("fe80::/10")),
+    ("multicast", ipaddress.ip_network("ff00::/8")),
+)
+
+
+def warn(message: str) -> None:
+    print(f"policy: warning: {message}", file=sys.stderr)
+
+
+def _parse_network(text: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
+    if not isinstance(text, str) or any(ch.isspace() for ch in text):
+        die(f"invalid LAN CIDR {text!r}: whitespace is not allowed")
     try:
         net = ipaddress.ip_network(text, strict=True)
     except ValueError as exc:
         die(f"invalid LAN CIDR '{text}': {exc}")
-    if not isinstance(net, ipaddress.IPv4Network):
-        die(f"LAN CIDR '{text}' must be IPv4")
+    return net
+
+
+def _is_rfc1918_or_ula(net: ipaddress.IPv4Network | ipaddress.IPv6Network) -> bool:
+    if net.version == 4:
+        return any(net.subnet_of(block) for block in RFC1918)
+    return bool(net.subnet_of(ULA_V6))
+
+
+def _classify(net: ipaddress.IPv4Network | ipaddress.IPv6Network, *, allow_public: bool, already_public: bool) -> str:
+    """Return 'private' or 'public'. Exits on anything that must not be a LAN grant."""
     if net.prefixlen == 0:
-        die(f"LAN CIDR '{text}' is an exit-node route; this deployment does not auto-approve it")
-    return str(net)
+        die(
+            f"LAN CIDR {net} is an exit-node route (/0) and overlaps the tailnet; "
+            "this deployment does not auto-approve it"
+        )
+    if net.version == 4 and net.overlaps(TAILNET_V4):
+        die(f"LAN CIDR {net} overlaps the tailnet range {TAILNET_V4}")
+    if net.version == 6 and net.overlaps(TAILNET_V6):
+        die(f"LAN CIDR {net} overlaps the tailnet range {TAILNET_V6}")
+    if net.version == 6:
+        for addr in (net.network_address, net.broadcast_address):
+            if getattr(addr, "ipv4_mapped", None) is not None:
+                die(f"LAN CIDR {net} is an IPv4-mapped IPv6 prefix")
+    forbidden = _FORBIDDEN_V4 if net.version == 4 else _FORBIDDEN_V6
+    for label, block in forbidden:
+        if net.overlaps(block):
+            die(f"LAN CIDR {net} overlaps {label} range {block}")
+    if _is_rfc1918_or_ula(net):
+        return "private"
+    if allow_public or already_public:
+        warn(
+            f"PUBLIC CIDR {net} is not RFC1918 and not IPv6 ULA (fc00::/7). "
+            "It will be placed in this organisation's ACL and autoApprovers. "
+            "Do this only when that prefix is really the office LAN."
+        )
+        return "public"
+    die(
+        f"LAN CIDR {net} is not private address space "
+        "(IPv4 RFC1918, or IPv6 ULA fc00::/7). "
+        "169.254.0.0/16 and 100.64.0.0/10 are rejected. "
+        "Pass --allow-public-cidr to acknowledge a public prefix."
+    )
+
+
+def parse_cidr(text: str, *, allow_public: bool = False) -> str:
+    """Normalise a CLI prefix. Policy (private, overlap, tailnet) is applied in validate_state.
+
+    allow_public is accepted so callers can pass the flag through; the decision
+    itself happens when the whole state is re-validated.
+    """
+    del allow_public
+    return str(_parse_network(text))
+
+
+def _normalise_org_lists(org: dict) -> None:
+    org.setdefault("lan_cidrs", [])
+    org.setdefault("public_cidrs", [])
+    org.setdefault("ai_callback_ports", [])
+    if not isinstance(org["lan_cidrs"], list) or not isinstance(org["public_cidrs"], list):
+        die(f"organisation '{org.get('name', '?')}' has a non-list CIDR field")
+
+
+def validate_state(state: dict, *, allow_public: bool, requested: list[str]) -> None:
+    """Re-check every persisted prefix, not only the ones passed on this command line."""
+    requested_set = set(requested)
+    seen: list[tuple[str, ipaddress.IPv4Network | ipaddress.IPv6Network, str]] = []
+    for org in state["orgs"]:
+        name = org["name"]
+        _normalise_org_lists(org)
+        acked = set(org["public_cidrs"])
+        normalised: list[str] = []
+        public_now: list[str] = []
+        for cidr in org["lan_cidrs"]:
+            net = _parse_network(str(cidr))
+            text = str(net)
+            kind = _classify(
+                net,
+                allow_public=allow_public and text in requested_set,
+                already_public=text in acked,
+            )
+            for prev_org, prev_net, prev_text in seen:
+                if not net.overlaps(prev_net):
+                    continue
+                if prev_org != name:
+                    die(
+                        f"LAN CIDR {text} ({name}) overlaps {prev_text} ({prev_org}). "
+                        "Prefixes owned by different organisations must not overlap or nest. "
+                        "Use a distinct prefix, or a separate deploy/vpn stack."
+                    )
+                if prev_text != text:
+                    warn(
+                        f"organisation '{name}' has overlapping prefixes {prev_text} and {text}. "
+                        "The wider grant includes the narrower one."
+                    )
+            seen.append((name, net, text))
+            if text not in normalised:
+                normalised.append(text)
+            if kind == "public" and text not in public_now:
+                public_now.append(text)
+        org["lan_cidrs"] = normalised
+        org["public_cidrs"] = public_now
 
 
 def marker_bodies(text: str) -> dict[str, str]:
@@ -137,21 +265,14 @@ def org_by_name(state: dict, name: str) -> dict | None:
 
 
 def merge_cidrs(state: dict, org_name: str, cidrs: list[str]) -> None:
+    """Append prefixes. Overlap is rejected later by validate_state, which uses network math."""
     org = org_by_name(state, org_name)
     if org is None:
         die(f"internal: org '{org_name}' missing while merging CIDRs")
-    owned = {c: o["name"] for o in state["orgs"] for c in o["lan_cidrs"]}
+    _normalise_org_lists(org)
     for cidr in cidrs:
-        owner = owned.get(cidr)
-        if owner is not None and owner != org_name:
-            die(
-                f"LAN CIDR {cidr} is already auto-approved for '{owner}'. "
-                "Two organisations cannot share a prefix on one Headscale; "
-                "use a distinct prefix or a separate deploy/vpn stack."
-            )
         if cidr not in org["lan_cidrs"]:
             org["lan_cidrs"].append(cidr)
-            owned[cidr] = org_name
 
 
 def apply_command(state: dict, args: argparse.Namespace, fresh_file: bool, policy_text: str) -> None:
@@ -190,7 +311,8 @@ def apply_command(state: dict, args: argparse.Namespace, fresh_file: bool, polic
             if args.org in state["admins"]:
                 die(f"'{args.org}' is an admin user, not a tenant name")
             state["orgs"].append({"name": args.org, "lan_cidrs": []})
-        merge_cidrs(state, args.org, args.lan_cidr)
+        target = args.org
+        merge_cidrs(state, target, args.lan_cidr)
     else:
         die(f"unknown command '{args.command}'")
     if args.tailnet_admin:
@@ -201,6 +323,58 @@ def apply_command(state: dict, args: argparse.Namespace, fresh_file: bool, polic
         valid_name(org["name"], "organisation")
         if org["name"] in state["admins"]:
             die(f"organisation '{org['name']}' collides with an admin user")
+        _normalise_org_lists(org)
+    validate_state(state, allow_public=bool(args.allow_public_cidr), requested=list(args.lan_cidr))
+    if getattr(args, "ai_callback_ports", None) is not None:
+        chosen = org_by_name(state, target)
+        if chosen is None:
+            die(f"internal: org '{target}' missing while recording callback ports")
+        chosen["ai_callback_ports"] = parse_callback_ports(args.ai_callback_ports)
+    validate_callback_ports(state)
+
+
+def parse_callback_ports(text: str) -> list[int]:
+    """Parse '22,8080'. 'none' clears the list. Order is normalised by sorting."""
+    raw = text.strip().lower()
+    if raw in {"", "none", "-"}:
+        return []
+    found: list[int] = []
+    for part in text.split(","):
+        item = part.strip()
+        if not item.isdigit():
+            die(f"invalid callback port '{part}' (want 1-65535, comma-separated, or 'none')")
+        port = int(item)
+        if port < 1 or port > 65535:
+            die(f"callback port {port} is outside 1-65535")
+        if port not in found:
+            found.append(port)
+    return sorted(found)
+
+
+def validate_callback_ports(state: dict) -> None:
+    for org in state["orgs"]:
+        raw = org.get("ai_callback_ports", [])
+        if raw is None:
+            raw = []
+        if not isinstance(raw, list):
+            die(f"organisation '{org['name']}' ai_callback_ports must be a list of ports")
+        cleaned: list[int] = []
+        for port in raw:
+            if isinstance(port, bool) or not isinstance(port, int):
+                die(
+                    f"organisation '{org['name']}' ai_callback_ports has {port!r}; "
+                    "expected an integer 1-65535"
+                )
+            if port < 1 or port > 65535:
+                die(f"organisation '{org['name']}' callback port {port} is outside 1-65535")
+            if port not in cleaned:
+                cleaned.append(port)
+        org["ai_callback_ports"] = sorted(cleaned)
+
+
+def _callback_block(org_name: str, ports: list[int]) -> str:
+    lines = [f'        "{org_name}@:{port}", // opt-in AI callback' for port in ports]
+    return "\n".join(lines)
 
 
 def _ports(prefix: str, ports: tuple[tuple[int, str], ...]) -> str:
@@ -233,7 +407,11 @@ def render(state: dict) -> dict[str, str]:
         tags.append(f'    "tag:{name}-local-ai": ["group:admins"],')
         acls.append(f"    // organisation {name}\n")
         acls.append(_acl(f"{name}@", _ports(f"tag:{name}-local-ai", LOCAL_AI_PORTS)))
-        acls.append(_acl(f"tag:{name}-local-ai", f'        "{name}@:*", // replies and callbacks'))
+        # Tailscale ACLs are stateful: a member-initiated connection does not
+        # need a reverse grant for the reply. A callback is opt-in, per port.
+        callback = _callback_block(name, org.get("ai_callback_ports") or [])
+        if callback:
+            acls.append(_acl(f"tag:{name}-local-ai", callback))
         acls.append(_acl("group:admins", f'        "tag:{name}-local-ai:22", // Tailscale SSH'))
         ssh.append(
             "    {\n"
@@ -249,10 +427,10 @@ def render(state: dict) -> dict[str, str]:
             for cidr in org["lan_cidrs"]:
                 dst.append(_ports(cidr, LAN_PORTS))
             acls.append(_acl(f"{name}@", "\n".join(dst)))
-            # The gateway host (not the whole LAN) may reach its members.
-            # LAN devices are not a source: with Tailscale's default subnet
-            # SNAT, replies already come from the gateway node's own address.
-            acls.append(_acl(f"tag:{name}-gateway", f'        "{name}@:*", // gateway host to its members'))
+            # No gateway -> member grant. Subnet SNAT means replies already
+            # come from the gateway node, and a stateful ACL allows them.
+            # Do not put the LAN prefix in src: that would let any host on
+            # the LAN open a connection to a member.
             for cidr in org["lan_cidrs"]:
                 routes.append(f'      "{cidr}": ["tag:{name}-gateway"],')
     forbidden = ("autogroup:member", "autogroup:tagged", "autogroup:internet", "autogroup:danger-all")
@@ -269,6 +447,8 @@ def render(state: dict) -> dict[str, str]:
             die(f"refusing to write {word}; it is instance-wide and breaks tenant isolation")
     if re.search(r'"(?:\*|autogroup:(?!nonroot))', blob):
         die("refusing to write an autogroup wildcard")
+    if "@:*" in rendered["acls"]:
+        die("refusing to write a reverse grant onto every member port")
     return rendered
 
 
@@ -287,13 +467,23 @@ def main() -> None:
     parser.add_argument("--org", default="")
     parser.add_argument("--admin", default=DEFAULT_ADMIN)
     parser.add_argument("--lan-cidr", action="append", default=[], dest="lan_cidr")
+    parser.add_argument(
+        "--allow-public-cidr",
+        action="store_true",
+        help="acknowledge a prefix that is not RFC1918 / IPv6 ULA (prints a warning)",
+    )
+    parser.add_argument(
+        "--ai-callback-ports",
+        default=None,
+        help="comma-separated ports the Local AI host may open towards its members (or 'none')",
+    )
     parser.add_argument("--tailnet-admin", action="store_true")
     args = parser.parse_args()
     if args.command == "init":
         valid_name(args.admin, "admin user")
     if args.org:
         valid_name(args.org, "organisation")
-    args.lan_cidr = [parse_cidr(c) for c in args.lan_cidr]
+    args.lan_cidr = [parse_cidr(c, allow_public=args.allow_public_cidr) for c in args.lan_cidr]
 
     policy_path = args.policy
     text = policy_path.read_text()
