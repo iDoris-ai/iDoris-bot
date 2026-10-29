@@ -50,8 +50,9 @@ type Config struct {
 
 	// Mode is auto (default), system, or embedded.
 	Mode string `json:"mode,omitempty"`
-	// Role is the join role this config was written for: member, local-ai,
-	// gateway, or admin. The daemon does not enforce it; the wizard does.
+	// Role is member (default), local-ai, gateway, or admin. local-ai and
+	// gateway cannot use embedded mode. Discovery overwrites this when it
+	// returns a role.
 	Role string `json:"role,omitempty"`
 	// StateDir is the embedded node's private state directory (0700). Empty
 	// uses ~/.idoris/vpn-state.
@@ -258,6 +259,16 @@ func (c *Config) Resolve() error {
 	default:
 		return fmt.Errorf("mode %q: want auto, system, or embedded", c.Mode)
 	}
+	c.Role = strings.ToLower(strings.TrimSpace(c.Role))
+	if c.Role == "" {
+		c.Role = "member"
+	}
+	if !ValidRole(c.Role) {
+		return fmt.Errorf("role %q: want member, local-ai, gateway, or admin", c.Role)
+	}
+	if err := c.RejectEmbeddedRole(); err != nil {
+		return err
+	}
 	if err := c.validateForwards(); err != nil {
 		return err
 	}
@@ -313,6 +324,26 @@ func (c *Config) RoutePrefixes() ([]netip.Prefix, error) {
 		out = append(out, p)
 	}
 	return out, nil
+}
+
+// ValidRole reports whether role is one the daemon knows.
+func ValidRole(role string) bool {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "member", "local-ai", "gateway", "admin":
+		return true
+	default:
+		return false
+	}
+}
+
+// RejectEmbeddedRole reports an error when a role that serves inbound traffic
+// is pinned to embedded mode. auto is allowed: startup waits for tailscaled
+// instead of falling back to embedded.
+func (c *Config) RejectEmbeddedRole() error {
+	if c.Mode == ModeEmbedded && RequiresSystem(c.Role) {
+		return fmt.Errorf("role %s cannot use embedded mode: embedded mode is outbound-only and cannot serve inbound traffic; set mode to system or auto and run the official tailscaled", c.Role)
+	}
+	return nil
 }
 
 // RejectEmbeddedRoutes reports an error when mode is embedded and the config
