@@ -5,7 +5,7 @@
   <key>Label</key><string>ai.idoris.vpnd</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/idoris-vpnd</string>
+    <string>/usr/local/lib/idoris/idoris-vpnd</string>
     <string>run</string>
     <string>--config</string>
     <string>/etc/idoris/vpn.json</string>
