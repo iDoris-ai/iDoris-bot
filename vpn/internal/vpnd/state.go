@@ -11,16 +11,27 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/fsutil"
 )
 
 // DaemonState is the small binding file the daemon keeps between restarts.
 // It never contains an enrollment token, a join code, or an auth key.
 // TokenFingerprint is a truncated SHA-256 of the enrollment token.
+// NodeID is the stable ID of the self node this binding was confirmed
+// against. ProfileID is the LocalAPI profile ID in system mode, when the
+// client exposes one. NextLoginAt and LoginFailures are the persisted login
+// backoff: a supervisor restart must not mint a new key before NextLoginAt.
 type DaemonState struct {
-	ControlURL       string `json:"control_url,omitempty"`
-	Tenant           string `json:"tenant,omitempty"`
-	Role             string `json:"role,omitempty"`
-	TokenFingerprint string `json:"token_fingerprint,omitempty"`
+	ControlURL       string    `json:"control_url,omitempty"`
+	Tenant           string    `json:"tenant,omitempty"`
+	Role             string    `json:"role,omitempty"`
+	TokenFingerprint string    `json:"token_fingerprint,omitempty"`
+	NodeID           string    `json:"node_id,omitempty"`
+	ProfileID        string    `json:"profile_id,omitempty"`
+	NextLoginAt      time.Time `json:"next_login_at,omitzero"`
+	LoginFailures    int       `json:"login_failures,omitempty"`
 }
 
 // Identity is the credential the enrollment service just described.
@@ -122,6 +133,7 @@ func (s *StateFile) Get() DaemonState {
 
 // RememberControl persists a trusted control URL without changing the bound
 // tenant or role. Discovery calls this before the node is logged in.
+// The in-memory copy changes only after the file is replaced.
 func (s *StateFile) RememberControl(controlURL string) error {
 	if s == nil {
 		return nil
@@ -131,54 +143,95 @@ func (s *StateFile) RememberControl(controlURL string) error {
 	if s.st.ControlURL == controlURL {
 		return nil
 	}
-	s.st.ControlURL = controlURL
-	return s.saveLocked()
+	next := s.st
+	next.ControlURL = controlURL
+	if err := s.saveLocked(next); err != nil {
+		return err
+	}
+	s.st = next
+	return nil
 }
 
 // SetIdentity persists the credential the running node is now bound to.
-func (s *StateFile) SetIdentity(controlURL, tenant, role, fingerprint string) error {
+// nodeID is the self node's stable ID. profileID is the system-mode LocalAPI
+// profile ID, or empty when the backend does not expose one. Login backoff
+// fields already on the file are kept. The in-memory copy changes only after
+// the file is replaced, so a failed write is retried on the next pass.
+func (s *StateFile) SetIdentity(controlURL, tenant, role, fingerprint, nodeID, profileID string) error {
 	if s == nil {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	next := DaemonState{
-		ControlURL:       controlURL,
-		Tenant:           tenant,
-		Role:             role,
-		TokenFingerprint: fingerprint,
-	}
+	next := s.st
+	next.ControlURL = controlURL
+	next.Tenant = tenant
+	next.Role = role
+	next.TokenFingerprint = fingerprint
+	next.NodeID = nodeID
+	next.ProfileID = profileID
 	if next == s.st {
 		return nil
 	}
+	if err := s.saveLocked(next); err != nil {
+		return err
+	}
 	s.st = next
-	return s.saveLocked()
+	return nil
 }
 
-func (s *StateFile) saveLocked() error {
+// SetLoginBackoff persists the next time a login may mint a key, and how
+// many consecutive attempts have failed to reach Running. Callers do this
+// before requesting a key. A failed write leaves the previous memory intact.
+func (s *StateFile) SetLoginBackoff(next time.Time, failures int) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stored := s.st
+	if next.IsZero() {
+		stored.NextLoginAt = time.Time{}
+	} else {
+		stored.NextLoginAt = next.UTC()
+	}
+	stored.LoginFailures = failures
+	if stored == s.st {
+		return nil
+	}
+	if err := s.saveLocked(stored); err != nil {
+		return err
+	}
+	s.st = stored
+	return nil
+}
+
+// ClearLoginBackoff forgets a persisted login delay after the node is up.
+func (s *StateFile) ClearLoginBackoff() error {
+	return s.SetLoginBackoff(time.Time{}, 0)
+}
+
+// LoginBackoff returns the persisted next-eligible time and failure count.
+func (s *StateFile) LoginBackoff() (time.Time, int) {
+	if s == nil {
+		return time.Time{}, 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.st.NextLoginAt, s.st.LoginFailures
+}
+
+func (s *StateFile) saveLocked(st DaemonState) error {
 	dir := filepath.Dir(s.path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := fsutil.EnsurePrivateDir(dir); err != nil {
 		return err
 	}
-	if err := os.Chmod(dir, 0o700); err != nil { //nolint:gosec // the directory needs the owner execute bit
-		return err
-	}
-	body, err := json.MarshalIndent(s.st, "", "  ")
+	body, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		return err
 	}
 	body = append(body, '\n')
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, body, 0o600); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmp, 0o600); err != nil { //nolint:gosec // owner-only binding file
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, s.path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return os.Chmod(s.path, 0o600) //nolint:gosec // owner-only binding file
+	// Unique temp name inside dir. A pre-planted path+".tmp" symlink is never
+	// opened, so it cannot redirect this write onto another file.
+	return fsutil.WriteFileAtomic(s.path, body, 0o600)
 }
