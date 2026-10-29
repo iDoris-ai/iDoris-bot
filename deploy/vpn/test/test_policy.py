@@ -301,6 +301,10 @@ class GatewayLanCidrTest(unittest.TestCase):
         self.assertEqual(gateway["lan_cidrs"], ["192.168.1.0/24", "10.8.0.0/24"])
         self.assertEqual(gateway["token_hashes"][0]["hash"], digest)
         self.assertNotIn("lan_cidrs", cfg["tenants"][1])
+        lock = Path(str(config) + ".lock")
+        self.assertTrue(lock.is_file())
+        self.assertEqual(lock.stat().st_mode & 0o777, 0o600)
+        written = config.read_bytes()
         again = subprocess.run(
             [sys.executable, str(POLICY_PY), "reconcile-enroll",
              "--state", str(state), "--config", str(config)],
@@ -308,6 +312,7 @@ class GatewayLanCidrTest(unittest.TestCase):
         )
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertFalse(json.loads(again.stdout)["changed"])
+        self.assertEqual(config.read_bytes(), written)
 
 
 if __name__ == "__main__":
