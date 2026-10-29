@@ -3,6 +3,7 @@ package vpnd
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -110,6 +111,16 @@ func listenLocal(network, address string) (net.Listener, error) {
 			_ = ln.Close()
 			return nil, err
 		}
+		return ln, nil
+	}
+	if network == "tcp" && ownerOnlyEnforced(address) {
+		return &ownerFilter{Listener: ln, address: address}, nil
+	}
+	if network == "tcp" {
+		// Raw TCP has no authentication. slog.Default is used because
+		// StartAccess does not pass its logger into listenLocal, and this
+		// warning must still show when the daemon logger is quieter.
+		slog.Default().Warn(tcpForwardWarning, "listen", address, "bound", ln.Addr().String())
 	}
 	return ln, nil
 }
