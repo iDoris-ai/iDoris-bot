@@ -5,11 +5,12 @@ import (
 	"testing"
 )
 
-func TestPathsForDefaultKeepsHistoricalNames(t *testing.T) {
+func TestPathsForDefaultTokenIsNotTheLegacySharedName(t *testing.T) {
 	home := filepath.Join(string(filepath.Separator), "h")
+	legacy := filepath.Join(home, ".idoris", "enroll.token")
 	for _, cfg := range []string{"", filepath.Join(home, ".idoris", "vpn.json")} {
 		p := PathsFor(home, cfg)
-		if p.Token != filepath.Join(home, ".idoris", "enroll.token") || p.Plan != filepath.Join(home, ".idoris", "gateway-plan.json") {
+		if p.Token != filepath.Join(home, ".idoris", "vpn.json.enroll-token") || p.Plan != filepath.Join(home, ".idoris", "gateway-plan.json") || p.Token == legacy {
 			t.Fatalf("cfg %q: %+v", cfg, p)
 		}
 	}
