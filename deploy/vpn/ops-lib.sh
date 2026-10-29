@@ -288,3 +288,340 @@ chown_volume_to_image() {
   docker run --rm --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
     chown -R "$owner" /data
 }
+
+# Create stopped containers for this mode when the host has none.
+# `up --no-start` does not start the other Headplane.
+ensure_mode_containers() {
+  local mode="$1"
+  if [[ -z "$(_compose_ps_id headscale)" ]]; then
+    echo "creating stopped containers for admin mode ${mode}..."
+    if [[ "$mode" == "tailnet-admin" ]]; then
+      docker compose up -d --no-start headscale enroll
+      docker compose --profile tailnet-admin up -d --no-start vpn-sidecar headplane-tailnet
+    else
+      docker compose up -d --no-start headscale enroll headplane
+    fi
+  fi
+  if [[ "$mode" == "tailnet-admin" ]]; then
+    if [[ -z "$(_compose_ps_id headplane-tailnet)" ]]; then
+      docker compose --profile tailnet-admin up -d --no-start vpn-sidecar headplane-tailnet
+    fi
+  elif [[ -z "$(_compose_ps_id headplane)" ]]; then
+    docker compose up -d --no-start headplane
+  fi
+  if [[ -z "$(_compose_ps_id enroll)" ]]; then
+    docker compose up -d --no-start enroll
+  fi
+}
+
+# Manifest lists image tags, ids and digests only. The compose config JSON
+# also contains env values; it is written to a 0600 temp file and deleted.
+write_backup_manifest() {
+  local dest="$1" mode="$2" version="$3" tmp ec
+  tmp="$(mktemp "$here/.running.XXXXXX")"
+  chmod 600 "$tmp"
+  ec=0
+  docker compose --profile tailnet-admin config --format json > "$tmp" || ec=$?
+  if [[ "$ec" -eq 0 ]]; then
+    python3 - "$dest/manifest.json" "$mode" "$version" "$tmp" "$here" <<'PY' || ec=$?
+import json, os, subprocess, sys
+out_path, mode, version, cfg_path, here = sys.argv[1:]
+cfg = json.load(open(cfg_path))
+wanted = {
+    "state/dotenv": os.path.join(here, ".env"),
+    "state/enroll/config.json": os.path.join(here, "enroll", "config.json"),
+    "state/enroll/headscale.apikey": os.path.join(here, "enroll", "headscale.apikey"),
+    "state/headplane/cookie_secret": os.path.join(here, "headplane", "cookie_secret"),
+    "state/headscale/managed.json": os.path.join(here, "headscale", "managed.json"),
+    "state/headscale/config.yaml": os.path.join(here, "headscale", "config.yaml"),
+    "state/headscale/policy.hujson": os.path.join(here, "headscale", "policy.hujson"),
+    "state/headplane/config.yaml": os.path.join(here, "headplane", "config.yaml"),
+    "state/compose.yaml": os.path.join(here, "compose.yaml"),
+}
+file_modes = {}
+for rel, src in wanted.items():
+    file_modes[rel] = format(os.stat(src).st_mode & 0o777, "o")
+images = []
+for name in sorted(cfg.get("services", {})):
+    image = cfg["services"][name].get("image") or ""
+    ps = subprocess.run(["docker", "compose", "ps", "-aq", name], capture_output=True, text=True)
+    cid = ""
+    if ps.stdout.strip():
+        cid = ps.stdout.strip().splitlines()[-1]
+    if not cid and name in ("vpn-sidecar", "headplane-tailnet"):
+        ps = subprocess.run(
+            ["docker", "compose", "--profile", "tailnet-admin", "ps", "-aq", name],
+            capture_output=True, text=True)
+        if ps.stdout.strip():
+            cid = ps.stdout.strip().splitlines()[-1]
+    image_id = ""
+    digests = []
+    if cid:
+        ins = subprocess.run(
+            ["docker", "inspect", "-f", "{{.Image}}", cid],
+            capture_output=True, text=True)
+        image_id = ins.stdout.strip()
+        if image_id:
+            dig = subprocess.run(
+                ["docker", "image", "inspect", "-f", "{{json .RepoDigests}}", image_id],
+                capture_output=True, text=True)
+            if dig.returncode == 0 and dig.stdout.strip() and dig.stdout.strip() != "null":
+                digests = json.loads(dig.stdout)
+    images.append({
+        "service": name,
+        "image": image,
+        "image_id": image_id,
+        "repo_digests": digests,
+    })
+doc = {
+    "created_utc": __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "admin_mode": mode,
+    "compose_project": cfg.get("name") or os.environ.get("COMPOSE_PROJECT_NAME", ""),
+    "headscale_version": version.strip(),
+    "file_modes": file_modes,
+    "images": images,
+}
+blob = json.dumps(doc, indent=2) + "\n"
+# The manifest is built from image metadata only. Refuse to persist a secret
+# if one ever leaks into an image name or version string.
+for needle in ("idv1_", "hskey-", "ENROLL_TOKEN"):
+    if needle in blob:
+        sys.exit("manifest would contain %s; refusing to write it" % needle)
+with open(out_path, "w") as fh:
+    fh.write(blob)
+os.chmod(out_path, 0o600)
+PY
+  fi
+  rm -f "$tmp"
+  [[ "$ec" -eq 0 ]] || die "could not write backup manifest"
+}
+
+# Non-secret files go back to the mode they had on the host (never a
+# group/other-writable mode). Secrets stay 0600.
+apply_restored_mode() {
+  local manifest="$1" rel="$2" dest="$3"
+  python3 - "$manifest" "$rel" "$dest" <<'PY'
+import json, os, sys
+manifest, rel, dest = sys.argv[1:]
+secrets = {
+    "state/dotenv",
+    "state/enroll/config.json",
+    "state/enroll/headscale.apikey",
+    "state/headplane/cookie_secret",
+    "state/headscale/managed.json",
+}
+mode = 0o600
+if rel not in secrets:
+    try:
+        raw = json.load(open(manifest)).get("file_modes", {}).get(rel, "600")
+        mode = int(raw, 8)
+    except (OSError, ValueError, json.JSONDecodeError):
+        mode = 0o600
+    if mode & 0o022 or mode == 0:
+        mode = 0o600
+os.chmod(dest, mode)
+PY
+}
+
+# Container id of the Headplane that owns the data volume for this mode.
+headplane_writer_id() {
+  local mode="$1" id
+  if [[ "$mode" == "tailnet-admin" ]]; then
+    id="$(_compose_ps_id headplane-tailnet)"
+    [[ -n "$id" ]] || id="$(_compose_ps_id headplane)"
+  else
+    id="$(_compose_ps_id headplane)"
+    [[ -n "$id" ]] || id="$(_compose_ps_id headplane-tailnet)"
+  fi
+  [[ -n "$id" ]] || die "no Headplane container to copy; start the stack once before backup or restore"
+  printf '%s' "$id"
+}
+
+# 0600 .env update. Key is a shell identifier; the value is one line.
+write_env_var() {
+  local key="$1" value="$2" tmp
+  [[ "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]] || die "bad env key '$key'"
+  [[ "$value" != *$'\n'* ]] || die "env value for $key must be one line"
+  tmp="$(mktemp "$here/.env.XXXXXX")"
+  { grep -v "^${key}=" "$here/.env" 2>/dev/null || true; printf '%s=%s\n' "$key" "$value"; } > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$here/.env"
+}
+
+# Shell export wins, then .env, then the compose.yaml default.
+current_project_name() {
+  local from_env
+  if [[ -n "${COMPOSE_PROJECT_NAME:-}" ]]; then
+    printf '%s' "$COMPOSE_PROJECT_NAME"
+    return
+  fi
+  from_env=""
+  if [[ -f "$here/.env" ]]; then
+    from_env="$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' "$here/.env" | head -n1 | tr -d "\"'" | tr -d '[:space:]')"
+  fi
+  if [[ -n "$from_env" ]]; then
+    printf '%s' "$from_env"
+    return
+  fi
+  printf '%s' "idoris-vpn"
+}
+
+# "office" -> idoris-vpn-office. A name that already starts with idoris-vpn is kept.
+sanitize_instance_name() {
+  local name
+  name="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  [[ "$name" =~ ^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$ ]] || die "--instance must be a short lowercase label (got '$1')"
+  case "$name" in
+    idoris-vpn|idoris-vpn-*) ;;
+    *) name="idoris-vpn-${name}" ;;
+  esac
+  printf '%s' "$name"
+}
+
+# Same project name from another directory shares volumes and container names.
+reject_project_collision() {
+  local want mine json err
+  want="$(current_project_name)"
+  [[ "$want" =~ ^[a-z0-9][a-z0-9_-]{0,50}$ ]] || die "compose project name '$want' is not a safe label"
+  mine="$(cd "$here" && pwd)/compose.yaml"
+  if ! json="$(docker compose ls --all --format json 2>/dev/null)"; then
+    if ! json="$(docker compose ls --format json)"; then
+      die "could not list compose projects"
+    fi
+  fi
+  if ! err="$(python3 -c '
+import json, os, sys
+want, mine, raw = sys.argv[1], sys.argv[2], sys.argv[3]
+raw = raw.strip()
+if not raw or raw == "null":
+    raise SystemExit(0)
+try:
+    data = json.loads(raw)
+except ValueError:
+    data = [json.loads(line) for line in raw.splitlines() if line.strip()]
+if isinstance(data, dict):
+    data = [data]
+mine = os.path.realpath(mine)
+for item in data:
+    if (item.get("Name") or "") != want:
+        continue
+    files = item.get("ConfigFiles") or ""
+    paths = []
+    for part in files.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not os.path.isabs(part):
+            part = os.path.join(os.getcwd(), part)
+        paths.append(os.path.realpath(part))
+    if mine not in paths:
+        sys.stderr.write(
+            "compose project %s is already used by %s; pass --instance NAME or set COMPOSE_PROJECT_NAME\n"
+            % (want, files or "another directory"))
+        raise SystemExit(1)
+' "$want" "$mine" "$json" 2>&1)"; then
+    die "${err:-compose project ${want} collides with another directory}"
+  fi
+}
+
+# One knob for Headplane's origin and cookie. tunnel, lan and proxy publish
+# the headplane service. tailnet does not: the profile serves it on the
+# tailnet address only. Rewrites base_url and cookie_secure in place.
+apply_headplane_access() {
+  local mode="$1" port bind base secure host_url server_host admin_host allow
+  case "$mode" in
+    tunnel|lan|tailnet|proxy) ;;
+    *) die "HEADPLANE_ACCESS must be tunnel, lan, tailnet or proxy (got '$mode')" ;;
+  esac
+  port="${HEADPLANE_PORT:-}"
+  if [[ -z "$port" && -f "$here/.env" ]]; then
+    port="$(sed -n 's/^HEADPLANE_PORT=//p' "$here/.env" | head -n1 | tr -d '[:space:]')"
+  fi
+  port="${port:-3000}"
+  [[ "$port" =~ ^[0-9]+$ ]] || die "HEADPLANE_PORT must be numeric"
+  bind="${HEADPLANE_BIND:-}"
+  if [[ -z "$bind" && -f "$here/.env" ]]; then
+    bind="$(sed -n 's/^HEADPLANE_BIND=//p' "$here/.env" | head -n1 | tr -d "\"'" | tr -d '[:space:]')"
+  fi
+  bind="${bind:-127.0.0.1}"
+  case "$mode" in
+    tunnel)
+      bind="127.0.0.1"
+      base="http://127.0.0.1:${port}"
+      secure=false
+      ;;
+    lan)
+      [[ "$bind" != "127.0.0.1" ]] || die "HEADPLANE_ACCESS=lan needs HEADPLANE_BIND set to a LAN address (not 127.0.0.1)"
+      host_url="${HEADPLANE_LAN_HOST:-}"
+      if [[ -z "$host_url" && -f "$here/.env" ]]; then
+        host_url="$(sed -n 's/^HEADPLANE_LAN_HOST=//p' "$here/.env" | head -n1 | tr -d "\"'" | tr -d '[:space:]')"
+      fi
+      host_url="${host_url:-$bind}"
+      base="http://${host_url}:${port}"
+      secure=false
+      echo "WARNING: Headplane will speak plain HTTP on ${bind}." >&2
+      echo "WARNING: the session cookie is not marked Secure. Anyone on that LAN can steal it." >&2
+      echo "WARNING: prefer HEADPLANE_ACCESS=tunnel (SSH) or tailnet." >&2
+      ;;
+    tailnet)
+      bind="127.0.0.1"
+      base="http://vpn-server.idoris.internal:3000"
+      secure=false
+      ;;
+    proxy)
+      base="${HEADPLANE_BASE_URL:-}"
+      if [[ -z "$base" && -f "$here/.env" ]]; then
+        base="$(sed -n 's/^HEADPLANE_BASE_URL=//p' "$here/.env" | head -n1 | tr -d "\"'" | tr -d '[:space:]')"
+      fi
+      [[ "$base" == https://* ]] || die "HEADPLANE_ACCESS=proxy needs HEADPLANE_BASE_URL=https://admin.example.org (a different host from server_url)"
+      server_host="$(sed -n 's/^server_url:[[:space:]]*//p' "$here/headscale/config.yaml" | sed 's/[[:space:]]*#.*$//' | tr -d "\"'" | head -n1)"
+      admin_host="$(python3 -c 'import sys; from urllib.parse import urlparse; print(urlparse(sys.argv[1]).hostname or "")' "$base")"
+      server_host="$(python3 -c 'import sys; from urllib.parse import urlparse; print(urlparse(sys.argv[1]).hostname or "")' "$server_host")"
+      allow="${HEADPLANE_ALLOW_PUBLIC_ADMIN:-}"
+      if [[ -z "$allow" && -f "$here/.env" ]]; then
+        allow="$(sed -n 's/^HEADPLANE_ALLOW_PUBLIC_ADMIN=//p' "$here/.env" | head -n1 | tr -d '[:space:]')"
+      fi
+      if [[ -n "$admin_host" && "$admin_host" == "$server_host" && "$allow" != "1" ]]; then
+        die "HEADPLANE_BASE_URL uses the public VPN hostname ($server_host). /admin stays off that name unless HEADPLANE_ALLOW_PUBLIC_ADMIN=1"
+      fi
+      if [[ "$allow" == "1" ]]; then
+        echo "WARNING: HEADPLANE_ALLOW_PUBLIC_ADMIN=1 puts /admin on the public VPN hostname." >&2
+        echo "WARNING: the default is a separate admin hostname that is not published as server_url." >&2
+      fi
+      bind="127.0.0.1"
+      secure=true
+      ;;
+  esac
+  python3 - "$here/headplane/config.yaml" "$base" "$secure" <<'PY'
+import sys
+path, base, secure = sys.argv[1:]
+lines = open(path).read().splitlines(keepends=True)
+saw_base = saw_cookie = False
+out = []
+for line in lines:
+    stripped = line.lstrip()
+    if stripped.startswith("base_url:"):
+        out.append('  base_url: "%s"\n' % base)
+        saw_base = True
+        continue
+    if stripped.startswith("cookie_secure:"):
+        out.append("  cookie_secure: %s\n" % secure)
+        saw_cookie = True
+        continue
+    out.append(line)
+if not saw_base or not saw_cookie:
+    sys.exit("headplane config is missing base_url or cookie_secure")
+open(path, "w").writelines(out)
+PY
+  write_env_var HEADPLANE_ACCESS "$mode"
+  write_env_var HEADPLANE_BIND "$bind"
+  if [[ "$mode" == "proxy" ]]; then
+    write_env_var HEADPLANE_BASE_URL "$base"
+  fi
+  if [[ "$mode" == "tailnet" ]]; then
+    write_admin_mode tailnet-admin
+  else
+    write_admin_mode published
+  fi
+  echo "Headplane access: $mode base_url=$base cookie_secure=$secure bind=$bind"
+}
