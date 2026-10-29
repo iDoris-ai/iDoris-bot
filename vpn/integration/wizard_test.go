@@ -742,9 +742,23 @@ func (e *wizEnv) approve(t *testing.T, host, numericID, cidr string) {
 		"--identifier", numericID, "--routes", cidr)
 }
 
+// waitEcho retries the member's TCP probe. The route can be installed
+// before the WireGuard session to the gateway has passed a packet.
 func (e *wizEnv) waitEcho(t *testing.T, ip string) {
-	panic("stub")
+	t.Helper()
+	waitFor(t, "wiz-member reaches "+ip+":8740", 45*time.Second, func() (bool, string) {
+		out, err := e.exec(8*time.Second, "exec", "-T", "wiz-member", "nc", "-w", "2", ip, "8740")
+		text := strings.TrimSpace(out)
+		if err == nil && strings.Contains(text, "ok") {
+			return true, text
+		}
+		if err != nil {
+			text = strings.TrimSpace(text + " " + err.Error())
+		}
+		return false, text
+	})
 }
+
 func (e *wizEnv) nc(t *testing.T, container, host, port string, waitSec int) (string, error) {
 	t.Helper()
 	out, err := e.exec(time.Duration(waitSec+8)*time.Second, "exec", "-T", container, "nc", "-w", fmt.Sprintf("%d", waitSec), host, port)
