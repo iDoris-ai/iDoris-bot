@@ -99,7 +99,9 @@ func bindCommon(fs *flag.FlagSet, cfg *vpnd.Config, configPath *string) {
 	fs.StringVar(&cfg.Interval, "interval", "", "healthy reconcile interval (default 5s)")
 	fs.StringVar(&cfg.LogLevel, "log-level", "", "debug|info|warn|error")
 	fs.StringVar(&cfg.Mode, "mode", "", "auto|system|embedded (default auto)")
+	fs.StringVar(&cfg.Role, "role", "", "member|local-ai|gateway|admin (default member; discovery wins when it returns a role)")
 	fs.StringVar(&cfg.StateDir, "state-dir", "", "embedded node state directory (default ~/.idoris/vpn-state)")
+	fs.StringVar(&cfg.StateFile, "state-file", "", "identity binding file (default ~/.idoris/vpnd-state.json)")
 	fs.StringVar(&cfg.SOCKS5Listen, "socks5-listen", "", "loopback SOCKS5 address into the tailnet")
 }
 
@@ -144,7 +146,9 @@ func loadConfig(args []string, fs *flag.FlagSet) (*vpnd.Config, error) {
 	override("interval", &cfg.Interval, flagCfg.Interval)
 	override("log-level", &cfg.LogLevel, flagCfg.LogLevel)
 	override("mode", &cfg.Mode, flagCfg.Mode)
+	override("role", &cfg.Role, flagCfg.Role)
 	override("state-dir", &cfg.StateDir, flagCfg.StateDir)
+	override("state-file", &cfg.StateFile, flagCfg.StateFile)
 	override("socks5-listen", &cfg.SOCKS5Listen, flagCfg.SOCKS5Listen)
 	if set["enroll-allow-insecure"] {
 		cfg.EnrollAllowInsecure = flagCfg.EnrollAllowInsecure
@@ -226,11 +230,14 @@ func runCmd(args []string) error {
 		return err
 	}
 	log := newLogger(cfg.LogLevel)
-	keys, controlURL, err := prepareKeys(cfg, log)
+	keys, controlURL, ident, binding, err := prepareKeys(cfg, log)
 	if err != nil {
 		return err
 	}
 	cfg.ControlURL = controlURL
+	if ident.Role != "" {
+		cfg.Role = ident.Role
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -261,6 +268,9 @@ func runCmd(args []string) error {
 		AdvertiseRoutes:    routes,
 		Takeover:           cfg.TakeoverValue(),
 		LoginWhileStarting: node.LoginWhileStarting,
+		Role:               cfg.Role,
+		Identity:           ident,
+		State:              binding,
 		Interval:           cfg.IntervalDuration(),
 	}, log)
 	if err != nil {
@@ -297,24 +307,69 @@ func runCmd(args []string) error {
 	}
 }
 
-func prepareKeys(cfg *vpnd.Config, log *slog.Logger) (vpnd.KeySource, string, error) {
+func prepareKeys(cfg *vpnd.Config, log *slog.Logger) (vpnd.KeySource, string, vpnd.Identity, *vpnd.StateFile, error) {
 	controlURL := cfg.ControlURL
+	var ident vpnd.Identity
 	if cfg.EnrollURL == "" {
-		return vpnd.StaticKey(cfg.AuthKey), controlURL, nil
+		binding, err := openBinding(cfg)
+		if err != nil {
+			return nil, "", ident, nil, err
+		}
+		if controlURL != "" && binding != nil {
+			if err := binding.RememberControl(controlURL); err != nil {
+				return nil, "", ident, nil, err
+			}
+		}
+		return vpnd.StaticKey(cfg.AuthKey), controlURL, ident, binding, nil
 	}
 	ec := &enroll.Client{URL: cfg.EnrollURL, Token: cfg.EnrollToken, AllowInsecure: cfg.EnrollAllowInsecure}
-	if controlURL == "" {
-		// Discover does not mint a key, so restarting an enrolled daemon is free.
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		d, err := ec.Discover(ctx)
-		cancel()
-		if err != nil {
-			return nil, "", fmt.Errorf("discover control url via enrollment service: %w", err)
-		}
-		controlURL = d.ControlURL
-		log.Info("control url discovered", "tenant", d.Tenant, "control_url", controlURL)
+	// Discover does not mint a key. It is the source of truth for tenant and role.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	d, err := ec.Discover(ctx)
+	cancel()
+	if err != nil {
+		return nil, "", ident, nil, fmt.Errorf("discover control url via enrollment service: %w", err)
 	}
-	return &enrollKeys{c: ec, cfg: cfg, log: log}, controlURL, nil
+	if controlURL != "" && !vpnd.SameControlURL(controlURL, d.ControlURL) {
+		return nil, "", ident, nil, fmt.Errorf("enrollment service points at %s but config pins %s; refusing", d.ControlURL, controlURL)
+	}
+	if controlURL == "" {
+		controlURL = d.ControlURL
+	}
+	role := strings.TrimSpace(d.Role)
+	if role == "" {
+		role = strings.TrimSpace(cfg.Role)
+	}
+	if cfg.Role != "" && d.Role != "" && cfg.Role != d.Role {
+		log.Warn("config role differs from enrollment discovery; using discovery", "config_role", cfg.Role, "discovery_role", d.Role)
+	}
+	ident = vpnd.Identity{
+		Tenant:           d.Tenant,
+		Role:             role,
+		TokenFingerprint: vpnd.TokenFingerprint(cfg.EnrollToken),
+		Known:            true,
+	}
+	log.Info("control url discovered", "tenant", d.Tenant, "role", role, "control_url", controlURL)
+	binding, err := openBinding(cfg)
+	if err != nil {
+		return nil, "", ident, nil, err
+	}
+	if err := binding.RememberControl(controlURL); err != nil {
+		return nil, "", ident, nil, err
+	}
+	return &enrollKeys{c: ec, cfg: cfg, log: log}, controlURL, ident, binding, nil
+}
+
+func openBinding(cfg *vpnd.Config) (*vpnd.StateFile, error) {
+	path := cfg.StateFile
+	if path == "" {
+		var err error
+		path, err = vpnd.DefaultStateFile()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return vpnd.OpenState(path)
 }
 
 func statusCmd(args []string) error {

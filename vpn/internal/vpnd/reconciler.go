@@ -32,6 +32,9 @@ const (
 	PhaseRoutesPending Phase = "routes-pending-approval"
 	PhaseBlocked       Phase = "blocked-foreign-tailnet"
 	PhaseError         Phase = "error"
+	// PhaseMissingTags means the node is up but a tagged role (local-ai,
+	// gateway) has no Self.Tags. Enrollment succeeded; the ACL identity did not.
+	PhaseMissingTags Phase = "missing-node-tags"
 )
 
 // KeySource yields a fresh node auth key when the reconciler needs one.
@@ -80,6 +83,14 @@ type Options struct {
 	// did not exist yet, so a restart that is briefly Starting does not mint
 	// a new key.
 	LoginWhileStarting bool
+	// Role is member, local-ai, gateway, or admin. Empty is treated as member
+	// for tag checks. Discovery is the source of truth when it ran.
+	Role string
+	// Identity is the credential from /v1/discover. Known is false when the
+	// daemon has no fresh discovery (static key, or enrollment is down).
+	Identity Identity
+	// State is the binding file. Nil in tests that do not care about identity.
+	State *StateFile
 	// Interval between reconcile passes while healthy. Default 5s.
 	Interval time.Duration
 	// MaxBackoff caps the retry delay after failures. Default 2m.
@@ -109,6 +120,11 @@ type Snapshot struct {
 	// AdminHint is the exact Headscale command while any route is unapproved.
 	// It is not LastError: the node is still connected.
 	AdminHint string `json:"admin_hint,omitempty"`
+	// Role is the enrollment role this daemon is holding the node to.
+	Role string `json:"role,omitempty"`
+	// Warnings are operator-facing notices that do not by themselves change
+	// phase. Missing tags uses both a phase and a warning.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // Reconciler converges tailscaled onto the configured control server.
@@ -137,6 +153,12 @@ type Reconciler struct {
 	// NeedsLogin/NoState. tsnet reports that state briefly while it resumes
 	// the stored key; minting immediately cancels that resume.
 	needsLoginSince time.Time
+	// awaitingIdentity is set when the bound tenant or role disagrees with
+	// the configured credential. identityLoginOK becomes true only after
+	// Start and StartLoginInteractive both return, so a failed attempt cannot
+	// rewrite the binding while the old node is still the one that is up.
+	awaitingIdentity bool
+	identityLoginOK  bool
 }
 
 const (
@@ -188,8 +210,10 @@ func (r *Reconciler) Snapshot() Snapshot {
 func (r *Reconciler) set(mutate func(s *Snapshot)) Snapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.snap.Warnings = nil
 	mutate(&r.snap)
 	r.snap.ControlURL = r.opt.ControlURL
+	r.snap.Role = r.opt.Role
 	r.snap.Attempts = r.attempts
 	r.snap.PreviousProfile = string(r.previousProfile)
 	r.snap.UpdatedAt = r.now()
@@ -268,6 +292,9 @@ func (r *Reconciler) Step(ctx context.Context) (Snapshot, error) {
 
 	switch state {
 	case ipn.Running.String():
+		if snap, err, handled := r.settleIdentity(ctx); handled {
+			return snap, err
+		}
 		r.loginStarted = time.Time{}
 		r.needsLoginSince = time.Time{}
 		r.unconverged = 0
@@ -278,6 +305,10 @@ func (r *Reconciler) Step(ctx context.Context) (Snapshot, error) {
 			fillSelf(s, st)
 			s.LastError = ""
 			s.Routes, s.AdminHint, s.Phase = routePhase(r.opt.Hostname, r.opt.AdvertiseRoutes, st)
+			if warn, missing := missingNodeTags(r.opt.Role, st); missing {
+				s.Phase = PhaseMissingTags
+				s.Warnings = append(s.Warnings, warn)
+			}
 		}), nil
 	case ipn.Starting.String():
 		if r.needsLoginWhileStarting(st) {
@@ -409,7 +440,87 @@ func (r *Reconciler) login(ctx context.Context, reason string) (Snapshot, error)
 	}
 	r.loginStarted = r.now()
 	r.unconverged++
+	if r.awaitingIdentity {
+		r.identityLoginOK = true
+	}
 	return r.set(func(s *Snapshot) { s.Phase = PhaseStarting; s.LastError = "" }), nil
+}
+
+// settleIdentity refuses to call a Running node connected when the configured
+// credential is a different tenant or role than the binding file. The new
+// login uses this same profile (the control URL is already ours), which is
+// allowed. The binding is rewritten only after that login call returns.
+// handled is true when the caller should return snap and err as the step result.
+func (r *Reconciler) settleIdentity(ctx context.Context) (Snapshot, error, bool) {
+	if r.shouldReenrollIdentity() {
+		bound := r.opt.State.Get()
+		r.awaitingIdentity = true
+		r.identityLoginOK = false
+		r.log.Warn("bound enrollment identity differs from the configured credential; re-enrolling",
+			"bound_tenant", bound.Tenant, "bound_role", bound.Role,
+			"want_tenant", r.opt.Identity.Tenant, "want_role", r.opt.Identity.Role)
+		snap, err := r.login(ctx, "identity-mismatch")
+		return snap, err, true
+	}
+	if r.awaitingIdentity {
+		if !r.identityLoginOK {
+			if r.recentLogin() {
+				return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil, true
+			}
+			snap, err := r.login(ctx, "identity-mismatch")
+			return snap, err, true
+		}
+		if err := r.writeIdentity(); err != nil {
+			return r.fail(fmt.Errorf("save identity: %w", err)), err, true
+		}
+		r.awaitingIdentity = false
+		r.identityLoginOK = false
+		return Snapshot{}, nil, false
+	}
+	if err := r.writeIdentity(); err != nil {
+		return r.fail(fmt.Errorf("save identity: %w", err)), err, true
+	}
+	return Snapshot{}, nil, false
+}
+
+func (r *Reconciler) shouldReenrollIdentity() bool {
+	if r.awaitingIdentity || r.opt.State == nil || !r.opt.Identity.Known {
+		return false
+	}
+	bound := r.opt.State.Get()
+	if bound.Tenant == "" && bound.Role == "" {
+		return false
+	}
+	return bound.Tenant != r.opt.Identity.Tenant || bound.Role != r.opt.Identity.Role
+}
+
+func (r *Reconciler) writeIdentity() error {
+	if r.opt.State == nil || !r.opt.Identity.Known {
+		return nil
+	}
+	return r.opt.State.SetIdentity(r.opt.ControlURL, r.opt.Identity.Tenant, r.opt.Identity.Role, r.opt.Identity.TokenFingerprint)
+}
+
+// missingNodeTags reports a warning when a tagged role has an empty tag set.
+// member and admin are untagged by design. An ACL entry for :22 does not tag
+// the node; the enrollment key's acl_tags does.
+func missingNodeTags(role string, st *ipnstate.Status) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "local-ai", "gateway":
+	default:
+		return "", false
+	}
+	if len(selfTags(st)) > 0 {
+		return "", false
+	}
+	return "role " + role + " expects a non-empty node tag from the enrollment key; the node is online but has no tags, so the Local AI or gateway ACL does not select it", true
+}
+
+func selfTags(st *ipnstate.Status) []string {
+	if st == nil || st.Self == nil || st.Self.Tags == nil || st.Self.Tags.IsNil() {
+		return nil
+	}
+	return st.Self.Tags.AsSlice()
 }
 
 // persistedIdentity reports whether this profile already has a node key.
