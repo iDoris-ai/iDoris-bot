@@ -550,7 +550,7 @@ func TestIdentityMismatchReenrollsOnSameControlURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SetIdentity(ours, "acme", "admin", "old"); err != nil {
+	if err := st.SetIdentity(ours, "acme", "admin", "old", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	be := &fakeBackend{state: ipn.Running, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true, CorpDNS: true}}
@@ -591,7 +591,7 @@ func TestSameControlDifferentTenantReenrolls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SetIdentity(ours, "acme", "local-ai", "fp"); err != nil {
+	if err := st.SetIdentity(ours, "acme", "local-ai", "fp", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	be := &fakeBackend{state: ipn.Running, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true, CorpDNS: true}}
@@ -670,7 +670,7 @@ func TestEnrollDownResumesSavedIdentityWithoutMinting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SetIdentity(ours, "acme", "member", "fp"); err != nil {
+	if err := st.SetIdentity(ours, "acme", "member", "fp", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	be := &fakeBackend{state: ipn.Running, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true, CorpDNS: true}}
@@ -699,7 +699,7 @@ func TestEnrollDownMintsOnlyWhenLoginIsRequired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SetIdentity(ours, "acme", "local-ai", "fp"); err != nil {
+	if err := st.SetIdentity(ours, "acme", "local-ai", "fp", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	be := &fakeBackend{state: ipn.NeedsLogin, prefs: ipn.Prefs{ControlURL: ours}}
