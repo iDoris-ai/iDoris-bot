@@ -79,8 +79,8 @@ func TestJoinMemberDoesNotPrintTheCode(t *testing.T) {
 	if !bytes.Contains(cfg, []byte(`"accept_routes": true`)) || bytes.Contains(cfg, []byte("advertise_routes")) || bytes.Contains(cfg, []byte(testToken)) {
 		t.Fatalf("config %s", cfg)
 	}
-	if host.modes["/home/acme/.idoris/enroll.token"] != 0o600 {
-		t.Fatalf("token mode %#o", host.modes["/home/acme/.idoris/enroll.token"])
+	if host.modes["/home/acme/.idoris/vpn.json.enroll-token"] != 0o600 {
+		t.Fatalf("token mode %#o", host.modes["/home/acme/.idoris/vpn.json.enroll-token"])
 	}
 }
 
