@@ -43,6 +43,9 @@ type Config struct {
 
 	// Mode is auto (default), system, or embedded.
 	Mode string `json:"mode,omitempty"`
+	// Role is the join role this config was written for: member, local-ai,
+	// gateway, or admin. The daemon does not enforce it; the wizard does.
+	Role string `json:"role,omitempty"`
 	// StateDir is the embedded node's private state directory (0700). Empty
 	// uses ~/.idoris/vpn-state.
 	StateDir string `json:"state_dir,omitempty"`
