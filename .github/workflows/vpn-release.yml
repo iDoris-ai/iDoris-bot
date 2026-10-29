@@ -1,0 +1,51 @@
+name: vpn-release
+
+# Pushing a tag vpn-v* builds idoris-vpnd and idoris-vpn-enroll for
+# linux/darwin/windows on amd64 and arm64. The GitHub release attaches
+# those binaries, SHA256SUMS, and vpn/THIRD_PARTY_NOTICES.md.
+# Uses the workflow's GITHUB_TOKEN only. No repository secrets.
+on:
+  push:
+    tags:
+      - "vpn-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: vpn/go.mod
+          cache-dependency-path: vpn/go.sum
+      - name: Build release binaries
+        working-directory: vpn
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME}"
+          mkdir -p ../dist
+          for goos in linux darwin windows; do
+            for goarch in amd64 arm64; do
+              ext=""
+              if [ "$goos" = "windows" ]; then
+                ext=".exe"
+              fi
+              ldflags="-s -w -X github.com/iDoris-ai/iDoris-bridge/vpn/internal/version.Version=${version}"
+              GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags "$ldflags" \
+                -o "../dist/idoris-vpnd-${goos}-${goarch}${ext}" ./cmd/idoris-vpnd
+              GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags "$ldflags" \
+                -o "../dist/idoris-vpn-enroll-${goos}-${goarch}${ext}" ./cmd/idoris-vpn-enroll
+            done
+          done
+          cp THIRD_PARTY_NOTICES.md ../dist/THIRD_PARTY_NOTICES.md
+          cd ../dist
+          sha256sum ./* > SHA256SUMS
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true

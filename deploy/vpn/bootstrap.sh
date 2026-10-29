@@ -2,9 +2,12 @@
 # Bootstrap one organisation on the iDoris VPN control plane, or add another.
 #
 #   bash deploy/vpn/bootstrap.sh init [--org NAME] [--admin NAME]
-#       [--lan-cidr CIDR]... [--tailnet-admin]
+#       [--lan-cidr CIDR]... [--allow-public-cidr]
+#       [--ai-callback-ports PORTS] [--tailnet-admin] [--instance NAME]
+#       [--headplane-access tunnel|lan|tailnet|proxy]
 #   bash deploy/vpn/bootstrap.sh add-tenant NAME [--lan-cidr CIDR]...
-#       [--tailnet-admin]
+#       [--allow-public-cidr] [--ai-callback-ports PORTS] [--tailnet-admin]
+#       [--instance NAME]
 #
 # init is the default path: one organisation (name "office" if you omit
 # --org) plus an admin user (name "admin" if you omit --admin). It creates
@@ -28,9 +31,12 @@ usage() {
   cat <<'EOF'
 Usage:
   bash deploy/vpn/bootstrap.sh init [--org NAME] [--admin NAME]
-      [--lan-cidr CIDR]... [--tailnet-admin]
+      [--lan-cidr CIDR]... [--allow-public-cidr]
+      [--ai-callback-ports PORTS] [--tailnet-admin] [--instance NAME]
+      [--headplane-access MODE]
   bash deploy/vpn/bootstrap.sh add-tenant NAME [--lan-cidr CIDR]...
-      [--tailnet-admin]
+      [--allow-public-cidr] [--ai-callback-ports PORTS] [--tailnet-admin]
+      [--instance NAME]
 
 init prepares ONE organisation. The default name is "office" and the default
 admin user is "admin". Re-running init is safe.
@@ -41,10 +47,40 @@ advanced option; the product default is a single organisation.
 --lan-cidr CIDR   (repeatable) subnet-router block for that organisation:
                   tag:<org>-gateway, an enrollment entry, autoApprovers for
                   the prefix, and an ACL from <org>@ to the prefix on
-                  8740, 8742, 443 and 11434. A prefix cannot be shared.
+                  8740, 8742, 443 and 11434. Overlapping prefixes owned by
+                  different organisations are rejected. Private address
+                  space only (RFC1918, or IPv6 ULA), unless
+                  --allow-public-cidr is also set.
+
+--allow-public-cidr
+                  Acknowledge a --lan-cidr that is not private. Prints a
+                  warning. Does not allow tailnet, loopback, link-local,
+                  multicast, or 169.254.0.0/16. Persisted public prefixes
+                  are re-checked on every later run.
+
+--ai-callback-ports PORTS
+                  Comma-separated TCP ports (or "none") that this
+                  organisation's Local AI host may open towards its own
+                  members. Omitted means keep the saved list. Replies to
+                  member-initiated connections need no rule. There is no
+                  default reverse grant for the AI host or the gateway.
 
 --tailnet-admin   enrollment entry "vpn-server" (tag:vpn-server) for the
                   compose profile tailnet-admin. See docs/14-VPN-OPERATIONS.md.
+
+--headplane-access MODE
+                  tunnel (default, SSH to 127.0.0.1), lan (plain HTTP,
+                  loud warning), tailnet (compose profile, no host port),
+                  or proxy (HTTPS on a hostname that is not server_url).
+                  Sets base_url, cookie_secure and HEADPLANE_BIND together.
+                  tailnet conflicts with a published mode.
+
+--instance NAME   compose project for this directory. Stored as
+                  COMPOSE_PROJECT_NAME in .env (idoris-vpn-NAME unless NAME
+                  already starts with idoris-vpn). The default is idoris-vpn.
+                  A second copy on the same Docker host must use a different
+                  name and different host ports. Refuses a name another
+                  directory is already using.
 
 The lines between BEGIN/END markers in headscale/policy.hujson are
 regenerated. Hand-written rules outside the markers are kept.
@@ -52,6 +88,26 @@ EOF
 }
 
 die() { echo "bootstrap: $*" >&2; exit 1; }
+
+# Root's umask 077 files are not readable by uid 65532 until this chown.
+# Headplane runs as root in its image and can still read the cookie secret.
+chown_enroll_tree() {
+  [[ "$(id -u)" == 0 ]] || return 0
+  local f
+  if [[ -d enroll && ! -L enroll ]]; then
+    chown 65532:65532 enroll
+    chmod 700 enroll
+  fi
+  for f in enroll/config.json enroll/headscale.apikey enroll/minted-tokens.txt enroll/token-labels.json; do
+    if [[ -f "$f" && ! -L "$f" ]]; then
+      chown 65532:65532 "$f"
+      chmod 600 "$f"
+    fi
+  done
+}
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=ops-lib.sh
+source "$here/ops-lib.sh"
 trap 'echo "bootstrap failed; inspect with: (cd $here && docker compose ps && docker compose logs --tail=50)" >&2' ERR
 
 cmd="${1:-}"
@@ -68,6 +124,11 @@ shift
 org=""
 admin="admin"
 tailnet_admin=0
+allow_public_cidr=0
+ai_callback_ports=""
+ai_callback_set=0
+instance=""
+headplane_access=""
 lan_cidrs=()
 if [[ "$cmd" == "add-tenant" && $# -gt 0 && "$1" != --* ]]; then
   org="$1"
@@ -91,9 +152,29 @@ while [[ $# -gt 0 ]]; do
       lan_cidrs+=("$2")
       shift 2
       ;;
+    --allow-public-cidr)
+      allow_public_cidr=1
+      shift
+      ;;
+    --ai-callback-ports)
+      [[ $# -ge 2 ]] || die "--ai-callback-ports needs a value (for example 22,8080 or none)"
+      ai_callback_ports="$2"
+      ai_callback_set=1
+      shift 2
+      ;;
     --tailnet-admin)
       tailnet_admin=1
       shift
+      ;;
+    --instance)
+      [[ $# -ge 2 ]] || die "--instance needs a value"
+      instance="$2"
+      shift 2
+      ;;
+    --headplane-access)
+      [[ $# -ge 2 ]] || die "--headplane-access needs tunnel, lan, tailnet or proxy"
+      headplane_access="$2"
+      shift 2
       ;;
     -h|--help)
       usage
@@ -126,14 +207,21 @@ if [[ "${control_url#https://}" =~ :([0-9]+)(/|$) && "${BASH_REMATCH[1]}" != 443
   die "server_url must be served on port 443 (got '$control_url')"
 fi
 
-set_env() {
-  local tmp
-  tmp="$(mktemp .env.XXXXXX)"
-  { grep -v "^$1=" .env 2>/dev/null || true; echo "$1=$2"; } > "$tmp"
-  mv "$tmp" .env
-}
-set_env ENROLL_UID "$(id -u)"
-set_env ENROLL_GID "$(id -g)"
+# The enroll image is USER 65532 and must not run as root. A non-root
+# operator keeps their own uid so mode 0600 files stay readable. Root is
+# rewritten to 65532, and the secret files are chowned before start.
+enroll_uid="$(id -u)"
+enroll_gid="$(id -g)"
+if [[ "$enroll_uid" == 0 ]]; then
+  enroll_uid=65532
+  enroll_gid=65532
+  echo "bootstrap: refusing to run enroll as root; using uid 65532 (the image USER)" >&2
+fi
+write_env_var ENROLL_UID "$enroll_uid"
+write_env_var ENROLL_GID "$enroll_gid"
+# Record the compose project before any container is created. A second
+# directory on this Docker host must not reuse the name.
+assign_instance "$instance"
 
 if [[ ! -s headplane/cookie_secret ]]; then
   od -An -N16 -tx1 /dev/urandom | tr -d ' \n' > headplane/cookie_secret
@@ -147,6 +235,12 @@ if [[ -n "$org" ]]; then
 fi
 if (( tailnet_admin )); then
   policy_args+=(--tailnet-admin)
+fi
+if (( allow_public_cidr )); then
+  policy_args+=(--allow-public-cidr)
+fi
+if (( ai_callback_set )); then
+  policy_args+=(--ai-callback-ports "$ai_callback_ports")
 fi
 if [[ ${#lan_cidrs[@]} -gt 0 ]]; then
   for cidr in "${lan_cidrs[@]}"; do
@@ -301,23 +395,27 @@ if [[ ! -s enroll/headscale.apikey ]]; then
   echo "wrote enroll/headscale.apikey (expires in 365d; rotate with: ctl.sh apikeys create / expire)"
 fi
 
-# Which enrollment entries to have, as name|user|tags|rate|ttl (tags comma-separated, rate empty = default).
+# Which enrollment entries to have, as name|user|tags|rate|ttl|role
+# (tags comma-separated, rate empty = default, role empty = omit).
+# role is a field the enroll config already accepts. invite copies it into
+# the join code. An empty role makes the code say "member".
 wanted=()
 for a in "${admins[@]}"; do
   # Personal node of the admin user: no tags, tighter limit, short TTL.
-  wanted+=("${a}|$(user_id_of "$a")||5|5m")
+  wanted+=("${a}|$(user_id_of "$a")||5|5m|admin")
 done
 for o in "${org_names[@]}"; do
   oid="$(user_id_of "$o")"
-  wanted+=("${o}|${oid}|||10m")
-  wanted+=("${o}-local-ai|${oid}|tag:${o}-local-ai|5|10m")
+  wanted+=("${o}|${oid}|||10m|member")
+  wanted+=("${o}-local-ai|${oid}|tag:${o}-local-ai|5|10m|local-ai")
   cidrs="$(cidrs_of "$o")"
   if [[ -n "$cidrs" ]]; then
-    wanted+=("${o}-gateway|${oid}|tag:${o}-gateway|5|10m")
+    wanted+=("${o}-gateway|${oid}|tag:${o}-gateway|5|10m|gateway")
   fi
 done
 if [[ "$tailnet_flag" == "1" ]]; then
-  wanted+=("vpn-server|$(user_id_of "${admins[0]}")|tag:vpn-server|5|10m")
+  # No join role named vpn-server. The sidecar uses the raw token and acl_tags.
+  wanted+=("vpn-server|$(user_id_of "${admins[0]}")|tag:vpn-server|5|10m|")
 fi
 
 image="$(docker compose config --format json | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["enroll"]["image"])')"
@@ -338,14 +436,26 @@ fi
 new_rows=()
 printed=()
 for spec in "${wanted[@]}"; do
-  IFS='|' read -r ename euser etags erate ettl <<< "$spec"
+  IFS='|' read -r ename euser etags erate ettl erole <<< "$spec"
   if [[ "$existing_names" == *" $ename "* ]]; then
     continue
   fi
   read -r tok hash < <(mint)
-  new_rows+=("${ename}|${euser}|${etags}|${erate}|${ettl}|${hash}")
+  new_rows+=("${ename}|${euser}|${etags}|${erate}|${ettl}|${hash}|${erole}")
   printed+=("${ename}|${tok}")
 done
+
+# Persist plaintext before config rewrite and before compose up. A later
+# failure must not be the only copy of a token that already exists as a hash.
+if [[ ${#printed[@]} -gt 0 ]]; then
+  {
+    printf '# minted %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    for row in "${printed[@]}"; do
+      printf '%s\t%s\n' "${row%%|*}" "${row#*|}"
+    done
+  } >> "$here/enroll/minted-tokens.txt"
+  chmod 600 "$here/enroll/minted-tokens.txt"
+fi
 
 if [[ ${#new_rows[@]} -gt 0 ]]; then
   spec_file="$(mktemp enroll/config.sync.XXXXXX)"
@@ -366,7 +476,7 @@ else:
 have = {t["name"] for t in cfg.get("tenants", [])}
 with open(spec_path) as f:
     for line in f:
-        name, user, tags, rate, ttl, digest = line.rstrip("\n").split("|")
+        name, user, tags, rate, ttl, digest, role = line.rstrip("\n").split("|")
         if name in have:
             continue
         entry = {
@@ -375,6 +485,8 @@ with open(spec_path) as f:
             "token_hashes": [digest],
             "preauth_ttl": ttl or "10m",
         }
+        if role:
+            entry["role"] = role
         if tags:
             entry["acl_tags"] = tags.split(",")
         if rate:
@@ -393,13 +505,36 @@ else
   echo "enrollment entries already present; no new tokens minted"
 fi
 
-echo "starting all services..."
-docker compose up -d --wait --wait-timeout 180
+if [[ ${#printed[@]} -gt 0 ]]; then
+  for row in "${printed[@]}"; do
+    if [[ "${row%%|*}" == "vpn-server" ]]; then
+      export VPN_SERVER_ENROLL_TOKEN="${row#*|}"
+    fi
+  done
+fi
+if [[ -n "$headplane_access" && "$headplane_access" != "tunnel" && "$headplane_access" != "lan" && "$headplane_access" != "tailnet" && "$headplane_access" != "proxy" ]]; then
+  die "--headplane-access must be tunnel, lan, tailnet or proxy"
+fi
+if (( tailnet_admin )) && [[ -n "$headplane_access" && "$headplane_access" != "tailnet" ]]; then
+  die "--tailnet-admin cannot be combined with --headplane-access $headplane_access"
+fi
+if (( tailnet_admin )) && [[ -z "$headplane_access" ]]; then
+  headplane_access="tailnet"
+fi
+if [[ -z "$headplane_access" && -f "$here/.env" ]]; then
+  headplane_access="$(sed -n 's/^HEADPLANE_ACCESS=//p' "$here/.env" | head -n1 | tr -d '[:space:]')"
+fi
+headplane_access="${headplane_access:-tunnel}"
+apply_headplane_access "$headplane_access"
+chown_enroll_tree
+echo "starting services for admin mode $(read_admin_mode)..."
+start_stack_for_mode "$(read_admin_mode)"
 docker compose exec -T enroll idoris-vpn-enroll check --config /etc/idoris/enroll.json
 
 if [[ ${#printed[@]} -gt 0 ]]; then
   echo
-  echo "Enrollment tokens minted by this run (shown once; store them now):"
+  echo "Enrollment tokens minted by this run (also in enroll/minted-tokens.txt, mode 0600):"
+  echo "Delete that file after the tokens are stored somewhere else."
   for row in "${printed[@]}"; do
     echo "  ${row%%|*}: ${row#*|}"
   done
@@ -418,14 +553,17 @@ MagicDNS is <hostname>.idoris.internal with no organisation in the name.
 EOF
   if printf '%s\n' "${printed[@]}" | grep -q -- '-gateway|'; then
     cat <<'EOF'
-Gateway token: enroll that Linux host the same way, then advertise the LAN
-(idoris-vpnd has accept_routes but does not advertise routes):
-  sudo sysctl -w net.ipv4.ip_forward=1
-  sudo tailscale set --advertise-routes=<the CIDR you passed>
-See docs/14-VPN-OPERATIONS.md.
+Gateway token: enroll that Linux host in system mode and set advertise_routes
+to the CIDR you passed (see docs/14). Embedded mode rejects that field.
+On the host, also:  sudo sysctl -w net.ipv4.ip_forward=1
+Manual alternative after enroll:  sudo tailscale set --advertise-routes=<CIDR>
 
 EOF
   fi
+elif [[ -s "$here/enroll/minted-tokens.txt" ]]; then
+  echo
+  echo "No new tokens. Plaintext from the last mint is still in enroll/minted-tokens.txt:"
+  cat "$here/enroll/minted-tokens.txt"
 fi
 
 cat <<EOF
