@@ -113,10 +113,3 @@ func listenLocal(network, address string) (net.Listener, error) {
 	}
 	return ln, nil
 }
-
-func init() {
-	_ = splitListen
-	_ = validateUnixPath
-	_ = prepareUnixSocket
-	_ = listenLocal
-}
