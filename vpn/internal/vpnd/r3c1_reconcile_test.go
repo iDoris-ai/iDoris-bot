@@ -506,6 +506,50 @@ func TestR3C1PendingDialCancelledWhenOwnershipLost(t *testing.T) {
 	}
 }
 
+func TestR3C1EmbeddedForwardClosedWithoutConfirmedIdentity(t *testing.T) {
+	be := &r3c1LiveBackend{fakeBackend: fakeBackend{
+		state: ipn.Running,
+		prefs: ipn.Prefs{ControlURL: ours, WantRunning: true},
+	}}
+	owner := NewLiveOwner(LiveOwnerConfig{
+		Backend:    be,
+		Mode:       ModeEmbedded,
+		OurControl: ours,
+		CacheTTL:   20 * time.Millisecond,
+		Snapshot: func() Snapshot {
+			return Snapshot{Phase: PhaseError, CurrentControl: ours}
+		},
+		Identity: func(string, string) bool { return false },
+	})
+	dialer := &fakeDialer{dest: "127.0.0.1:1"}
+	access, err := StartAccess(dialer, []Forward{{Listen: "127.0.0.1:0", Target: "10.0.0.8:9"}}, "", AccessOptions{Owner: owner}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = access.Close() })
+	if !access.Suspended() {
+		t.Fatal("embedded gate opened without a confirmed identity")
+	}
+	conn, err := net.Dial("tcp", access.ForwardStatus()[0].Listen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	one := make([]byte, 1)
+	_, err = conn.Read(one)
+	if err == nil {
+		t.Fatal("embedded forward admitted a connection")
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		t.Fatal("closed embedded gate left the client blocked")
+	}
+	if len(dialer.got()) != 0 {
+		t.Fatalf("dialed: %v", dialer.got())
+	}
+}
+
 func r3c1Open(t *testing.T) *StateFile {
 	t.Helper()
 	st, err := OpenState(t.TempDir() + "/vpnd-state.json")
