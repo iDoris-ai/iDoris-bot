@@ -1,28 +1,37 @@
 # Headplane v0.8.x - admin UI for Headscale. https://github.com/tale/headplane
 # Reference: https://github.com/tale/headplane/blob/0.8.2/config.example.yaml
-# Replace vpn.example.org with your public hostname (same as headscale server_url).
+#
+# base_url and cookie_secure are the tunnel defaults. Do not edit them by
+# hand. bootstrap.sh and ctl.sh up rewrite those two keys from one knob,
+# HEADPLANE_ACCESS=tunnel|lan|tailnet|proxy:
+#   tunnel   http://127.0.0.1:<port>          cookie_secure false  (SSH)
+#   lan      http://<lan-host>:<port>         cookie_secure false  (warns)
+#   tailnet  http://vpn-server.idoris.internal:3000
+#            cookie_secure false, no host port
+#   proxy    https://<other-host>             cookie_secure true
+#            refused when the host is headscale server_url, unless
+#            HEADPLANE_ALLOW_PUBLIC_ADMIN=1
+# public_url is the public Headscale name, not the Headplane origin.
+# /admin is not served on that name. Replace vpn.example.org before
+# bootstrap (bootstrap refuses the placeholder).
 server:
   host: "0.0.0.0"
   port: 3000
   # Public origin of Headplane WITHOUT the /admin dashboard prefix.
-  base_url: "https://vpn.example.org"
+  # The access knob overwrites this line.
+  base_url: "http://127.0.0.1:3000"
   # Exactly 32 characters; bootstrap.sh generates the file mounted here.
   cookie_secret_path: "/run/secrets/headplane_cookie_secret"
-  # true: the session cookie is HTTPS-only. Correct behind the TLS proxy
-  # (HEADPLANE_BIND=127.0.0.1 plus the proxy, or an SSH tunnel to that port
-  # while the browser still uses https://<base_url>).
-  # For plain HTTP on a LAN address (HEADPLANE_BIND=192.168.x.x or 0.0.0.0)
-  # set cookie_secure: false AND base_url to that http origin, including the
-  # port. Otherwise the browser drops the session cookie and API-key login
-  # does not stick. That cookie is then sent in clear text on the LAN.
-  # Anyone on that LAN can steal it. Prefer the SSH tunnel.
-  cookie_secure: true
+  # Tunnel default: plain HTTP on loopback, so the cookie must not be Secure.
+  # proxy mode sets this to true. The access knob overwrites this line.
+  cookie_secure: false
   cookie_max_age: 86400
   data_path: "/var/lib/headplane"
 
 headscale:
   # Internal address on the compose network (plain HTTP).
   url: "http://headscale:8080"
+  # Public Headscale URL. Not where operators open /admin.
   public_url: "https://vpn.example.org"
   # Mounted read-only: Headplane displays DNS settings but does not edit them.
   config_path: "/etc/headscale/config.yaml"
@@ -34,8 +43,8 @@ integration:
   agent:
     enabled: false
 
-# Admin login: open https://vpn.example.org/admin/login and paste a Headscale
-# API key made for yourself (NOT the key used by idoris-vpn-enroll):
+# Admin login is <base_url>/admin/login. Paste a Headscale API key made for
+# yourself (NOT the key used by idoris-vpn-enroll):
 #   docker compose exec headscale headscale apikeys create --expiration 90d
 # Optional SSO instead of API-key login:
 # headscale:

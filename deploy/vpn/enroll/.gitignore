@@ -3,3 +3,5 @@ headscale.apikey
 config.json
 config.json.tmp
 config.sync.*
+minted-tokens.txt
+token-labels.json

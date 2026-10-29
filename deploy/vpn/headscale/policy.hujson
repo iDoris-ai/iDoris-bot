@@ -15,8 +15,11 @@
 //     them and they do not expire.
 //   * Default deny. For each organisation the marked regions allow only:
 //       <org>@              -> tag:<org>-local-ai : 8740, 8742, 443
-//       tag:<org>-local-ai  -> <org>@ : any port
 //       group:admins        -> tag:<org>-local-ai : 22, plus an ssh rule
+//     There is no default reverse grant. Tailscale ACLs are stateful, so a
+//     reply to a member-initiated connection needs no rule. An opt-in
+//     --ai-callback-ports list adds tag:<org>-local-ai -> <org>@:<port>
+//     only. The gateway tag has no grant back to members.
 //     There is no member-to-member rule and no rule that names two
 //     organisations. Do NOT add autogroup:member, autogroup:tagged, or "*"
 //     — those match every organisation on this Headscale.
@@ -29,7 +32,12 @@
 //   * A subnet router, when bootstrap was given --lan-cidr, is tag:<org>-gateway.
 //     autoApprovers.routes approves that prefix only for that tag. Members of
 //     the same organisation may open 8740, 8742, 443 and 11434 on the prefix.
-//     The same prefix cannot belong to two organisations.
+//     Prefixes owned by different organisations must not overlap or nest
+//     (192.168.0.0/16 and 192.168.50.0/24 cannot coexist). The check is
+//     network math, re-run against managed.json on every init/add-tenant.
+//     RFC1918 (and IPv6 ULA) only, unless --allow-public-cidr is passed.
+//     100.64.0.0/10, fd7a:115c:a1e0::/48, loopback, link-local and multicast
+//     are rejected. A same-organisation overlap is kept and warned about.
 //
 // Markers
 //   bootstrap.sh rewrites the lines between each BEGIN/END pair. Edit rules
