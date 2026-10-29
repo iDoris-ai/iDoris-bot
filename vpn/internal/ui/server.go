@@ -968,8 +968,9 @@ func (s *Server) ensurePaths() (idorisPaths, error) {
 	if err != nil || home == "" {
 		return idorisPaths{}, fmt.Errorf("ui: home directory: %w", err)
 	}
-	// Empty config path keeps the historical default names. The UI never picks
-	// another config file; a second organization is an explicit replace.
+	// Empty config path keeps the historical plan name. The token is
+	// vpn.json.enroll-token, not the legacy shared enroll.token. The UI
+	// never picks another config file; a second organization is an explicit replace.
 	p := gateway.PathsFor(home, "")
 	return idorisPaths{config: p.Config, token: p.Token, plan: p.Plan}, nil
 }
