@@ -3,7 +3,10 @@ package vpnd
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -43,6 +46,36 @@ func (k *r3c1RefreshKeys) AuthKey(context.Context) (string, error) {
 	k.auth++
 	k.order = append(k.order, "auth")
 	return "hskey-r3c1", nil
+}
+
+// r3c1LiveBackend lets a gate poll and a test flip the control URL together.
+type r3c1LiveBackend struct {
+	mu sync.Mutex
+	fakeBackend
+}
+
+func (b *r3c1LiveBackend) GetPrefs(ctx context.Context) (*ipn.Prefs, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.fakeBackend.GetPrefs(ctx)
+}
+
+func (b *r3c1LiveBackend) Status(ctx context.Context) (*ipnstate.Status, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.fakeBackend.Status(ctx)
+}
+
+func (b *r3c1LiveBackend) ProfileStatus(ctx context.Context) (ipn.LoginProfile, []ipn.LoginProfile, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.fakeBackend.ProfileStatus(ctx)
+}
+
+func (b *r3c1LiveBackend) setControl(url string) {
+	b.mu.Lock()
+	b.prefs.ControlURL = url
+	b.mu.Unlock()
 }
 
 func TestR3C1IdentityFollowsRunningNode(t *testing.T) {
@@ -350,6 +383,82 @@ func TestR3C1RediscoverBeforeEnrollAfterDegradedStart(t *testing.T) {
 	})
 	if _, err := r2.Step(context.Background()); err == nil || bad.auth != 0 {
 		t.Fatalf("minted without rediscovery: auth=%d err=%v", bad.auth, err)
+	}
+}
+
+func TestR3C1ForeignSwitchClosesEstablishedForward(t *testing.T) {
+	if OwnershipCacheTTL > time.Second {
+		t.Fatalf("ownership cache %s exceeds 1s", OwnershipCacheTTL)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		accepted <- c
+		buf := make([]byte, 4)
+		_, _ = io.ReadFull(c, buf)
+		_, _ = c.Write(buf)
+		_, _ = io.Copy(io.Discard, c)
+		_ = c.Close()
+	}()
+
+	be := &r3c1LiveBackend{fakeBackend: fakeBackend{
+		state: ipn.Running,
+		prefs: ipn.Prefs{ControlURL: ours, WantRunning: true},
+	}}
+	owner := NewLiveOwner(LiveOwnerConfig{
+		Backend:    be,
+		Mode:       ModeSystem,
+		OurControl: ours,
+		CacheTTL:   20 * time.Millisecond,
+		Snapshot:   func() Snapshot { return Snapshot{Phase: PhaseConnected, CurrentControl: ours} },
+		Identity:   func(string, string) bool { return true },
+	})
+	access, err := StartAccess(&net.Dialer{}, []Forward{{Listen: "127.0.0.1:0", Target: ln.Addr().String()}}, "", AccessOptions{Owner: owner}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = access.Close() })
+
+	conn, err := net.Dial("tcp", access.ForwardStatus()[0].Listen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != "ping" {
+		t.Fatalf("echo %q", buf)
+	}
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("echo server did not accept")
+	}
+
+	be.setControl("https://foreign.example")
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	one := make([]byte, 1)
+	_, err = conn.Read(one)
+	if err == nil {
+		t.Fatal("stream stayed open after the tailnet switch")
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		t.Fatal("timed out waiting for the stream to close")
 	}
 }
 
