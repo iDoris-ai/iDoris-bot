@@ -758,6 +758,9 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	plan.AllowInsecure = held.AllowInsecure
 	plan.TokenFile = paths.token
 	plan.ConfigPath = paths.config
+	// The written config drops control_url when the enrollment authority
+	// changes. Completion has to wait for this authenticated server instead.
+	plan.DiscoveryControlURL = strings.TrimSpace(held.ControlURL)
 	if raw, err := os.ReadFile(plan.ConfigPath); err == nil {
 		gateway.NoteControlPinDrop(&plan, gateway.PreviousEnrollURL(raw))
 	}
@@ -868,6 +871,14 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
+	}
+	// A stub Apply can omit these. The plan already holds the identity the
+	// operator confirmed, and the page waits on that identity.
+	if strings.TrimSpace(res.DiscoveryControlURL) == "" {
+		res.DiscoveryControlURL = strings.TrimSpace(plan.DiscoveryControlURL)
+	}
+	if strings.TrimSpace(res.Tenant) == "" {
+		res.Tenant = strings.TrimSpace(plan.Tenant)
 	}
 	writeJSON(w, http.StatusOK, res)
 }
