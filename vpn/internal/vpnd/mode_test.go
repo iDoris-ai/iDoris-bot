@@ -13,6 +13,7 @@ func TestDecideMode(t *testing.T) {
 	const our = "https://vpn.idoris.example"
 	foreign := "https://controlplane.tailscale.com"
 	running := ipn.Running.String()
+	starting := ipn.Starting.String()
 	needsLogin := ipn.NeedsLogin.String()
 	noState := ipn.NoState.String()
 	stopped := ipn.Stopped.String()
@@ -31,6 +32,10 @@ func TestDecideMode(t *testing.T) {
 		{"auto empty request is auto", "", false, SystemView{}, ModeEmbedded, "unreachable"},
 		{"auto fresh empty url", ModeAuto, false, SystemView{Reachable: true, BackendState: noState}, ModeSystem, "not logged in"},
 		{"auto needs login empty url", ModeAuto, false, SystemView{Reachable: true, BackendState: needsLogin}, ModeSystem, "not logged in"},
+		{"auto empty url while running is foreign saas", ModeAuto, false, SystemView{Reachable: true, BackendState: running}, ModeEmbedded, "foreign control server"},
+		{"auto empty url while starting is foreign", ModeAuto, false, SystemView{Reachable: true, BackendState: starting}, ModeEmbedded, "foreign control server"},
+		{"auto empty url while stopped is foreign", ModeAuto, false, SystemView{Reachable: true, BackendState: stopped}, ModeEmbedded, "foreign control server"},
+		{"auto empty url running with explicit takeover", ModeAuto, true, SystemView{Reachable: true, BackendState: running}, ModeSystem, "takeover explicitly enabled"},
 		{"auto already ours", ModeAuto, false, SystemView{Reachable: true, BackendState: running, ControlURL: our + "/"}, ModeSystem, "already on the iDoris"},
 		{"auto stopped on ours", ModeAuto, false, SystemView{Reachable: true, BackendState: stopped, ControlURL: our}, ModeSystem, "already on the iDoris"},
 		{"auto has our profile while current is foreign", ModeAuto, false, SystemView{Reachable: true, BackendState: running, ControlURL: foreign, HasOurProfile: true}, ModeSystem, "iDoris profile"},
@@ -53,6 +58,32 @@ func TestDecideMode(t *testing.T) {
 	}
 	if _, err := DecideMode("both", false, SystemView{}, our); err == nil {
 		t.Fatal("invalid mode must fail")
+	}
+}
+
+func TestForeignControlEmptyURL(t *testing.T) {
+	const our = "https://vpn.idoris.example"
+	cases := []struct {
+		control string
+		state   string
+		want    bool
+	}{
+		{"", ipn.NoState.String(), false},
+		{"", ipn.NeedsLogin.String(), false},
+		{"", "", false},
+		{"", ipn.Running.String(), true},
+		{"", ipn.Starting.String(), true},
+		{"", ipn.Stopped.String(), true},
+		{"  ", ipn.Running.String(), true},
+		{our, ipn.Running.String(), false},
+		{our + "/", ipn.Stopped.String(), false},
+		{"https://controlplane.tailscale.com", ipn.NeedsLogin.String(), true},
+		{"https://controlplane.tailscale.com", ipn.Stopped.String(), true},
+	}
+	for _, tc := range cases {
+		if got := foreignControl(tc.control, our, tc.state); got != tc.want {
+			t.Errorf("foreignControl(%q, ours, %q)=%v, want %v", tc.control, tc.state, got, tc.want)
+		}
 	}
 }
 
