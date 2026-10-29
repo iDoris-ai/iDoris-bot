@@ -347,12 +347,16 @@ func rejectUnsafePath(p string) error {
 }
 
 func renderSchtasksCreate(exe, configPath string) []string {
+	return renderSchtasksCreateIn(exe, configPath, windowsConfigDir)
+}
+
+func renderSchtasksCreateIn(exe, configPath, stateDir string) []string {
 	// schtasks has no environment field. cmd /c sets STATE_DIRECTORY for this
 	// process only. Under SYSTEM, os.UserConfigDir is the system profile;
 	// state, the embedded node, and locks must stay in ProgramData, which
 	// the installer creates and locks down with icacls. No space before &&:
 	// cmd would otherwise include it in the value.
-	tr := fmt.Sprintf("cmd /c set STATE_DIRECTORY=%s&& %s run --config %s", quoteTask(windowsConfigDir), quoteTask(exe), quoteTask(configPath))
+	tr := fmt.Sprintf("cmd /c set STATE_DIRECTORY=%s&& %s run --config %s", quoteTask(stateDir), quoteTask(exe), quoteTask(configPath))
 	return []string{"/Create", "/TN", windowsTaskName, "/SC", "ONSTART", "/RU", "SYSTEM", "/RL", "HIGHEST", "/F", "/TR", tr}
 }
 
@@ -557,19 +561,28 @@ func installWindowsTask(configPath string) error {
 		return err
 	}
 	exeDir, exe := systemExecutable(runtime.GOOS, os.Getenv("ProgramFiles"))
-	if err := copyProtectedExecutable(src, exeDir, exe); err != nil {
+	staging, err := windowsStagingPath()
+	if err != nil {
 		return err
 	}
-	active := systemServiceActive("windows")
-	// Protect the destination directory before any secret byte is written.
-	// A later failure removes that partial installation.
-	if err := arrangeWindowsInstall(realWindowsInstallOps(exe), exeDir, exe, configPath); err != nil {
-		return err
+	spec := windowsReplaceSpec{
+		SrcExe:     src,
+		LiveExe:    exe,
+		ExeDir:     exeDir,
+		ConfigSrc:  configPath,
+		LiveDir:    windowsConfigDir,
+		LiveConfig: windowsConfigPath,
+		StagingDir: staging,
+		Active:     systemServiceActive("windows"),
 	}
-	if active {
-		if err := activateSystemService("windows", true); err != nil {
-			return err
-		}
+	if sameInstallExe(src, exe) {
+		// This process is mapped from the installed image. Replacing that
+		// path fails while we are running, so the task is pointed at a
+		// versioned copy instead.
+		spec.SelfPID = os.Getpid()
+	}
+	if err := replaceWindowsTask(spec); err != nil {
+		return err
 	}
 	fmt.Println("installed scheduled task", windowsTaskName)
 	fmt.Println("config:", windowsConfigPath)
@@ -823,4 +836,8 @@ func writeRootFile(dir, path string, data []byte, mode os.FileMode) error {
 		return err
 	}
 	return os.WriteFile(path, data, mode) //nolint:gosec // callers pass a fixed install path, not a request path
+}
+
+func init() {
+	_ = realWindowsInstallOps
 }
