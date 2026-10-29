@@ -2,8 +2,10 @@ package vpnd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"tailscale.com/ipn"
 )
@@ -41,6 +43,30 @@ type SystemView struct {
 type ModeDecision struct {
 	Mode   string
 	Reason string
+	// Waiting is set when a local-ai or gateway role needs the system
+	// tailscaled and it is not reachable. The daemon must not start an
+	// embedded node; it reports phase waiting-for-tailscaled and retries.
+	Waiting bool
+}
+
+// RequiresSystem reports whether role serves inbound traffic and therefore
+// cannot use embedded mode. member and admin may use either mode.
+func RequiresSystem(role string) bool {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "local-ai", "gateway":
+		return true
+	default:
+		return false
+	}
+}
+
+// WaitingTailscaledMessage is the operator-facing text for phase
+// waiting-for-tailscaled.
+func WaitingTailscaledMessage(role string) string {
+	if strings.TrimSpace(role) == "" {
+		role = "local-ai"
+	}
+	return "role " + role + " requires the official tailscaled because embedded mode cannot receive inbound connections. Install Tailscale, start it, and leave idoris-vpnd running; it keeps retrying"
 }
 
 // DecideMode chooses system or embedded.
@@ -56,32 +82,110 @@ type ModeDecision struct {
 // Running, Starting, or Stopped, and a non-empty foreign URL in NeedsLogin,
 // uses system only when takeover was explicitly enabled. Otherwise auto uses
 // embedded, including when tailscaled is not reachable.
-func DecideMode(requested string, takeoverExplicit bool, view SystemView, ourControl string) (ModeDecision, error) {
+//
+// local-ai and gateway never select embedded: embedded mode is outbound-only
+// and cannot serve inbound traffic. auto and system wait (Waiting) while
+// tailscaled is unreachable. A foreign login stays on system mode and is left
+// unchanged until takeover is explicit. An explicit embedded request for
+// those roles is a configuration error. member and admin keep the desktop
+// behaviour above.
+func DecideMode(requested, role string, takeoverExplicit bool, view SystemView, ourControl string) (ModeDecision, error) {
 	switch requested {
 	case "", ModeAuto:
 	case ModeSystem:
+		if RequiresSystem(role) && !view.Reachable {
+			return ModeDecision{Mode: ModeSystem, Reason: "waiting-for-tailscaled", Waiting: true}, nil
+		}
 		return ModeDecision{Mode: ModeSystem, Reason: "configured system"}, nil
 	case ModeEmbedded:
+		if RequiresSystem(role) {
+			return ModeDecision{}, fmt.Errorf("role %s cannot use embedded mode: embedded mode is outbound-only and cannot serve inbound traffic; set mode to system or auto and run the official tailscaled", role)
+		}
 		return ModeDecision{Mode: ModeEmbedded, Reason: "configured embedded"}, nil
 	default:
 		return ModeDecision{}, fmt.Errorf("mode %q: want auto, system, or embedded", requested)
 	}
+	if RequiresSystem(role) {
+		if !view.Reachable {
+			return ModeDecision{Mode: ModeSystem, Reason: "waiting-for-tailscaled", Waiting: true}, nil
+		}
+		return serviceMode(takeoverExplicit, view, ourControl, role), nil
+	}
 	if !view.Reachable {
 		return ModeDecision{Mode: ModeEmbedded, Reason: "tailscaled unreachable"}, nil
 	}
+	return desktopMode(takeoverExplicit, view, ourControl), nil
+}
+
+func serviceMode(takeoverExplicit bool, view SystemView, ourControl, role string) ModeDecision {
+	d := desktopMode(takeoverExplicit, view, ourControl)
+	if d.Mode == ModeEmbedded {
+		return ModeDecision{
+			Mode:   ModeSystem,
+			Reason: "role " + role + " requires system mode; the foreign tailnet is left unchanged until takeover is enabled",
+		}
+	}
+	return d
+}
+
+func desktopMode(takeoverExplicit bool, view SystemView, ourControl string) ModeDecision {
 	if ourControl != "" && SameControlURL(view.ControlURL, ourControl) {
-		return ModeDecision{Mode: ModeSystem, Reason: "system tailscaled is already on the iDoris control server"}, nil
+		return ModeDecision{Mode: ModeSystem, Reason: "system tailscaled is already on the iDoris control server"}
 	}
 	if !foreignControl(view.ControlURL, ourControl, view.BackendState) {
-		return ModeDecision{Mode: ModeSystem, Reason: "system tailscaled is not logged in"}, nil
+		return ModeDecision{Mode: ModeSystem, Reason: "system tailscaled is not logged in"}
 	}
 	if takeoverExplicit {
-		return ModeDecision{Mode: ModeSystem, Reason: "takeover explicitly enabled"}, nil
+		return ModeDecision{Mode: ModeSystem, Reason: "takeover explicitly enabled"}
 	}
 	return ModeDecision{
 		Mode:   ModeEmbedded,
 		Reason: "system tailscaled is logged into a foreign control server and takeover is not enabled",
-	}, nil
+	}
+}
+
+const (
+	tailscaledWaitMin = 2 * time.Second
+	tailscaledWaitMax = 30 * time.Second
+)
+
+// ProbeUntilReady repeats a read-only probe until DecideMode is not waiting
+// or ctx ends. local-ai and gateway stay here while tailscaled is down.
+// Backoff starts at 2s and doubles up to 30s. sleep is called only while
+// waiting; a test passes a fake clock. onWait runs before each sleep.
+func ProbeUntilReady(ctx context.Context, requested, role string, takeoverExplicit bool, ourControl string, probe func(context.Context) SystemView, onWait func(ModeDecision), sleep func(context.Context, time.Duration) error) (ModeDecision, error) {
+	if probe == nil {
+		probe = func(context.Context) SystemView { return SystemView{} }
+	}
+	backoff := tailscaledWaitMin
+	for {
+		if err := ctx.Err(); err != nil {
+			return ModeDecision{}, err
+		}
+		var view SystemView
+		if requested == "" || requested == ModeAuto || RequiresSystem(role) {
+			view = probe(ctx)
+		}
+		d, err := DecideMode(requested, role, takeoverExplicit, view, ourControl)
+		if err != nil || !d.Waiting {
+			return d, err
+		}
+		if onWait != nil {
+			onWait(d)
+		}
+		if sleep == nil {
+			return d, errors.New("waiting for tailscaled without a retry function")
+		}
+		if err := sleep(ctx, backoff); err != nil {
+			return d, err
+		}
+		if backoff < tailscaledWaitMax {
+			backoff *= 2
+			if backoff > tailscaledWaitMax {
+				backoff = tailscaledWaitMax
+			}
+		}
+	}
 }
 
 // foreignControl reports whether control is a persisted login to some server

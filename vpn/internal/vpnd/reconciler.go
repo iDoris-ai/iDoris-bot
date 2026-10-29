@@ -32,6 +32,10 @@ const (
 	PhaseRoutesPending Phase = "routes-pending-approval"
 	PhaseBlocked       Phase = "blocked-foreign-tailnet"
 	PhaseError         Phase = "error"
+	// PhaseWaitingTailscaled means a local-ai or gateway role needs the
+	// official tailscaled and it is not reachable. Embedded mode is not a
+	// fallback: it cannot receive inbound connections.
+	PhaseWaitingTailscaled Phase = "waiting-for-tailscaled"
 	// PhaseMissingTags means the node is up but a tagged role (local-ai,
 	// gateway) has no Self.Tags. Enrollment succeeded; the ACL identity did not.
 	PhaseMissingTags Phase = "missing-node-tags"
@@ -274,6 +278,15 @@ func (r *Reconciler) backoff(failures int) time.Duration {
 func (r *Reconciler) Step(ctx context.Context) (Snapshot, error) {
 	st, err := r.be.Status(ctx)
 	if err != nil {
+		if RequiresSystem(r.opt.Role) {
+			msg := WaitingTailscaledMessage(r.opt.Role)
+			snap := r.set(func(s *Snapshot) {
+				s.Phase = PhaseWaitingTailscaled
+				s.LastError = msg
+				s.Warnings = []string{msg}
+			})
+			return snap, fmt.Errorf("%s: %w", msg, err)
+		}
 		return r.fail(fmt.Errorf("tailscaled unreachable: %w", err)), err
 	}
 	prefs, err := r.be.GetPrefs(ctx)
@@ -364,6 +377,13 @@ func (r *Reconciler) graceFor(n int) time.Duration {
 	return min(g, maxLoginGrace)
 }
 
+func foreignBlockedMessage(role, url string) string {
+	if RequiresSystem(role) {
+		return fmt.Sprintf("tailscaled is logged into %s; takeover is disabled. Role %s cannot use embedded mode. Set takeover: true to switch this machine onto the iDoris control server", url, role)
+	}
+	return fmt.Sprintf("tailscaled is logged into %s; takeover is disabled. Set mode: embedded to run alongside it, or takeover: true to switch this machine", url)
+}
+
 func (r *Reconciler) stepForeign(ctx context.Context, st *ipnstate.Status, prefs *ipn.Prefs) (Snapshot, error) {
 	// Ownership first. Switching to a saved iDoris profile, SwitchToEmptyProfile,
 	// and login are all mutations of the active profile. A saved profile must
@@ -375,7 +395,7 @@ func (r *Reconciler) stepForeign(ctx context.Context, st *ipnstate.Status, prefs
 		}
 		return r.set(func(s *Snapshot) {
 			s.Phase = PhaseBlocked
-			s.LastError = fmt.Sprintf("tailscaled is logged into %s; takeover is disabled. Set mode: embedded to run alongside it, or takeover: true to switch this machine", url)
+			s.LastError = foreignBlockedMessage(r.opt.Role, url)
 		}), nil
 	}
 	cur, all, err := r.be.ProfileStatus(ctx)
