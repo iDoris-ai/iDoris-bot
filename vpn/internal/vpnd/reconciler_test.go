@@ -409,6 +409,24 @@ func TestBackoffIsBoundedAndJittered(t *testing.T) {
 	}
 }
 
+func TestLoginDoesNotSendAdvertiseTags(t *testing.T) {
+	want := []netip.Prefix{netip.MustParsePrefix("10.251.73.10/32")}
+	be := &fakeBackend{state: ipn.NeedsLogin}
+	r := newR(t, be, &countingKeys{}, func(o *Options) {
+		o.AdvertiseRoutes = want
+		o.AdvertiseTags = []string{"tag:acme-gateway"}
+	})
+	if _, err := r.Step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(be.prefs.AdvertiseTags) != 0 {
+		t.Fatalf("login prefs sent tags %v; Headscale v0.29.6 rejects that on a pre-auth key", be.prefs.AdvertiseTags)
+	}
+	if !sameRoutes(be.prefs.AdvertiseRoutes, want) {
+		t.Fatalf("routes %+v", be.prefs.AdvertiseRoutes)
+	}
+}
+
 func TestLoginAdvertisesRoutes(t *testing.T) {
 	want := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("192.168.1.0/24")}
 	be := &fakeBackend{state: ipn.NeedsLogin}
