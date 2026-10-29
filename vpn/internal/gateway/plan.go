@@ -198,14 +198,16 @@ func LoadPlan(r io.Reader) (Plan, error) {
 	return p, nil
 }
 
-// AdminCommand is the Headscale CLI that approves routes. identifier is the
-// node hostname; Headscale also accepts the numeric node id from `nodes list`.
+// AdminCommand is the Headscale CLI that approves routes.
+// v0.29.6 --identifier is the numeric node id from `headscale nodes list`.
+// A hostname is rejected (ParseUint). The name is only a comment so the
+// operator can find the row.
 func AdminCommand(hostname string, routes []string) string {
-	id := hostname
-	if id == "" {
-		id = "<NODE>"
+	name := strings.TrimSpace(hostname)
+	if name == "" {
+		name = "<NODE>"
 	}
-	return "headscale nodes approve-routes --identifier " + id + " --routes " + strings.Join(routes, ",")
+	return "headscale nodes approve-routes --identifier <ID> --routes " + strings.Join(routes, ",") + "  # <ID> is the numeric id of " + name + " from `headscale nodes list`"
 }
 
 func baseSteps(forward bool) []Step {
