@@ -511,11 +511,6 @@ func TestShorterRewriteDropsTrailingBytes(t *testing.T) {
 
 func TestSaveFileHoldsLockAcrossTruncate(t *testing.T) {
 	path := writeHashes(t, 0o600, []string{HashToken("seed-token")})
-	cfg, err := LoadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg.ControlURL = "https://other.example.org"
 	release := make(chan struct{})
 	started := make(chan struct{})
 	var once sync.Once
@@ -525,7 +520,12 @@ func TestSaveFileHoldsLockAcrossTruncate(t *testing.T) {
 	}
 	t.Cleanup(func() { afterTruncate = nil })
 	saveErr := make(chan error, 1)
-	go func() { saveErr <- SaveFile(path, cfg) }()
+	go func() {
+		saveErr <- updateConfig(path, func(cfg *Config) error {
+			cfg.ControlURL = "https://other.example.org"
+			return nil
+		})
+	}()
 	<-started
 	readDone := make(chan error, 1)
 	go func() {
@@ -567,14 +567,17 @@ func TestConcurrentSaveFileStaysParseable(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(8)
 		for i := range 8 {
-			cfg := base
+			url := base.ControlURL
 			if i%2 == 1 {
-				cfg = &alt
+				url = alt.ControlURL
 			}
-			go func() {
+			go func(url string) {
 				defer wg.Done()
-				_ = SaveFile(path, cfg)
-			}()
+				_ = updateConfig(path, func(cfg *Config) error {
+					cfg.ControlURL = url
+					return nil
+				})
+			}(url)
 		}
 		wg.Wait()
 		got, err := LoadFile(path)
