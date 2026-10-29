@@ -75,6 +75,42 @@ func TestStatusViewAddsModeAndForwards(t *testing.T) {
 	}
 }
 
+func TestEmbeddedMemberWithoutPathWarns(t *testing.T) {
+	v := View{Source: stubStatus{snap: Snapshot{Phase: PhaseConnected, Role: "member"}}, Mode: ModeEmbedded}
+	snap := v.Snapshot()
+	if len(snap.Warnings) != 1 || snap.Warnings[0] != EmbeddedNoPathWarning {
+		t.Fatalf("warnings %+v", snap.Warnings)
+	}
+	withFwd := View{Source: stubStatus{snap: Snapshot{
+		Role:     "member",
+		Forwards: []ForwardStatus{{Listen: "127.0.0.1:9", Target: "h:1", State: "listening"}},
+	}}, Mode: ModeEmbedded}
+	if w := withFwd.Snapshot().Warnings; len(w) != 0 {
+		t.Fatalf("forward is a path: %v", w)
+	}
+	withSOCKS := View{Source: stubStatus{snap: Snapshot{
+		Role:   "member",
+		SOCKS5: &SOCKS5Status{Listen: "127.0.0.1:1055", State: "listening"},
+	}}, Mode: ModeEmbedded}
+	if w := withSOCKS.Snapshot().Warnings; len(w) != 0 {
+		t.Fatalf("socks5 is a path: %v", w)
+	}
+	admin := View{Source: stubStatus{snap: Snapshot{Role: "admin"}}, Mode: ModeEmbedded}
+	if w := admin.Snapshot().Warnings; len(w) != 0 {
+		t.Fatalf("admin is not the member warning: %v", w)
+	}
+	system := View{Source: stubStatus{snap: Snapshot{Role: "member"}}, Mode: ModeSystem}
+	if w := system.Snapshot().Warnings; len(w) != 0 {
+		t.Fatalf("system mode: %v", w)
+	}
+
+	h := httptest.NewRecorder()
+	StatusHandler(FixedSnapshot(Snapshot{Phase: PhaseWaitingTailscaled, Role: "local-ai"}), "v").ServeHTTP(h, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if h.Code != http.StatusServiceUnavailable || !strings.Contains(h.Body.String(), string(PhaseWaitingTailscaled)) {
+		t.Fatalf("health %d %s", h.Code, h.Body.String())
+	}
+}
+
 func TestStatusPrintsPendingRoutes(t *testing.T) {
 	src := stubStatus{snap: Snapshot{
 		Phase: PhaseRoutesPending,
