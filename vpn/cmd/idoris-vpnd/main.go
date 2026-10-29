@@ -355,7 +355,7 @@ func runCmd(args []string) error {
 		return err
 	}
 
-	opt, err := accessOptions(cfg, node.Mode, controlURL, rec)
+	opt, err := accessOptions(cfg, node.Mode, controlURL, rec, node.Backend, binding)
 	if err != nil {
 		return err
 	}
@@ -447,15 +447,32 @@ func openBinding(cfg *vpnd.Config) (*vpnd.StateFile, error) {
 	return vpnd.OpenState(path)
 }
 
-// accessOptions is what run passes to StartAccess. Embedded mode leaves the
-// gate open. System mode opens it only while the reconciler snapshot says the
-// live control URL is ours and the phase still carries traffic.
-// CurrentControl is that live URL. Snapshot.ControlURL is always ours.
+// accessOptions is what run passes to StartAccess. The gate reads LocalAPI
+// (prefs and status) with a cache of at most one second, and every accepted
+// connection is tied to the reconciler's ownership generation. Embedded mode
+// is not exempt: it also needs a confirmed identity and a connected phase.
 // A SOCKS5 listener with no explicit credential file gets one generated at
 // <state_dir>/socks5.auth.
-func accessOptions(cfg *vpnd.Config, mode, ourControl string, src vpnd.StatusSource) (vpnd.AccessOptions, error) {
+func accessOptions(cfg *vpnd.Config, mode, ourControl string, src vpnd.StatusSource, be vpnd.Backend, binding *vpnd.StateFile) (vpnd.AccessOptions, error) {
+	var owner *vpnd.LiveOwner
+	if rec, ok := src.(*vpnd.Reconciler); ok {
+		rec.SetRunMode(mode)
+		owner = vpnd.NewLiveOwner(vpnd.LiveOwnerConfig{
+			Backend:    be,
+			Mode:       mode,
+			OurControl: ourControl,
+			State:      binding,
+			Snapshot:   rec.Snapshot,
+			Identity:   rec.AccessIdentityOK,
+		})
+		rec.SetOwner(owner)
+	}
 	opt := vpnd.AccessOptions{
+		Owner: owner,
 		Gate: func() bool {
+			if owner != nil {
+				return owner.Allow()
+			}
 			var current string
 			var phase vpnd.Phase
 			if src != nil {
@@ -463,7 +480,7 @@ func accessOptions(cfg *vpnd.Config, mode, ourControl string, src vpnd.StatusSou
 				current = snap.CurrentControl
 				phase = snap.Phase
 			}
-			return vpnd.AccessOpen(mode, current, ourControl, phase)
+			return vpnd.AccessOpen(mode, current, ourControl, phase, false)
 		},
 		MaxConnections: cfg.MaxConnections,
 		DialTimeout:    cfg.DialTimeoutDuration(),
