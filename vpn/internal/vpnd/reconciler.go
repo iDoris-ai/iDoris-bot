@@ -588,7 +588,7 @@ func (r *Reconciler) writeIdentity() error {
 	if r.opt.State == nil || !r.opt.Identity.Known {
 		return nil
 	}
-	return r.opt.State.SetIdentity(r.opt.ControlURL, r.opt.Identity.Tenant, r.opt.Identity.Role, r.opt.Identity.TokenFingerprint)
+	return r.opt.State.SetIdentity(r.opt.ControlURL, r.opt.Identity.Tenant, r.opt.Identity.Role, r.opt.Identity.TokenFingerprint, "", "")
 }
 
 // missingNodeTags reports a warning when a tagged role has an empty tag set.
