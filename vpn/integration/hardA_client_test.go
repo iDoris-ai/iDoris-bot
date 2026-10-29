@@ -673,9 +673,3 @@ func hardAEnrollDown(t *testing.T, h hardA, mints *countingMinter, enrollURL, to
 	t.Logf("enroll down resume: phase=%v reachable=%v attempts=%v warnings=%v keys=%d",
 		got["phase"], got["enroll_reachable"], got["login_attempts"], got["warnings"], mints.n.Load())
 }
-
-func init() {
-	var touch1 hardAProfile
-	_ = touch1.Tailnet
-	_ = touch1.Account
-}
