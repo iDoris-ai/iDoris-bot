@@ -112,8 +112,29 @@ func (e *wizEnv) down(t *testing.T) {
 }
 
 func wizPolicy(echo, echoB string) string {
-	panic("stub")
+	// The tag is applied by the pre-auth key (tenant acl_tags), not by a
+	// client advertise-tags request. Headscale v0.29.6 rejects the latter.
+	//
+	// The same tag is an ACL source. Headscale only copies an approved
+	// primary onto the advertising node's own netmap when that node can
+	// access the prefix (mapper.WithSelfNode → ReduceRoutes). Without
+	// this, tailscaled's Status.Self.PrimaryRoutes stays empty and
+	// idoris-vpnd keeps reporting routes-pending-approval after the
+	// server has already approved the route. echo B is a destination
+	// only ("<ip>/32:8740"), never an autoApprovers key.
+	return fmt.Sprintf(`{
+  "groups": {"group:admins": ["admin@"]},
+  "tagOwners": {"tag:wiz-gateway": ["group:admins"]},
+  "autoApprovers": {
+    "routes": {%q: ["tag:wiz-gateway"]}
+  },
+  "acls": [
+    {"action": "accept", "src": ["wiz@", "tag:wiz-gateway"], "dst": [%q, %q]}
+  ]
 }
+`, echo+"/32", echo+"/32:8740", echoB+"/32:8740")
+}
+
 func wizInvite(t *testing.T, bin, cfgPath, hint, enrollURL string) (string, join.Payload) {
 	t.Helper()
 	cmd := exec.Command(bin, "invite",
