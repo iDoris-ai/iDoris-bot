@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/enroll"
+	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/gateway"
 	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/headscale"
 	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/join"
 	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/vpnd"
@@ -464,8 +465,50 @@ func (e *wizEnv) assertJoinPlan(t *testing.T, out string, nets wizNets, route st
 	panic("stub")
 }
 func (e *wizEnv) assertWrittenConfig(t *testing.T, host, route, office string, auto bool) {
-	panic("stub")
+	t.Helper()
+	raw := e.must(t, 10*time.Second, "exec", "-T", host, "cat", "/root/.idoris/vpn.json")
+	if strings.Contains(raw, "idv1_") || strings.Contains(raw, office) {
+		t.Fatalf("vpn.json leaked a token or advertised the office prefix:\n%s", e.redact(raw))
+	}
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var cfg vpnd.Config
+	if err := dec.Decode(&cfg); err != nil {
+		t.Fatalf("vpn.json: %v\n%s", err, raw)
+	}
+	if cfg.Mode != "system" || cfg.Role != join.RoleGateway || cfg.AcceptRoutes || !cfg.EnrollAllowInsecure {
+		t.Fatalf("config mode=%s role=%s accept=%v insecure=%v", cfg.Mode, cfg.Role, cfg.AcceptRoutes, cfg.EnrollAllowInsecure)
+	}
+	if len(cfg.AdvertiseRoutes) != 1 || cfg.AdvertiseRoutes[0] != route {
+		t.Fatalf("advertise_routes %v", cfg.AdvertiseRoutes)
+	}
+	if len(cfg.AdvertiseTags) != 1 || cfg.AdvertiseTags[0] != "tag:wiz-gateway" {
+		t.Fatalf("tags %v", cfg.AdvertiseTags)
+	}
+	if cfg.EnrollToken != "" || cfg.AuthKey != "" || cfg.EnrollTokenFile == "" {
+		t.Fatal("config stored a plaintext secret or missed the token file")
+	}
+	planRaw := e.must(t, 10*time.Second, "exec", "-T", host, "cat", "/root/.idoris/gateway-plan.json")
+	if strings.Contains(planRaw, "idv1_") {
+		t.Fatal("plan file contains a token")
+	}
+	var plan gateway.Plan
+	if err := json.Unmarshal([]byte(planRaw), &plan); err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Routes) != 1 || plan.Routes[0] != route || plan.Network != office || plan.WholeSubnet || plan.WillAutoApprove != auto {
+		t.Fatalf("plan routes %v network %s whole %v auto %v", plan.Routes, plan.Network, plan.WholeSubnet, plan.WillAutoApprove)
+	}
+	fwd := e.must(t, 10*time.Second, "exec", "-T", host, "cat", "/etc/sysctl.d/99-idoris-vpn.conf")
+	if !strings.Contains(fwd, "net.ipv4.ip_forward = 1") {
+		t.Fatalf("sysctl drop-in:\n%s", fwd)
+	}
+	proc := e.must(t, 10*time.Second, "exec", "-T", host, "cat", "/proc/sys/net/ipv4/ip_forward")
+	if strings.TrimSpace(proc) != "1" {
+		t.Fatalf("ip_forward=%q", proc)
+	}
 }
+
 func (e *wizEnv) startDaemon(t *testing.T, host string) {
 	t.Helper()
 	e.must(t, 20*time.Second, "exec", "-d", "-e", "HOME=/root", "-T", host,
