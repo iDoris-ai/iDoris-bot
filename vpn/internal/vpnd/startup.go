@@ -11,6 +11,11 @@ import (
 // Enrollment is contacted again only when a login is actually required.
 const EnrollUnreachableWarning = "enrollment service is unreachable; continuing with the saved control URL and the existing node identity. A new login is attempted only when this node actually needs one"
 
+// IdentityUnconfirmedWarning is shown when discovery failed and the token
+// now in hand does not match the saved binding, or the running node is not
+// the one that binding names. Access stays closed until discovery succeeds.
+const IdentityUnconfirmedWarning = "discovery failed and the saved enrollment identity is not confirmed for this token; access stays closed until discovery succeeds"
+
 // ResolveStartupControl picks the control URL to run with.
 //
 // discoveredOK means /v1/discover returned a URL. A pinned URL that does not
