@@ -102,6 +102,9 @@ type Options struct {
 	// Role is member, local-ai, gateway, or admin. Empty is treated as member
 	// for tag checks. Discovery is the source of truth when it ran.
 	Role string
+	// Mode is system or embedded. Empty in tests that do not bind a profile.
+	// System mode records the LocalAPI profile ID on the identity binding.
+	Mode string
 	// Identity is the credential from /v1/discover. Known is false when the
 	// daemon has no fresh discovery (static key, or enrollment is down).
 	Identity Identity
@@ -189,6 +192,8 @@ type Reconciler struct {
 	// rewrite the binding while the old node is still the one that is up.
 	awaitingIdentity bool
 	identityLoginOK  bool
+	allowNodeBackfill bool
+	owner             *LiveOwner
 }
 
 const (
@@ -269,6 +274,22 @@ func (r *Reconciler) set(mutate func(s *Snapshot)) Snapshot {
 	r.snap.PreviousProfile = string(r.previousProfile)
 	r.snap.UpdatedAt = r.now()
 	return r.snap
+}
+
+// SetOwner attaches the access gate's generation. Nil disables bumps.
+// The listener is started after this returns and before Run.
+func (r *Reconciler) SetOwner(o *LiveOwner) {
+	r.mu.Lock()
+	r.owner = o
+	r.mu.Unlock()
+}
+
+// SetRunMode records system or embedded before the first reconcile pass.
+// System mode is what makes the profile ID part of the identity binding.
+func (r *Reconciler) SetRunMode(mode string) {
+	r.mu.Lock()
+	r.opt.Mode = mode
+	r.mu.Unlock()
 }
 
 // Run loops Step until ctx is cancelled.
@@ -589,6 +610,80 @@ func (r *Reconciler) writeIdentity() error {
 		return nil
 	}
 	return r.opt.State.SetIdentity(r.opt.ControlURL, r.opt.Identity.Tenant, r.opt.Identity.Role, r.opt.Identity.TokenFingerprint, "", "")
+}
+
+func (r *Reconciler) identityFlags() (awaiting, loginOK bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.awaitingIdentity, r.identityLoginOK
+}
+
+// bindingMatches reports whether the stored binding names this credential
+// and the node that is actually running. An empty binding matches nothing:
+// an already-running node must be enrolled once before it is certified.
+// A fingerprint-only change still matches; writeIdentity updates the fingerprint.
+func (r *Reconciler) bindingMatches(nodeID, profileID string) bool {
+	if r.opt.State == nil {
+		return true
+	}
+	bound := r.opt.State.Get()
+	if bound.Tenant == "" && bound.Role == "" && bound.NodeID == "" && bound.ProfileID == "" {
+		return false
+	}
+	ident := r.boundIdentity()
+	if bound.Tenant != ident.Tenant || bound.Role != ident.Role {
+		return false
+	}
+	if nodeID != "" && bound.NodeID != "" && bound.NodeID != nodeID {
+		return false
+	}
+	if nodeID != "" && bound.NodeID == "" && !r.nodeBackfill() {
+		return false
+	}
+	if r.opt.Mode == ModeSystem && profileID != "" && bound.ProfileID != "" && bound.ProfileID != profileID {
+		return false
+	}
+	if r.opt.Mode == ModeSystem && profileID != "" && bound.ProfileID == "" && !r.nodeBackfill() {
+		return false
+	}
+	return true
+}
+
+func (r *Reconciler) nodeBackfill() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.allowNodeBackfill
+}
+
+func (r *Reconciler) boundIdentity() Identity {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.opt.Identity
+}
+
+// AccessIdentityOK is the gate's view of enrollment. It is false during an
+// identity transition that has not finished logging in, and false when the
+// binding does not name the node LocalAPI is showing. A degraded start with
+// a previously stored binding stays confirmed: discovery did not contradict it.
+func (r *Reconciler) AccessIdentityOK(nodeID, profileID string) bool {
+	awaiting, loginOK := r.identityFlags()
+	if awaiting && !loginOK {
+		return false
+	}
+	if !r.boundIdentity().Known {
+		if r.opt.State == nil {
+			return true
+		}
+		b := r.opt.State.Get()
+		return b.Tenant != "" || b.Role != "" || b.NodeID != ""
+	}
+	if r.opt.State == nil {
+		return !awaiting
+	}
+	if awaiting {
+		return false
+	}
+	return r.bindingMatches(nodeID, profileID)
 }
 
 // missingNodeTags reports a warning when a tagged role has an empty tag set.
