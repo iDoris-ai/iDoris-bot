@@ -162,10 +162,19 @@
   var confirmBox = document.getElementById("confirm-authority");
   var replaceBox = document.getElementById("replace-existing");
   var enableBtn = document.getElementById("enable");
+  var shownAuthority = "";
+  var shownRev = 0;
   function syncEnable() {
     enableBtn.disabled = !confirmBox.checked;
   }
   confirmBox.addEventListener("change", syncEnable);
+
+  function clearConfirmation() {
+    confirmBox.checked = false;
+    shownAuthority = "";
+    shownRev = 0;
+    syncEnable();
+  }
 
   function answers() {
     var whole = document.getElementById("whole").checked;
@@ -174,7 +183,9 @@
       this_machine_is_local_ai: localAI === true,
       whole_subnet: whole,
       device_ips: [],
-      confirm_authority: confirmBox.checked
+      confirm_authority: confirmBox.checked,
+      authority: shownAuthority,
+      join_rev: shownRev
     };
     if (localAI === false && !whole && ip) {
       body.device_ips = [ip];
@@ -184,6 +195,9 @@
 
   document.getElementById("save-code").addEventListener("click", function () {
     showError("");
+    // A confirmation of the previous code must not survive this save,
+    // including while the request is still in flight.
+    clearConfirmation();
     var input = document.getElementById("code");
     post("/api/join", {
       code: input.value,
@@ -191,6 +205,9 @@
     }).then(function (view) {
       input.value = "";
       clearPlanText();
+      clearConfirmation();
+      shownAuthority = view.authority || "";
+      shownRev = view.join_rev || 0;
       document.getElementById("authority").textContent = "登记服务器：" + (view.authority || "");
       document.getElementById("code-state").textContent = "已保存。租户 " + view.tenant + "，角色 " + view.role + "。加入码已从输入框清掉。请核对上面的登记服务器。";
     }).catch(showError);
