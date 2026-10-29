@@ -21,7 +21,7 @@ func TestInviteKeepsInodeThroughSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := inodeOf(t, target)
-	if _, err := Invite(link, "acme", "", "https://enroll.example.org", false); err != nil {
+	if _, err := Invite(link, "acme", "", "https://enroll.example.org", "", false); err != nil {
 		t.Fatal(err)
 	}
 	if got := inodeOf(t, target); got != before {

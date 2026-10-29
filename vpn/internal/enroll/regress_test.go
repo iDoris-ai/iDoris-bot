@@ -23,7 +23,7 @@ func TestConcurrentInviteKeepsEveryHash(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			if _, err := Invite(path, "acme", "", "https://enroll.example.org", false); err != nil {
+			if _, err := Invite(path, "acme", "", "https://enroll.example.org", "", false); err != nil {
 				mu.Lock()
 				if first == nil {
 					first = err
@@ -108,7 +108,7 @@ func TestRevokePrefixLengthCaseAndHex(t *testing.T) {
 
 func TestInviteRoundTripStillDecodes(t *testing.T) {
 	path := writeTenantFile(t, 0o600)
-	code, err := Invite(path, "acme", "office-gw", "https://enroll.example.org", false)
+	code, err := Invite(path, "acme", "office-gw", "https://enroll.example.org", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
