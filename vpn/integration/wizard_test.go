@@ -627,8 +627,22 @@ func (e *wizEnv) status(t *testing.T, host string) (wizSnap, string, error) {
 }
 
 func (e *wizEnv) waitStatus(t *testing.T, host string, budget time.Duration, cond func(wizSnap) (bool, string)) wizSnap {
-	panic("stub")
+	t.Helper()
+	var found wizSnap
+	waitFor(t, host+" status", budget, func() (bool, string) {
+		st, raw, err := e.status(t, host)
+		if err != nil {
+			return false, e.redact(err.Error() + " " + raw)
+		}
+		ok, note := cond(st)
+		if ok {
+			found = st
+		}
+		return ok, e.redact(note)
+	})
+	return found
 }
+
 func (e *wizEnv) mustHealth(t *testing.T, host string, connected bool) {
 	t.Helper()
 	// BusyBox wget drops the body and exits 1 on HTTP 503. A raw request
