@@ -260,6 +260,36 @@ func (e *enrollKeys) AuthKey(ctx context.Context) (string, error) {
 	return resp.AuthKey, nil
 }
 
+// RefreshIdentity rediscovers tenant and role before the next enroll.
+// It does not mint a key. The reconciler calls it when startup discovery
+// failed and a login is now required.
+func (e *enrollKeys) RefreshIdentity(ctx context.Context) (vpnd.Identity, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	d, err := e.c.Discover(ctx)
+	if err != nil {
+		return vpnd.Identity{}, "", err
+	}
+	if e.cfg.ControlURL != "" && d.ControlURL != "" && !vpnd.SameControlURL(e.cfg.ControlURL, d.ControlURL) {
+		return vpnd.Identity{}, "", fmt.Errorf("enrollment service points at %s but config pins %s; refusing", d.ControlURL, e.cfg.ControlURL)
+	}
+	role := strings.ToLower(strings.TrimSpace(d.Role))
+	if role == "" {
+		role = strings.ToLower(strings.TrimSpace(e.cfg.Role))
+	}
+	ident := vpnd.Identity{
+		Tenant:           strings.TrimSpace(d.Tenant),
+		Role:             role,
+		TokenFingerprint: vpnd.TokenFingerprint(e.cfg.EnrollToken),
+		Known:            true,
+	}
+	if role != "" {
+		e.cfg.Role = role
+	}
+	e.log.Info("enrollment identity refreshed", "tenant", ident.Tenant, "role", role)
+	return ident, role, nil
+}
+
 func runCmd(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	cfg, err := loadConfig(args, fs)
@@ -406,7 +436,8 @@ func prepareKeys(cfg *vpnd.Config, log *slog.Logger) (vpnd.KeySource, string, vp
 		if rerr != nil {
 			return nil, "", ident, nil, false, fmt.Errorf("%w (discovery: %w)", rerr, derr)
 		}
-		cfg.Role = vpnd.RoleWhileEnrollDown(cfg.Role, binding.Get().Role)
+		savedBinding := binding.Get()
+		cfg.Role = vpnd.RoleWhileEnrollDown(cfg.Role, savedBinding.Role, vpnd.TokenFingerprint(cfg.EnrollToken), savedBinding.TokenFingerprint)
 		log.Warn("enrollment discovery failed; resuming the saved control URL", "err", derr, "control_url", url, "role", cfg.Role)
 		// The URL was not confirmed this start, so the binding is left as it was.
 		return &enrollKeys{c: ec, cfg: cfg, log: log}, url, ident, binding, !degraded, nil
