@@ -115,8 +115,33 @@ func wizPolicy(echo, echoB string) string {
 	panic("stub")
 }
 func wizInvite(t *testing.T, bin, cfgPath, hint, enrollURL string) (string, join.Payload) {
-	panic("stub")
+	t.Helper()
+	cmd := exec.Command(bin, "invite",
+		"--config", cfgPath,
+		"--entry", "wiz",
+		"--hostname-hint", hint,
+		"--enroll-url", enrollURL,
+		"--allow-insecure")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("invite %s: %v\n%s", hint, err, wizSecretRE.ReplaceAllString(stderr.String(), "[redacted]"))
+	}
+	code := strings.TrimSpace(stdout.String())
+	if code == "" || strings.Contains(code, "\n") {
+		t.Fatalf("invite %s: stdout must be exactly one join code line", hint)
+	}
+	payload, err := join.Decode(code, join.Options{AllowInsecure: true})
+	if err != nil {
+		t.Fatalf("invite %s: decode: %v", hint, err)
+	}
+	if payload.Role != join.RoleGateway || payload.Tenant != "wiz" || payload.HostnameHint != hint || payload.Token == "" {
+		t.Fatalf("invite %s: role %s tenant %s hint %s", hint, payload.Role, payload.Tenant, payload.HostnameHint)
+	}
+	return code, payload
 }
+
 func buildHostBin(t *testing.T, pkg, out string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
