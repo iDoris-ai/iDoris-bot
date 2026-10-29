@@ -1,0 +1,13 @@
+[Unit]
+Description=iDoris VPN membership daemon (Tailscale client -> iDoris Headscale)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/idoris-vpnd run --config /etc/idoris/vpn.json
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
