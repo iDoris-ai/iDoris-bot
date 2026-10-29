@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -9,6 +10,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/vpnd"
 )
 
 const launchdLabel = "ai.idoris.vpnd"
@@ -34,6 +37,11 @@ func serviceCmd(args []string) error {
 		}
 		if _, err := os.Stat(abs); err != nil {
 			return fmt.Errorf("config: %w", err)
+		}
+		// Both the user service and --system stop here. CheckSecretFile warns
+		// and returns nil on Windows; on Unix a failure contains "chmod 600".
+		if err := checkInstallSecrets(abs); err != nil {
+			return err
 		}
 		if *system {
 			return installSystemService(abs)
@@ -61,6 +69,46 @@ func userServiceNotice(goos string) string {
 		msg += "; enable it with: loginctl enable-linger"
 	}
 	return msg
+}
+
+// checkInstallSecrets calls CheckSecretFile for the enrollment token file,
+// the auth key file, the SOCKS5 auth file, and the config itself when it
+// holds an inline enroll_token or auth_key. A config that only names those
+// files may stay 0644.
+func checkInstallSecrets(configPath string) error {
+	b, err := os.ReadFile(configPath) //nolint:gosec // operator-chosen config, checked before install
+	if err != nil {
+		return err
+	}
+	var probe struct {
+		EnrollToken     string `json:"enroll_token"`
+		EnrollTokenFile string `json:"enroll_token_file"`
+		AuthKey         string `json:"auth_key"`
+		AuthKeyFile     string `json:"auth_key_file"`
+		SOCKS5AuthFile  string `json:"socks5_auth_file"`
+	}
+	if err := json.Unmarshal(b, &probe); err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	if probe.EnrollToken != "" || probe.AuthKey != "" {
+		if err := vpnd.CheckSecretFile(configPath); err != nil {
+			return fmt.Errorf("config holds an inline secret: %w", err)
+		}
+	}
+	files := []struct{ name, path string }{
+		{"enroll_token_file", probe.EnrollTokenFile},
+		{"auth_key_file", probe.AuthKeyFile},
+		{"socks5_auth_file", probe.SOCKS5AuthFile},
+	}
+	for _, f := range files {
+		if strings.TrimSpace(f.path) == "" {
+			continue
+		}
+		if err := vpnd.CheckSecretFile(f.path); err != nil {
+			return fmt.Errorf("%s: %w", f.name, err)
+		}
+	}
+	return nil
 }
 
 func selfPath() (string, error) {
