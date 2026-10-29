@@ -650,9 +650,35 @@ func (e *wizEnv) mustHealth(t *testing.T, host string, connected bool) {
 	}
 }
 
-func (e *wizEnv) waitRoutes(t *testing.T, host string, budget time.Duration, cond func(gwRouteNode) (bool, string)) gwRouteNode {
-	panic("stub")
+func (e *wizEnv) listRoutes(t *testing.T) []gwRouteNode {
+	t.Helper()
+	raw := e.must(t, 20*time.Second, "exec", "-T", "headscale", "headscale", "nodes", "list-routes", "-o", "json")
+	nodes, err := gwParseRoutes(raw)
+	if err != nil {
+		t.Fatalf("list-routes: %v\n%s", err, e.redact(raw))
+	}
+	return nodes
 }
+
+func (e *wizEnv) waitRoutes(t *testing.T, host string, budget time.Duration, cond func(gwRouteNode) (bool, string)) gwRouteNode {
+	t.Helper()
+	var found gwRouteNode
+	waitFor(t, host+" routes", budget, func() (bool, string) {
+		nodes := e.listRoutes(t)
+		for _, n := range nodes {
+			if gwSameHost(n, host) {
+				ok, note := cond(n)
+				if ok {
+					found = n
+				}
+				return ok, note
+			}
+		}
+		return false, "node not in list-routes"
+	})
+	return found
+}
+
 func (e *wizEnv) nodeHasTag(t *testing.T, host, tag string) bool {
 	t.Helper()
 	out := e.must(t, 15*time.Second, "exec", "-T", "headscale", "headscale", "nodes", "list", "-o", "json")
