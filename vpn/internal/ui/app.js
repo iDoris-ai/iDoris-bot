@@ -155,6 +155,32 @@
     document.getElementById("plan").textContent = lines.join("\n");
   }
 
+  function clearPlanText() {
+    document.getElementById("plan").textContent = "先识别网络，再使用建议。";
+  }
+
+  var confirmBox = document.getElementById("confirm-authority");
+  var enableBtn = document.getElementById("enable");
+  function syncEnable() {
+    enableBtn.disabled = !confirmBox.checked;
+  }
+  confirmBox.addEventListener("change", syncEnable);
+
+  function answers() {
+    var whole = document.getElementById("whole").checked;
+    var ip = document.getElementById("device").value.trim();
+    var body = {
+      this_machine_is_local_ai: localAI === true,
+      whole_subnet: whole,
+      device_ips: [],
+      confirm_authority: confirmBox.checked
+    };
+    if (localAI === false && !whole && ip) {
+      body.device_ips = [ip];
+    }
+    return body;
+  }
+
   document.getElementById("save-code").addEventListener("click", function () {
     showError("");
     var input = document.getElementById("code");
@@ -163,21 +189,26 @@
       allow_insecure: document.getElementById("insecure").checked
     }).then(function (view) {
       input.value = "";
-      document.getElementById("code-state").textContent = "已保存。租户 " + view.tenant + "，角色 " + view.role + "。加入码已从输入框清掉。";
+      clearPlanText();
+      document.getElementById("authority").textContent = "登记服务器：" + (view.authority || "");
+      document.getElementById("code-state").textContent = "已保存。租户 " + view.tenant + "，角色 " + view.role + "。加入码已从输入框清掉。请核对上面的登记服务器。";
     }).catch(showError);
   });
 
   document.getElementById("yes-ai").addEventListener("click", function () {
     localAI = true;
+    clearPlanText();
     document.getElementById("role-state").textContent = "将以 Local AI 主机加入，不通告局域网。";
   });
   document.getElementById("no-ai").addEventListener("click", function () {
     localAI = false;
+    clearPlanText();
     document.getElementById("role-state").textContent = "这台机器做网关，只通告你填的设备地址。";
   });
 
   document.getElementById("detect").addEventListener("click", function () {
     showError("");
+    clearPlanText();
     post("/api/detect", {}).then(renderReport).catch(showError);
   });
 
@@ -191,16 +222,15 @@
 
   document.getElementById("recommend").addEventListener("click", function () {
     showError("");
+    if (!confirmBox.checked) {
+      showError(new Error("先确认：这是我组织的服务器"));
+      return;
+    }
     if (localAI === null) {
       showError(new Error("先回答：这台机器就是 Local AI 吗？"));
       return;
     }
-    var whole = document.getElementById("whole").checked;
-    var ip = document.getElementById("device").value.trim();
-    var body = { this_machine_is_local_ai: localAI, whole_subnet: whole, device_ips: [] };
-    if (!localAI && !whole && ip) {
-      body.device_ips = [ip];
-    }
+    var body = answers();
     var chain = Promise.resolve();
     if (!localAI) {
       chain = post("/api/detect", {}).then(renderReport);
@@ -242,7 +272,7 @@
 
   document.getElementById("enable").addEventListener("click", function () {
     showError("");
-    post("/api/apply", {}).then(function (res) {
+    post("/api/apply", answers()).then(function (res) {
       var lines = ["配置已写入 " + (res.config_path || "")];
       if (res.sudo_command) {
         lines.push("当前不是 root，没有改系统转发。请原样执行：");
