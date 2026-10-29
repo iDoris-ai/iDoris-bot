@@ -232,7 +232,13 @@ func newFakeOS(root bool, goos string) *fakeOS {
 	return &fakeOS{files: map[string][]byte{}, modes: map[string]os.FileMode{}, root: root, goos: goos}
 }
 
+// WriteFile matches os.WriteFile: an existing file keeps its mode. The real
+// osHost uses fsutil.WriteFileAtomic, which replaces the inode.
 func (m *fakeOS) WriteFile(path string, data []byte, mode os.FileMode) error {
+	if _, exists := m.files[path]; exists {
+		m.files[path] = append([]byte(nil), data...)
+		return nil
+	}
 	m.files[path] = append([]byte(nil), data...)
 	m.modes[path] = mode
 	return nil
@@ -274,3 +280,245 @@ func (m fakeInfo) Mode() os.FileMode  { return 0 }
 func (m fakeInfo) ModTime() time.Time { return time.Time{} }
 func (m fakeInfo) IsDir() bool        { return false }
 func (m fakeInfo) Sys() any           { return nil }
+
+func TestR3W2JoinCodeInputsMatchAndWarn(t *testing.T) {
+	code := codeFor(t, join.RoleMember, "https://enroll.example.org", false)
+	run := func(t *testing.T, args []string, in string, term bool, hidden string) (string, string) {
+		t.Helper()
+		host := newFakeOS(false, "linux")
+		d := testDeps(host, in)
+		if term {
+			d.term = func() bool { return true }
+			d.readPassword = func() (string, error) { return hidden, nil }
+		}
+		if err := joinCmd(args, d); err != nil {
+			t.Fatal(err)
+		}
+		cfg := host.files["/home/acme/.idoris/vpn.json"]
+		if bytes.Contains(cfg, []byte(testToken)) || bytes.Contains(cfg, []byte(code)) {
+			t.Fatalf("config holds a secret: %s", cfg)
+		}
+		return string(cfg), d.out() + "\n" + d.errOut()
+	}
+	fileHost := newFakeOS(false, "linux")
+	fileHost.files["/tmp/join.code"] = []byte(code + "\nrest\n")
+	d := testDeps(fileHost, "")
+	if err := joinCmd([]string{"--yes", "--code-file", "/tmp/join.code"}, d); err != nil {
+		t.Fatal(err)
+	}
+	fromFile := string(fileHost.files["/home/acme/.idoris/vpn.json"])
+	fromStdin, _ := run(t, []string{"--yes", "--code-stdin"}, code+"\n", false, "")
+	fromPrompt, _ := run(t, []string{"--yes"}, "", true, code)
+	fromArg, text := run(t, []string{"--yes", code}, "", false, "")
+	if fromFile != fromStdin || fromFile != fromPrompt || fromFile != fromArg {
+		t.Fatalf("plans differ\nfile %s\nstdin %s\nprompt %s\narg %s", fromFile, fromStdin, fromPrompt, fromArg)
+	}
+	if !strings.Contains(fromFile, `"socks5_listen": "127.0.0.1:1080"`) {
+		t.Fatalf("member config %s", fromFile)
+	}
+	if !strings.Contains(text, "process list") || !strings.Contains(text, "shell history") || strings.Contains(text, code) || strings.Contains(text, testToken) {
+		t.Fatalf("positional warning:\n%s", text)
+	}
+	if !strings.Contains(fromArg, "127.0.0.1:1080") {
+		t.Fatal("positional plan dropped socks")
+	}
+	// The prompt path prints the access lines and the authority, and never the code.
+	host := newFakeOS(false, "linux")
+	d = testDeps(host, "")
+	d.term = func() bool { return true }
+	d.readPassword = func() (string, error) { return code, nil }
+	if err := joinCmd([]string{"--yes"}, d); err != nil {
+		t.Fatal(err)
+	}
+	out := d.out()
+	for _, want := range []string{
+		"enrollment-authority: enroll.example.org",
+		"access: SOCKS5 127.0.0.1:1080",
+		"access: SOCKS5 credential file /home/acme/.idoris/vpn-state/socks5.auth",
+		"access: Reach the Local AI through this proxy by its MagicDNS name office-gw.idoris.internal",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in\n%s", want, out)
+		}
+	}
+	if strings.Contains(out+d.errOut(), code) || strings.Contains(out, testToken) {
+		t.Fatal("prompt path printed a secret")
+	}
+
+	d = testDeps(newFakeOS(false, "linux"), "")
+	if err := joinCmd([]string{"--code-file", "/tmp/join.code", "--code-stdin"}, d); err == nil || !strings.Contains(err.Error(), "only one") {
+		t.Fatalf("%v", err)
+	}
+	d = testDeps(newFakeOS(false, "linux"), code+"\n")
+	if err := joinCmd([]string{"--code-stdin", code}, d); err == nil || !strings.Contains(err.Error(), "only one") {
+		t.Fatalf("%v", err)
+	}
+	d = testDeps(newFakeOS(false, "linux"), "")
+	if err := joinCmd([]string{"--yes"}, d); err == nil || !strings.Contains(err.Error(), "--code-file") {
+		t.Fatalf("%v", err)
+	}
+}
+
+func TestR3W2JoinAuthorityConfirm(t *testing.T) {
+	code := codeFor(t, join.RoleMember, "https://enroll.example.org:8443", false)
+	var calls int
+	withDiscover := func(in string, args ...string) (deps, *fakeOS, error) {
+		host := newFakeOS(false, "linux")
+		d := testDeps(host, in)
+		d.discover = func(context.Context, string, string, bool) (*enroll.Discovery, error) {
+			calls++
+			return &enroll.Discovery{Tenant: "acme"}, nil
+		}
+		err := joinCmd(args, d)
+		return d, host, err
+	}
+	calls = 0
+	d, host, err := withDiscover("", "--yes", "--expect-authority", "evil.example", code)
+	if err == nil || !strings.Contains(err.Error(), "does not match") || !strings.Contains(d.out(), "enrollment-authority: enroll.example.org:8443") {
+		t.Fatalf("%v\n%s", err, d.out())
+	}
+	if calls != 0 || len(host.files) != 0 {
+		t.Fatalf("mismatch contacted the server (%d) or wrote %v", calls, host.files)
+	}
+	calls = 0
+	d, host, err = withDiscover("n\n", code)
+	if err == nil || !strings.Contains(err.Error(), "not applied") || calls != 0 || len(host.files) != 0 {
+		t.Fatalf("decline: %v calls %d files %v\n%s", err, calls, host.files, d.out())
+	}
+	if !strings.Contains(d.out(), "Contact enrollment authority enroll.example.org:8443?") {
+		t.Fatalf("stdout:\n%s", d.out())
+	}
+	calls = 0
+	d, _, err = withDiscover(code+"\n", "--yes", "--expect-authority", "Enroll.Example.Org:8443", "--code-stdin")
+	if err != nil || calls != 1 || !strings.Contains(d.out(), "enrollment-authority: enroll.example.org:8443") {
+		t.Fatalf("%v calls %d\n%s", err, calls, d.out())
+	}
+}
+
+func TestR3W2JoinRoleUsesDiscovery(t *testing.T) {
+	host := newFakeOS(false, "linux")
+	code := codeFor(t, join.RoleGateway, "https://enroll.example.org", false)
+	d := testDeps(host, "")
+	d.discover = func(context.Context, string, string, bool) (*enroll.Discovery, error) {
+		return &enroll.Discovery{Tenant: "acme", Role: join.RoleLocalAI, LANCIDRs: []string{"10.251.73.10/32"}}, nil
+	}
+	err := joinCmd([]string{"--yes", "--device", "10.251.73.10", "--no-service", code}, d)
+	if err == nil || !strings.Contains(err.Error(), "local-ai") || len(host.files) != 0 {
+		t.Fatalf("%v files %v", err, host.files)
+	}
+
+	host = newFakeOS(false, "linux")
+	d = testDeps(host, "")
+	d.discover = func(context.Context, string, string, bool) (*enroll.Discovery, error) {
+		return &enroll.Discovery{Tenant: "acme", Role: join.RoleGateway}, nil
+	}
+	err = joinCmd([]string{"--yes", "--role-override", "member", "--no-service", code}, d)
+	if err == nil || !strings.Contains(err.Error(), "--role-override") || len(host.files) != 0 {
+		t.Fatalf("%v files %v", err, host.files)
+	}
+
+	// Discovery agrees with the code, so the plan is a gateway and not a guess.
+	host = newFakeOS(false, "linux")
+	d = testDeps(host, code+"\n")
+	d.discover = func(context.Context, string, string, bool) (*enroll.Discovery, error) {
+		return &enroll.Discovery{Tenant: "acme", Role: join.RoleGateway, LANCIDRs: []string{"10.251.73.10/32"}}, nil
+	}
+	if err := joinCmd([]string{"--yes", "--device", "10.251.73.10", "--no-service", "--code-stdin"}, d); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(d.out(), "role: gateway") {
+		t.Fatalf("stdout:\n%s", d.out())
+	}
+
+	// gateway setup refuses a discovered local-ai role when this machine is not one.
+	host = newFakeOS(false, "linux")
+	tokenPath := "/home/acme/.idoris/enroll.token"
+	original := []byte(`{"enroll_url":"https://enroll.example.org","enroll_token_file":"` + tokenPath + `","hostname":"office-gw"}` + "\n")
+	host.files["/home/acme/.idoris/vpn.json"] = append([]byte(nil), original...)
+	host.files[tokenPath] = []byte(testToken + "\n")
+	d = testDeps(host, "")
+	d.discover = func(context.Context, string, string, bool) (*enroll.Discovery, error) {
+		return &enroll.Discovery{Tenant: "acme", Role: join.RoleLocalAI}, nil
+	}
+	if err := gatewayCmd([]string{"setup", "--yes", "--device", "10.251.73.10", "--no-service"}, d); err == nil || !strings.Contains(err.Error(), "local-ai") {
+		t.Fatalf("%v", err)
+	}
+	if !bytes.Equal(host.files["/home/acme/.idoris/vpn.json"], original) {
+		t.Fatalf("setup rewrote the config: %s", host.files["/home/acme/.idoris/vpn.json"])
+	}
+}
+
+func TestR3W2JoinDistinctConfigsAndReplace(t *testing.T) {
+	encode := func(t *testing.T, rawURL, token string) string {
+		t.Helper()
+		c, err := join.Encode(join.Payload{
+			V: 1, EnrollURL: rawURL, Token: token, Role: join.RoleMember, Tenant: "acme", HostnameHint: "laptop",
+		}, join.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	codeA := encode(t, "https://a.example", "idv1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	codeB := encode(t, "https://b.example", "idv1_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	host := newFakeOS(false, "linux")
+	host.files["/tmp/a.code"] = []byte(codeA + "\n")
+	host.files["/tmp/b.code"] = []byte(codeB + "\n")
+	d := testDeps(host, "")
+	if err := joinCmd([]string{"--yes", "--no-service", "--config", "/home/acme/orgA/vpn.json", "--code-file", "/tmp/a.code"}, d); err != nil {
+		t.Fatal(err)
+	}
+	d = testDeps(host, "")
+	if err := joinCmd([]string{"--yes", "--no-service", "--config", "/home/acme/orgB/vpn.json", "--code-file", "/tmp/b.code"}, d); err != nil {
+		t.Fatal(err)
+	}
+	tokA := "/home/acme/orgA/vpn.enroll-token"
+	tokB := "/home/acme/orgB/vpn.enroll-token"
+	if string(host.files[tokA]) != "idv1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n" || string(host.files[tokB]) != "idv1_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n" {
+		t.Fatalf("tokens %q %q", host.files[tokA], host.files[tokB])
+	}
+	if _, ok := host.files["/home/acme/.idoris/enroll.token"]; ok {
+		t.Fatal("custom configs wrote the shared token path")
+	}
+	if bytes.Contains(host.files["/home/acme/orgA/vpn.json"], []byte("b.example")) {
+		t.Fatal("B overwrote A")
+	}
+	d = testDeps(host, "")
+	err := joinCmd([]string{"--yes", "--no-service", "--config", "/home/acme/orgA/vpn.json", "--code-file", "/tmp/b.code"}, d)
+	if err == nil || !strings.Contains(err.Error(), "--replace") {
+		t.Fatalf("%v", err)
+	}
+	if string(host.files[tokA]) != "idv1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n" {
+		t.Fatal("refused join replaced A's token")
+	}
+	d = testDeps(host, "")
+	if err := joinCmd([]string{"--yes", "--no-service", "--replace", "--config", "/home/acme/orgA/vpn.json", "--code-file", "/tmp/b.code"}, d); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(host.files["/home/acme/orgA/vpn.json"], []byte("https://b.example")) || string(host.files[tokA]) != "idv1_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n" {
+		t.Fatalf("replace: %s", host.files["/home/acme/orgA/vpn.json"])
+	}
+	if string(host.files[tokB]) != "idv1_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n" {
+		t.Fatal("replacing A changed B")
+	}
+
+	// gateway apply --replace is the same switch for a plan that names another URL.
+	planPath := "/home/acme/orgA/vpn.gateway-plan.json"
+	plan := bytes.ReplaceAll(host.files[planPath], []byte("https://b.example"), []byte("https://c.example"))
+	host.files[planPath] = plan
+	before := append([]byte(nil), host.files["/home/acme/orgA/vpn.json"]...)
+	d = testDeps(host, "")
+	if err := gatewayCmd([]string{"apply", "--plan", planPath, "--no-service"}, d); err == nil || !strings.Contains(err.Error(), "--replace") {
+		t.Fatalf("%v", err)
+	}
+	if !bytes.Equal(before, host.files["/home/acme/orgA/vpn.json"]) {
+		t.Fatal("apply without --replace changed the config")
+	}
+	d = testDeps(host, "")
+	if err := gatewayCmd([]string{"apply", "--plan", planPath, "--no-service", "--replace"}, d); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(host.files["/home/acme/orgA/vpn.json"], []byte("https://c.example")) {
+		t.Fatalf("apply --replace: %s", host.files["/home/acme/orgA/vpn.json"])
+	}
+}
