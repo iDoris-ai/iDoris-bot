@@ -1,25 +1,52 @@
 (function () {
-  var csrfMeta = document.querySelector('meta[name="csrf-token"]');
-  var csrf = csrfMeta ? csrfMeta.getAttribute("content") : "";
-  if (window.history && window.history.replaceState) {
-    window.history.replaceState({}, "", window.location.pathname);
-  }
-
+  var session = "";
+  var csrf = "";
   var localAI = null;
-  var lastReport = null;
 
   function showError(err) {
     var el = document.getElementById("error");
     el.textContent = err && err.message ? err.message : String(err || "");
   }
 
-  function post(path, body) {
-    return fetch(path, {
+  function stored(key) {
+    try {
+      return sessionStorage.getItem(key) || "";
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function store(key, value) {
+    try {
+      sessionStorage.setItem(key, value);
+    } catch (e) {
+      /* the in-memory copy still covers this page */
+    }
+  }
+
+  function clearFragment() {
+    if (window.history && window.history.replaceState) {
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+  }
+
+  // A hand-opened URL carries the bootstrap secret in the fragment only.
+  // The fragment is not sent on the request; this POST is the one exchange.
+  function bootstrap() {
+    var hash = window.location.hash || "";
+    var m = /^#k=([0-9a-fA-F]+)$/.exec(hash);
+    if (!m) {
+      session = stored("idoris_ui");
+      csrf = stored("idoris_csrf");
+      return Promise.resolve();
+    }
+    return fetch("/api/bootstrap", {
       method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf },
-      body: JSON.stringify(body || {})
+      credentials: "omit",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ k: m[1] })
     }).then(function (res) {
+      clearFragment();
       return res.text().then(function (text) {
         var data = {};
         if (text) {
@@ -28,13 +55,43 @@
         if (!res.ok) {
           throw new Error(data.error || ("请求失败 " + res.status));
         }
-        return data;
+        session = data.capability || "";
+        csrf = data.csrf || "";
+        store("idoris_ui", session);
+        store("idoris_csrf", csrf);
+      });
+    });
+  }
+
+  var ready = bootstrap().catch(showError);
+
+  function post(path, body) {
+    return ready.then(function () {
+      return fetch(path, {
+        method: "POST",
+        credentials: "omit",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": csrf,
+          "X-Idoris-UI": session
+        },
+        body: JSON.stringify(body || {})
+      }).then(function (res) {
+        return res.text().then(function (text) {
+          var data = {};
+          if (text) {
+            try { data = JSON.parse(text); } catch (e) { data = { error: text }; }
+          }
+          if (!res.ok) {
+            throw new Error(data.error || ("请求失败 " + res.status));
+          }
+          return data;
+        });
       });
     });
   }
 
   function renderReport(rep) {
-    lastReport = rep;
     var nets = document.getElementById("networks");
     nets.textContent = "";
     var list = rep.candidates || [];
@@ -152,7 +209,12 @@
   });
 
   function poll() {
-    fetch("/api/status", { credentials: "same-origin" }).then(function (res) {
+    ready.then(function () {
+      return fetch("/api/status", {
+        credentials: "omit",
+        headers: { "X-Idoris-UI": session }
+      });
+    }).then(function (res) {
       return res.json();
     }).then(function (st) {
       var phase = st.phase || "";
