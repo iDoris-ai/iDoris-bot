@@ -224,6 +224,7 @@ type memHost struct {
 	goos     string
 	forwards int
 	services []string
+	links    map[string]string
 }
 
 func newMemHost(root bool, goos string) *memHost {
@@ -286,4 +287,15 @@ func joined(ss []string) string {
 		return ss[0]
 	}
 	return ""
+}
+
+func (m *memHost) ReadFile(path string) ([]byte, error) {
+	if target, ok := m.links[path]; ok {
+		return m.ReadFile(target)
+	}
+	b, ok := m.files[path]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return append([]byte(nil), b...), nil
 }
