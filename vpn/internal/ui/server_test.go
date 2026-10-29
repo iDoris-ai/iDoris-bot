@@ -302,11 +302,12 @@ func TestJoinPlanAndApplyHideTheToken(t *testing.T) {
 	if status != http.StatusOK || bytes.Contains(body, []byte(uiToken)) || bytes.Contains(body, []byte(code)) {
 		t.Fatalf("join %d %s", status, body)
 	}
+	joined := r3w1ReadJoin(t, body)
 	status, body = call("/api/detect", map[string]any{})
 	if status != http.StatusOK {
 		t.Fatalf("detect %d %s", status, body)
 	}
-	status, body = call("/api/plan", map[string]any{"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"}, "confirm_authority": true})
+	status, body = call("/api/plan", joined.body(map[string]any{"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"}}))
 	var plan gateway.Plan
 	if err := json.Unmarshal(body, &plan); err != nil {
 		t.Fatalf("plan %d %s", status, body)
@@ -314,9 +315,9 @@ func TestJoinPlanAndApplyHideTheToken(t *testing.T) {
 	if status != http.StatusOK || bytes.Contains(body, []byte(uiToken)) || len(plan.Routes) != 1 || plan.Routes[0] != "10.251.73.10/32" || !plan.WillAutoApprove {
 		t.Fatalf("plan %d %+v %s", status, plan.Routes, body)
 	}
-	status, body = call("/api/apply", map[string]any{
-		"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"}, "confirm_authority": true,
-	})
+	status, body = call("/api/apply", joined.body(map[string]any{
+		"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"},
+	}))
 	if status != http.StatusOK || bytes.Contains(body, []byte(uiToken)) || !bytes.Contains(body, []byte("sudo idoris-vpnd gateway apply")) {
 		t.Fatalf("apply %d %s", status, body)
 	}
@@ -378,9 +379,10 @@ func TestLocalAIPlanHasNoRoute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _ = io.ReadAll(res.Body)
+	joinBody, _ := io.ReadAll(res.Body)
 	_ = res.Body.Close()
-	raw, _ = json.Marshal(map[string]any{"this_machine_is_local_ai": true, "confirm_authority": true})
+	joined := r3w1ReadJoin(t, joinBody)
+	raw, _ = json.Marshal(joined.body(map[string]any{"this_machine_is_local_ai": true}))
 	req, _ = http.NewRequest(http.MethodPost, base+"/api/plan", bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "http://"+srv.bound)
