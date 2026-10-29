@@ -8,7 +8,9 @@
 package gateway
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/netip"
 	"strings"
 
@@ -180,6 +182,18 @@ func gatewayPlan(req Request) (Plan, error) {
 			Step{ID: "routes", Text: "Advertise " + strings.Join(p.Routes, ", ")},
 			Step{ID: "approve", Text: "An admin runs: " + p.AdminCommand},
 		)
+	}
+	return p, nil
+}
+
+// LoadPlan reads a plan file. Unknown fields are rejected so a token cannot
+// hide in an extra key. The reader is capped at 1 MiB.
+func LoadPlan(r io.Reader) (Plan, error) {
+	dec := json.NewDecoder(io.LimitReader(r, 1<<20))
+	dec.DisallowUnknownFields()
+	var p Plan
+	if err := dec.Decode(&p); err != nil {
+		return Plan{}, fmt.Errorf("gateway: plan: %w", err)
 	}
 	return p, nil
 }
