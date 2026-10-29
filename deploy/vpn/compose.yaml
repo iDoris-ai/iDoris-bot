@@ -6,8 +6,16 @@
 #
 # TLS: terminate at the reverse proxy you already run (Caddy/Traefik/nginx).
 #   https://vpn.example.org            -> headscale  (host: 127.0.0.1:${HEADSCALE_PORT}, network: headscale:8080)
-#   https://vpn.example.org/admin      -> headplane  (host: 127.0.0.1:${HEADPLANE_PORT}, network: headplane:3000)
 #   https://enroll.example.org         -> enroll     (host: 127.0.0.1:${ENROLL_PORT},    network: enroll:8787)
+# Headplane is not on that public hostname. HEADPLANE_ACCESS (bootstrap.sh
+# --headplane-access, or ctl.sh up --headplane-access) is the only knob.
+# It writes base_url, cookie_secure and HEADPLANE_BIND together:
+#   tunnel   default. SSH to 127.0.0.1:${HEADPLANE_PORT}. cookie_secure false.
+#   lan      plain HTTP on a non-loopback address. Loud warning.
+#   tailnet  profile tailnet-admin, no host port. cookie_secure false.
+#   proxy    HTTPS on a different name, e.g. https://admin.example.org
+#            -> 127.0.0.1:${HEADPLANE_PORT}. cookie_secure true.
+#            The server_url host is refused unless HEADPLANE_ALLOW_PUBLIC_ADMIN=1.
 # The proxy must pass Host and X-Forwarded-Proto and support WebSocket/Upgrade
 # (Tailscale control and DERP both upgrade the connection). Headscale is
 # reached on plain HTTP; its embedded DERP needs the *same* https origin as
@@ -21,11 +29,18 @@
 # DERP_STUN_PORT must stay 3478 in production: clients learn the STUN port from
 # the DERP map, which advertises headscale's stun_listen_addr port.
 #
-# HEADPLANE_BIND is the host address Headplane is published on (default
-# 127.0.0.1). Keep the default and use an SSH tunnel. Set a LAN address or
-# 0.0.0.0 only on a trusted office network, and read the cookie_secure note
-# in headplane/config.yaml and docs/14-VPN-OPERATIONS.md before you do.
-# Do not publish Headplane or enroll on a public interface.
+# One compose project per deployment. `name` below is idoris-vpn unless
+# COMPOSE_PROJECT_NAME is set (bootstrap.sh --instance writes it to .env).
+# A second copy on the same Docker host needs its own project name and its
+# own HEADSCALE_PORT, HEADPLANE_PORT, ENROLL_PORT and DERP_STUN_PORT.
+# Its headscale stun_listen_addr must advertise the port clients can reach,
+# which is not 3478 when the first instance already owns that UDP port.
+# See docs/14-VPN-OPERATIONS.md.
+#
+# HEADPLANE_BIND is written by HEADPLANE_ACCESS (default 127.0.0.1).
+# Do not publish Headplane or enroll on a public interface. lan is the only
+# mode that binds a non-loopback address, and it warns when it does.
+# See docs/14-VPN-OPERATIONS.md.
 #
 # Profile tailnet-admin (optional): a tailscale sidecar joins as tag:vpn-server
 # and Headplane shares its network namespace, so the UI is reachable only on
@@ -38,11 +53,14 @@
 #   bash deploy/vpn/bootstrap.sh init --org office
 # Another organisation (advanced):
 #   bash deploy/vpn/bootstrap.sh add-tenant globex
-name: idoris-vpn
+name: ${COMPOSE_PROJECT_NAME:-idoris-vpn}
 
 services:
   headscale:
-    image: headscale/headscale:v0.29.6
+    # Multi-arch index digest. Keep the tag. To move it: `docker buildx imagetools
+    # inspect`, then `docker compose pull`. enroll/Dockerfile is pinned the same way.
+    # See docs/14-VPN-OPERATIONS.md.
+    image: headscale/headscale:v0.29.6@sha256:cabe84f0699913dbca9320f0883dca7565dd08df3c5be29edfabbebeff763966
     restart: unless-stopped
     command: serve
     volumes:
@@ -66,7 +84,7 @@ services:
 
   headplane:
     # Tag is "0.8.2" (no "v" prefix); matches commit 05e3ee33 of tale/headplane.
-    image: ghcr.io/tale/headplane:0.8.2
+    image: ghcr.io/tale/headplane:0.8.2@sha256:b053a0a6699d0a67be3f0d9bae8e7dbe35ed67ae8448412adcbad7ea49866faa
     restart: unless-stopped
     depends_on:
       headscale:
@@ -133,7 +151,7 @@ services:
   # Headplane below shares this network namespace; do not also run `headplane`.
   vpn-sidecar:
     profiles: ["tailnet-admin"]
-    image: tailscale/tailscale:v1.104.2
+    image: tailscale/tailscale:v1.104.2@sha256:b11583ad2e93e4671128538c88cf11f460444a5d7e449311dd1933a400ab849d
     hostname: vpn-server
     restart: unless-stopped
     depends_on:
@@ -149,6 +167,9 @@ services:
     environment:
       ENROLL_URL: http://enroll:8787
       ENROLL_TOKEN: ${VPN_SERVER_ENROLL_TOKEN:-}
+      # Empty unless the operator sets it. The entrypoint treats empty as
+      # "use the control_url returned by enroll" (hairpin override).
+      VPN_SERVER_LOGIN_SERVER: ${VPN_SERVER_LOGIN_SERVER:-}
       TS_USERSPACE: "false"
       TS_STATE_DIR: /var/lib/tailscale
       TS_AUTH_ONCE: "true"
@@ -169,7 +190,7 @@ services:
   # namespace are the sidecar's tailnet address.
   headplane-tailnet:
     profiles: ["tailnet-admin"]
-    image: ghcr.io/tale/headplane:0.8.2
+    image: ghcr.io/tale/headplane:0.8.2@sha256:b053a0a6699d0a67be3f0d9bae8e7dbe35ed67ae8448412adcbad7ea49866faa
     restart: unless-stopped
     network_mode: "service:vpn-sidecar"
     depends_on:
