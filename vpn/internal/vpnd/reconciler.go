@@ -200,18 +200,20 @@ type Reconciler struct {
 	// rewrite the binding while the old node is still the one that is up.
 	awaitingIdentity bool
 	identityLoginOK  bool
-	// mismatchNode and mismatchProfile are the running IDs that caused the
-	// current identity transition. A later Running observation that still
-	// shows them has not replaced that node.
-	mismatchNode      string
-	mismatchKey       string
-	loginProfile      string
-	mismatchProfile   string
-	allowNodeBackfill bool
-	owner             *LiveOwner
-	ownKey            string
-	seenNode          string
-	seenProfile       string
+	// mismatchNode and mismatchKey identify the node that was running when
+	// this transition began. Headscale keeps the stable node ID across a
+	// re-authentication of the same machine; StartLoginInteractive forces a
+	// fresh node public key, and that key change (or a real ID change) is
+	// what completes the transition. loginProfile is the LocalAPI profile
+	// the login returned under, in system mode. A later profile is not
+	// certified.
+	mismatchNode string
+	mismatchKey  string
+	loginProfile string
+	owner        *LiveOwner
+	ownKey       string
+	seenNode     string
+	seenProfile  string
 }
 
 const (
@@ -293,6 +295,12 @@ func (r *Reconciler) set(mutate func(s *Snapshot)) Snapshot {
 	mutate(&r.snap)
 	if r.opt.EnrollUnreachable {
 		r.snap.Warnings = appendWarning(r.snap.Warnings, EnrollUnreachableWarning)
+	}
+	if r.unconfirmedLocked() {
+		r.snap.Warnings = appendWarning(r.snap.Warnings, IdentityUnconfirmedWarning)
+		if r.snap.LastError == "" {
+			r.snap.LastError = IdentityUnconfirmedWarning
+		}
 	}
 	r.snap.EnrollReachable = !r.opt.EnrollUnreachable
 	r.snap.ControlURL = r.opt.ControlURL
@@ -431,6 +439,12 @@ func (r *Reconciler) Step(ctx context.Context) (Snapshot, error) {
 	case ipn.Running.String():
 		r.markRegistered()
 		r.recoverSince = time.Time{}
+		if r.unconfirmedIdentity() {
+			// Discovery is what can confirm a changed token. A failure here
+			// leaves access closed; it is not a reason to mint.
+			_ = r.refreshIdentity(ctx)
+			profileID = r.observedProfile(ctx)
+		}
 		if snap, err, handled := r.settleIdentity(ctx, st, prefs, profileID); handled {
 			return snap, err
 		}
@@ -460,7 +474,7 @@ func (r *Reconciler) Step(ctx context.Context) (Snapshot, error) {
 			return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil
 		}
 		if r.needsLoginWhileStarting(st, prefs) {
-			return r.login(ctx, "starting-without-node", prefs, nodeID, profileID)
+			return r.login(ctx, "starting-without-node", prefs, nodeID, observedNodeKey(st), profileID)
 		}
 		return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil
 	case ipn.NeedsMachineAuth.String():
@@ -469,7 +483,7 @@ func (r *Reconciler) Step(ctx context.Context) (Snapshot, error) {
 		// A credential change while Stopped must enroll, not resume the old
 		// node and then enroll again once it is Running.
 		if r.shouldReenrollIdentity(nodeID, profileID) {
-			return r.login(ctx, "identity-mismatch", prefs, nodeID, profileID)
+			return r.login(ctx, "identity-mismatch", prefs, nodeID, observedNodeKey(st), profileID)
 		}
 		if snap, err := r.guardMutation(ctx, prefs.ControlURL); err != nil || snap.Phase != "" {
 			return snap, err
@@ -486,7 +500,7 @@ func (r *Reconciler) Step(ctx context.Context) (Snapshot, error) {
 			r.markRegistered()
 			return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil
 		}
-		return r.login(ctx, "needs-login", prefs, nodeID, profileID)
+		return r.login(ctx, "needs-login", prefs, nodeID, observedNodeKey(st), profileID)
 	default:
 		return r.set(func(s *Snapshot) { s.Phase = PhaseUnknown }), nil
 	}
@@ -629,6 +643,9 @@ func (r *Reconciler) stepForeign(ctx context.Context, st *ipnstate.Status, prefs
 	}
 	for _, p := range all {
 		if p.ID != "" && p.ID != cur.ID && SameControlURL(p.ControlURL, r.opt.ControlURL) {
+			if snap, err := r.guardProfileMutation(ctx); err != nil || snap.Phase != "" {
+				return snap, err
+			}
 			r.log.Info("switching to existing iDoris profile", "profile", p.ID, "from", cur.ID)
 			if cur.ID != "" {
 				r.previousProfile = cur.ID
@@ -642,6 +659,9 @@ func (r *Reconciler) stepForeign(ctx context.Context, st *ipnstate.Status, prefs
 	if r.recentLogin() {
 		return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil
 	}
+	if snap, err := r.guardProfileMutation(ctx); err != nil || snap.Phase != "" {
+		return snap, err
+	}
 	if cur.ID != "" {
 		r.previousProfile = cur.ID
 	}
@@ -654,12 +674,8 @@ func (r *Reconciler) stepForeign(ctx context.Context, st *ipnstate.Status, prefs
 	if err != nil {
 		return r.fail(fmt.Errorf("get prefs: %w", err)), err
 	}
-	return r.login(ctx, "foreign-or-empty-profile", base, nodeID, profileID)
+	return r.login(ctx, "foreign-or-empty-profile", base, nodeID, observedNodeKey(st), profileID)
 }
-
-// errOwnershipChanged means a re-read of prefs showed a different tailnet
-// than the one this pass decided to edit. The mutation was not issued.
-var errOwnershipChanged = errors.New("active tailnet changed during reconcile")
 
 // guardProfileMutation re-reads prefs and the active profile immediately
 // before SwitchProfile or SwitchToEmptyProfile. takeover=false and a foreign
@@ -699,6 +715,10 @@ func (r *Reconciler) guardProfileMutation(ctx context.Context) (Snapshot, error)
 	}), nil
 }
 
+// errOwnershipChanged means a re-read of prefs showed a different tailnet
+// than the one this pass decided to edit. The mutation was not issued.
+var errOwnershipChanged = errors.New("active tailnet changed during reconcile")
+
 // guardMutation re-reads the active prefs immediately before a mutation.
 // A zero snapshot and a nil error means the caller may proceed. Any other
 // result ends the pass: takeover=false and a foreign URL becomes
@@ -730,18 +750,33 @@ func (r *Reconciler) guardMutation(ctx context.Context, expectedControl string) 
 	}), errOwnershipChanged
 }
 
-func (r *Reconciler) login(ctx context.Context, reason string, base *ipn.Prefs, nodeID, profileID string) (Snapshot, error) {
+func (r *Reconciler) login(ctx context.Context, reason string, base *ipn.Prefs, nodeID, nodeKey, profileID string) (Snapshot, error) {
 	if r.recentLogin() {
 		return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil
 	}
 	if err := r.refreshIdentity(ctx); err != nil {
 		return r.fail(err), err
 	}
+	r.mu.RLock()
+	mode, role := r.opt.Mode, r.opt.Role
+	r.mu.RUnlock()
+	if mode == ModeEmbedded && RequiresSystem(role) {
+		err := fmt.Errorf("role %s requires system mode because embedded mode cannot receive inbound connections; this process selected embedded and will not enroll. Install and start the official tailscaled, then run idoris-vpnd in system mode", role)
+		return r.fail(err), err
+	}
 	// Recognise a credential or node change before the key is minted, on
 	// every path that logs in (NeedsLogin, Stopped, Starting, Running).
-	// The flag survives until the running node is no longer the one we
-	// refused, so reaching Running does not enroll a second time.
-	r.beginIdentityTransition(nodeID, profileID)
+	// The flag survives until the login's node key (or node ID) is visible
+	// and, in system mode, the profile is still the one this login used.
+	kept, err := r.beginIdentityTransition(nodeID, nodeKey, profileID)
+	if err != nil {
+		return r.fail(fmt.Errorf("persist identity transition: %w", err)), err
+	}
+	if kept {
+		// A previous process already finished StartLoginInteractive for this
+		// same node. Wait until Running shows the new key. Do not mint.
+		return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil
+	}
 	r.mu.Lock()
 	r.attempts++
 	r.mu.Unlock()
@@ -798,7 +833,9 @@ func (r *Reconciler) login(ctx context.Context, reason string, base *ipn.Prefs, 
 	if err := r.be.StartLoginInteractive(ctx); err != nil {
 		return r.fail(fmt.Errorf("login: %w", err)), err
 	}
-	r.markLoginOK()
+	if err := r.markLoginOK(ctx); err != nil {
+		return r.fail(fmt.Errorf("persist identity transition: %w", err)), err
+	}
 	return r.set(func(s *Snapshot) { s.Phase = PhaseStarting; s.LastError = "" }), nil
 }
 
@@ -836,48 +873,57 @@ func (r *Reconciler) refreshIdentity(ctx context.Context) error {
 }
 
 // settleIdentity refuses to call a Running node connected when the configured
-// credential, the running node, or (in system mode) the profile is not the
-// one the binding file names. The new login uses this same control URL,
-// which is allowed. The binding is rewritten only after that login returns
-// and the node we see is no longer the one that mismatched. An empty binding
-// does not certify a node that was already up; a fresh install that just
-// enrolled in this process does, because that login set the transition flag.
-// handled is true when the caller should return snap and err as the step result.
+// credential is not the one the binding file names. Completion is the login
+// transaction, not a new stable node ID: Headscale keeps that ID when the
+// same machine re-authenticates, and StartLoginInteractive forces a fresh
+// node public key. The binding is rewritten only after that login returns,
+// LocalAPI shows Running, the node key or the node ID differs from the one
+// recorded when the transition began, and (in system mode) the active
+// profile is still the profile that login returned under. A profile that
+// changed after the login is not certified; the transition restarts.
+// An empty binding does not certify a node that was already up. An empty
+// node ID on a binding that already names this tenant and role is filled in
+// once, without another key. handled is true when the caller should return
+// snap and err as the step result.
 func (r *Reconciler) settleIdentity(ctx context.Context, st *ipnstate.Status, prefs *ipn.Prefs, profileID string) (Snapshot, error, bool) {
 	nodeID := observedNode(st)
+	nodeKey := observedNodeKey(st)
 	if r.shouldReenrollIdentity(nodeID, profileID) {
-		snap, err := r.login(ctx, "identity-mismatch", prefs, nodeID, profileID)
+		snap, err := r.login(ctx, "identity-mismatch", prefs, nodeID, nodeKey, profileID)
 		return snap, err, true
 	}
 	awaiting, loginOK := r.identityFlags()
-	if awaiting {
-		if !loginOK {
-			if r.recentLogin() {
-				return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil, true
-			}
-			snap, err := r.login(ctx, "identity-mismatch", prefs, nodeID, profileID)
-			return snap, err, true
-		}
-		mismatchNode, mismatchProfile := r.mismatchIDs()
-		stillOld := mismatchNode != "" && nodeID == mismatchNode
-		if r.opt.Mode == ModeSystem && mismatchProfile != "" && profileID == mismatchProfile && (mismatchNode == "" || nodeID == mismatchNode) {
-			stillOld = true
-		}
-		if stillOld {
-			if r.recentLogin() {
-				return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil, true
-			}
-			snap, err := r.login(ctx, "identity-mismatch", prefs, nodeID, profileID)
-			return snap, err, true
-		}
+	if !awaiting {
 		if err := r.writeIdentity(nodeID, profileID); err != nil {
 			return r.fail(fmt.Errorf("save identity: %w", err)), err, true
 		}
-		_ = r.clearIdentityTransition()
 		return Snapshot{}, nil, false
+	}
+	if r.profileMoved(profileID) {
+		if err := r.restartIdentityTransition(nodeID, nodeKey, profileID); err != nil {
+			return r.fail(fmt.Errorf("persist identity transition: %w", err)), err, true
+		}
+		if r.recentLogin() {
+			return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil, true
+		}
+		snap, err := r.login(ctx, "identity-mismatch", prefs, nodeID, nodeKey, profileID)
+		return snap, err, true
+	}
+	// A key that has not rotated yet, or a login that has not returned, is
+	// not a completed enrollment. Grace expiry mints once more; the backoff
+	// window does not.
+	if !loginOK || !r.enrollmentProgressed(nodeID, nodeKey) {
+		if r.recentLogin() {
+			return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil, true
+		}
+		snap, err := r.login(ctx, "identity-mismatch", prefs, nodeID, nodeKey, profileID)
+		return snap, err, true
 	}
 	if err := r.writeIdentity(nodeID, profileID); err != nil {
 		return r.fail(fmt.Errorf("save identity: %w", err)), err, true
+	}
+	if err := r.clearIdentityTransition(); err != nil {
+		return r.fail(fmt.Errorf("clear identity transition: %w", err)), err, true
 	}
 	return Snapshot{}, nil, false
 }
@@ -886,12 +932,6 @@ func (r *Reconciler) identityFlags() (awaiting, loginOK bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.awaitingIdentity, r.identityLoginOK
-}
-
-func (r *Reconciler) mismatchIDs() (nodeID, profileID string) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.mismatchNode, r.mismatchProfile
 }
 
 // enrollmentProgressed reports whether LocalAPI is showing a node that this
@@ -926,12 +966,35 @@ func (r *Reconciler) profileMoved(current string) bool {
 	return r.loginProfile != "" && current != "" && r.loginProfile != current
 }
 
-func (r *Reconciler) markLoginOK() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.awaitingIdentity {
-		r.identityLoginOK = true
+// markLoginOK records that Start and StartLoginInteractive both returned,
+// and the profile LocalAPI is showing now. That profile, not the one from
+// before the login, is what a later pass must still be on.
+func (r *Reconciler) markLoginOK(ctx context.Context) error {
+	profile := ""
+	if r.opt.Mode == ModeSystem {
+		profile = r.observedProfile(ctx)
 	}
+	r.mu.Lock()
+	if !r.awaitingIdentity {
+		r.mu.Unlock()
+		return nil
+	}
+	r.identityLoginOK = true
+	if profile != "" {
+		r.loginProfile = profile
+	}
+	p := PendingLogin{
+		NodeID:    r.mismatchNode,
+		NodeKey:   r.mismatchKey,
+		ProfileID: r.loginProfile,
+		Started:   r.loginStarted,
+		LoginOK:   true,
+	}
+	r.mu.Unlock()
+	if r.opt.State == nil {
+		return nil
+	}
+	return r.opt.State.SetPending(p)
 }
 
 func (r *Reconciler) clearIdentityTransition() error {
@@ -950,29 +1013,122 @@ func (r *Reconciler) clearIdentityTransition() error {
 	return nil
 }
 
-// beginIdentityTransition records that this login is replacing the bound
-// node. It is a no-op when the binding already matches, so an ordinary
-// expiry re-login does not look like an identity change.
-func (r *Reconciler) beginIdentityTransition(nodeID, profileID string) {
-	if !r.shouldReenrollIdentity(nodeID, profileID) {
-		return
+// beginIdentityTransition records the node this login is replacing and
+// persists it before a key is minted. kept is true when a previous process
+// already finished StartLoginInteractive for this same node and the backoff
+// has not elapsed: the caller must not mint again. It is a no-op when the
+// binding already matches, so an ordinary expiry re-login does not look
+// like an identity change.
+func (r *Reconciler) beginIdentityTransition(nodeID, nodeKey, profileID string) (bool, error) {
+	awaiting, _ := r.identityFlags()
+	if !awaiting && !r.shouldReenrollIdentity(nodeID, profileID) {
+		return false, nil
+	}
+	r.mu.Lock()
+	same := r.awaitingIdentity && r.mismatchNode == nodeID && r.mismatchKey == nodeKey
+	if same && r.identityLoginOK && r.recentLogin() {
+		r.mu.Unlock()
+		return true, nil
+	}
+	prev := pendingIdentity{
+		awaiting: r.awaitingIdentity,
+		loginOK:  r.identityLoginOK,
+		node:     r.mismatchNode,
+		key:      r.mismatchKey,
+		profile:  r.loginProfile,
+		started:  r.loginStarted,
+	}
+	started := r.loginStarted
+	if started.IsZero() {
+		started = r.now()
+	}
+	r.awaitingIdentity = true
+	r.identityLoginOK = false
+	r.mismatchNode = nodeID
+	r.mismatchKey = nodeKey
+	r.loginProfile = profileID
+	r.loginStarted = started
+	wantTenant, wantRole := r.opt.Identity.Tenant, r.opt.Identity.Role
+	r.mu.Unlock()
+	if r.opt.State != nil {
+		err := r.opt.State.SetPending(PendingLogin{
+			NodeID:    nodeID,
+			NodeKey:   nodeKey,
+			ProfileID: profileID,
+			Started:   started,
+			LoginOK:   false,
+		})
+		if err != nil {
+			r.restorePending(prev)
+			return false, err
+		}
 	}
 	bound := DaemonState{}
 	if r.opt.State != nil {
 		bound = r.opt.State.Get()
 	}
-	r.mu.Lock()
-	r.awaitingIdentity = true
-	r.identityLoginOK = false
-	r.mismatchNode = nodeID
-	r.mismatchProfile = profileID
-	wantTenant, wantRole := r.opt.Identity.Tenant, r.opt.Identity.Role
-	r.mu.Unlock()
 	r.log.Warn("bound enrollment identity differs from the running node; re-enrolling",
 		"bound_tenant", bound.Tenant, "bound_role", bound.Role,
 		"bound_node", bound.NodeID, "bound_profile", bound.ProfileID,
 		"running_node", nodeID, "running_profile", profileID,
 		"want_tenant", wantTenant, "want_role", wantRole)
+	return false, nil
+}
+
+type pendingIdentity struct {
+	awaiting bool
+	loginOK  bool
+	node     string
+	key      string
+	profile  string
+	started  time.Time
+}
+
+func (r *Reconciler) restorePending(p pendingIdentity) {
+	r.mu.Lock()
+	r.awaitingIdentity = p.awaiting
+	r.identityLoginOK = p.loginOK
+	r.mismatchNode = p.node
+	r.mismatchKey = p.key
+	r.loginProfile = p.profile
+	r.loginStarted = p.started
+	r.mu.Unlock()
+}
+
+// restartIdentityTransition drops a login whose profile is no longer the
+// one that login returned under. The node now on screen becomes the mismatch
+// the next login has to replace. The binding is not rewritten.
+func (r *Reconciler) restartIdentityTransition(nodeID, nodeKey, profileID string) error {
+	r.mu.Lock()
+	prev := pendingIdentity{
+		awaiting: r.awaitingIdentity,
+		loginOK:  r.identityLoginOK,
+		node:     r.mismatchNode,
+		key:      r.mismatchKey,
+		profile:  r.loginProfile,
+		started:  r.loginStarted,
+	}
+	r.awaitingIdentity = true
+	r.identityLoginOK = false
+	r.mismatchNode = nodeID
+	r.mismatchKey = nodeKey
+	r.loginProfile = profileID
+	started := r.loginStarted
+	r.mu.Unlock()
+	if r.opt.State == nil {
+		return nil
+	}
+	err := r.opt.State.SetPending(PendingLogin{
+		NodeID:    nodeID,
+		NodeKey:   nodeKey,
+		ProfileID: profileID,
+		Started:   started,
+		LoginOK:   false,
+	})
+	if err != nil {
+		r.restorePending(prev)
+	}
+	return err
 }
 
 func (r *Reconciler) shouldReenrollIdentity(nodeID, profileID string) bool {
@@ -995,40 +1151,42 @@ func (r *Reconciler) shouldReenrollIdentity(nodeID, profileID string) bool {
 }
 
 // bindingMatches reports whether the stored binding names this credential
-// and the node that is actually running. An empty binding matches nothing:
-// an already-running node must be enrolled once before it is certified.
+// and the node that is actually running. A completely empty binding matches
+// nothing: an already-running node must be enrolled once before it is
+// certified. Empty node and profile IDs on a binding that already names the
+// tenant and role are filled in by writeIdentity; they are not a mismatch.
 // A fingerprint-only change still matches; writeIdentity updates the fingerprint.
 func (r *Reconciler) bindingMatches(nodeID, profileID string) bool {
 	if r.opt.State == nil {
 		return true
 	}
 	bound := r.opt.State.Get()
+	ident := r.boundIdentity()
+	if ident.Static {
+		if !bound.Static {
+			return false
+		}
+		if nodeID != "" && bound.NodeID != "" && bound.NodeID != nodeID {
+			return false
+		}
+		if r.opt.Mode == ModeSystem && profileID != "" && bound.ProfileID != "" && bound.ProfileID != profileID {
+			return false
+		}
+		return true
+	}
 	if bound.Tenant == "" && bound.Role == "" && bound.NodeID == "" && bound.ProfileID == "" {
 		return false
 	}
-	ident := r.boundIdentity()
 	if bound.Tenant != ident.Tenant || bound.Role != ident.Role {
 		return false
 	}
 	if nodeID != "" && bound.NodeID != "" && bound.NodeID != nodeID {
 		return false
 	}
-	if nodeID != "" && bound.NodeID == "" && !r.nodeBackfill() {
-		return false
-	}
 	if r.opt.Mode == ModeSystem && profileID != "" && bound.ProfileID != "" && bound.ProfileID != profileID {
 		return false
 	}
-	if r.opt.Mode == ModeSystem && profileID != "" && bound.ProfileID == "" && !r.nodeBackfill() {
-		return false
-	}
 	return true
-}
-
-func (r *Reconciler) nodeBackfill() bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.allowNodeBackfill
 }
 
 func (r *Reconciler) boundIdentity() Identity {
@@ -1039,7 +1197,7 @@ func (r *Reconciler) boundIdentity() Identity {
 
 func (r *Reconciler) writeIdentity(nodeID, profileID string) error {
 	ident := r.boundIdentity()
-	if r.opt.State == nil || !ident.Known {
+	if r.opt.State == nil || (!ident.Known && !ident.Static) {
 		return nil
 	}
 	bound := r.opt.State.Get()
@@ -1054,36 +1212,48 @@ func (r *Reconciler) writeIdentity(nodeID, profileID string) error {
 		// later system-mode start cannot inherit an unrelated id.
 		profileID = ""
 	}
-	if err := r.opt.State.SetIdentity(r.opt.ControlURL, ident.Tenant, ident.Role, ident.TokenFingerprint, nodeID, profileID); err != nil {
-		return err
+	if ident.Static {
+		return r.opt.State.SetStaticIdentity(r.opt.ControlURL, nodeID, profileID)
 	}
-	r.mu.Lock()
-	r.allowNodeBackfill = true
-	r.mu.Unlock()
-	return nil
+	return r.opt.State.SetIdentity(r.opt.ControlURL, ident.Tenant, ident.Role, ident.TokenFingerprint, nodeID, profileID)
 }
 
 // AccessIdentityOK is the gate's view of enrollment. It is false during an
-// identity transition that has not finished logging in, and false when the
-// binding does not name the node LocalAPI is showing. A degraded start with
-// a previously stored binding stays confirmed: discovery did not contradict it.
+// identity transition, and false when the binding does not name the node
+// LocalAPI is showing. A static key has no discovery: once the binding is
+// marked static and the running node does not contradict it, access opens.
+// A degraded start stays confirmed only when the token fingerprint matches
+// the saved binding and the running node does not contradict it.
 func (r *Reconciler) AccessIdentityOK(nodeID, profileID string) bool {
-	awaiting, loginOK := r.identityFlags()
-	if awaiting && !loginOK {
+	awaiting, _ := r.identityFlags()
+	if awaiting {
 		return false
 	}
-	if !r.boundIdentity().Known {
+	ident := r.boundIdentity()
+	if ident.Static {
+		if r.opt.State == nil {
+			return false
+		}
+		b := r.opt.State.Get()
+		if !b.Static {
+			return false
+		}
+		if nodeID != "" && b.NodeID != "" && nodeID != b.NodeID {
+			return false
+		}
+		if r.opt.Mode == ModeSystem && profileID != "" && b.ProfileID != "" && profileID != b.ProfileID {
+			return false
+		}
+		return true
+	}
+	if !ident.Known {
 		if r.opt.State == nil {
 			return true
 		}
-		b := r.opt.State.Get()
-		return b.Tenant != "" || b.Role != "" || b.NodeID != ""
+		return degradedContinuity(ident, r.opt.State.Get(), r.opt.Mode, nodeID, profileID)
 	}
 	if r.opt.State == nil {
-		return !awaiting
-	}
-	if awaiting {
-		return false
+		return true
 	}
 	return r.bindingMatches(nodeID, profileID)
 }
@@ -1337,14 +1507,4 @@ func fillSelf(s *Snapshot, st *ipnstate.Status) {
 			s.KeyExpiry = time.Time{}
 		}
 	}
-}
-
-func init() {
-	_ = observedNodeKey
-	_ = degradedContinuity
-	_ = (*Reconciler).guardProfileMutation
-	_ = (*Reconciler).enrollmentProgressed
-	_ = (*Reconciler).profileMoved
-	_ = (*Reconciler).unconfirmedIdentity
-	_ = (*Reconciler).unconfirmedLocked
 }
