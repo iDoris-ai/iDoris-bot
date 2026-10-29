@@ -32,6 +32,20 @@ type SOCKS5Status struct {
 	State  string `json:"state"`
 }
 
+// AccessOptions controls SOCKS5 authentication for StartAccess.
+type AccessOptions struct {
+	// SOCKS5User and SOCKS5Password are the RFC 1929 credential. Both empty
+	// means "look at the auth file". Setting only one is an error.
+	SOCKS5User     string
+	SOCKS5Password string
+	// AllowAnonymous permits a SOCKS5 listener with no authentication.
+	AllowAnonymous bool
+	// SOCKS5AuthFile is a 0600 file containing one "user:password" line.
+	SOCKS5AuthFile string
+	// StateDir, when set and SOCKS5AuthFile is empty, holds socks5.auth.
+	StateDir string
+}
+
 // LocalAccess is the set of loopback forwards and the optional SOCKS5 proxy.
 // It dials through Dialer and does not know whether that dialer is tsnet or
 // the kernel.
