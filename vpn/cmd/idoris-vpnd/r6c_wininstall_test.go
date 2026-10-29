@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -111,5 +112,107 @@ func TestR6CReplaceProtectsEmptyStageBeforeSecrets(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(liveDir, "enroll_token"))
 	if err != nil || string(got) != "enroll-secret\n" {
 		t.Fatalf("live token %q %v", got, err)
+	}
+}
+
+// TestR6CRetargetDecodesWindowsJSONPaths uses the JSON json.Marshal writes
+// for a Windows path. The staging directory appears there with doubled
+// backslashes, so a search of the raw text for the Go path string misses
+// it and leaves vpn.json pointing at the directory that install then deletes.
+func TestR6CRetargetDecodesWindowsJSONPaths(t *testing.T) {
+	staging := `C:\ProgramData\idoris-install-123`
+	live := `C:\ProgramData\idoris`
+	raw, err := json.Marshal(map[string]string{
+		"control_url":       "https://vpn.example",
+		"enroll_token_file": staging + `\enroll_token`,
+		"auth_key_file":     staging + `\auth_key`,
+		"socks5_auth_file":  staging + `\socks5.auth`,
+		"state_file":        `D:\keep\state.json`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	if strings.Contains(text, staging) {
+		t.Fatalf("fixture contains the unescaped staging path:\n%s", text)
+	}
+	if !strings.Contains(text, `C:\\ProgramData\\idoris-install-123`) {
+		t.Fatalf("marshal did not escape the staging path:\n%s", text)
+	}
+	out, err := retargetStagedConfig(raw, staging, live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("retarget output: %v\n%s", err, out)
+	}
+	want := map[string]string{
+		"enroll_token_file": live + `\enroll_token`,
+		"auth_key_file":     live + `\auth_key`,
+		"socks5_auth_file":  live + `\socks5.auth`,
+		"state_file":        `D:\keep\state.json`,
+		"control_url":       "https://vpn.example",
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("%s=%q, want %q\n%s", k, got[k], v, out)
+		}
+	}
+
+	// A credential that was never staged must come back as the original bytes.
+	outside, err := json.Marshal(map[string]string{
+		"enroll_token_file": `C:\Users\ada\enroll_token`,
+		"auth_key_file":     `C:\Users\ada\auth_key`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	same, err := retargetStagedConfig(outside, staging, live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(same) != string(outside) {
+		t.Fatalf("unrelated paths were rewritten:\n%s", same)
+	}
+
+	// Forward slashes are still a Windows path after JSON decoding.
+	slashed, err := json.Marshal(map[string]string{
+		"enroll_token_file": `C:/ProgramData/idoris-install-123/enroll_token`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err = retargetStagedConfig(slashed, staging, live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = nil
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["enroll_token_file"] != live+`\enroll_token` {
+		t.Fatalf("forward-slash staging path: %q\n%s", got["enroll_token_file"], out)
+	}
+
+	// Host-native paths still move, including when this test runs on Windows.
+	nativeStage := filepath.Join(string(filepath.Separator)+"var", "lib", "idoris", ".stage")
+	nativeLive := filepath.Join(string(filepath.Separator)+"var", "lib", "idoris")
+	native, err := json.Marshal(map[string]string{
+		"auth_key_file": filepath.Join(nativeStage, "auth_key"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err = retargetStagedConfig(native, nativeStage, nativeLive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = nil
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["auth_key_file"] != filepath.Join(nativeLive, "auth_key") {
+		t.Fatalf("native path %q", got["auth_key_file"])
 	}
 }

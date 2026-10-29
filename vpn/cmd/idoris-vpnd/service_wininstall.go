@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -227,23 +228,40 @@ func replaceFile(src, dest string) error {
 }
 
 func retargetStagedConfig(body []byte, staging, live string) ([]byte, error) {
-	if !strings.Contains(string(body), staging) {
-		return body, nil
-	}
+	// Compare decoded paths. On Windows a staging path is written into JSON
+	// with escaped backslashes, so it is not a substring of the raw text.
+	// filepath.Dir also uses the host separator, which does not split a
+	// Windows path when this function is tested on macOS or Linux.
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
 	var probe map[string]any
-	if err := json.Unmarshal(body, &probe); err != nil {
+	if err := dec.Decode(&probe); err != nil {
 		return nil, err
 	}
+	stageDir := parseInstallPath(staging)
 	changed := false
-	for k, v := range probe {
-		s, ok := v.(string)
+	for _, it := range stagedCredentialFiles {
+		raw, ok := probe[it.key]
+		if !ok || raw == nil {
+			continue
+		}
+		s, ok := raw.(string)
 		if !ok {
 			continue
 		}
-		if filepath.Clean(filepath.Dir(s)) != filepath.Clean(staging) {
+		s = strings.TrimSpace(s)
+		if s == "" {
 			continue
 		}
-		probe[k] = filepath.Join(live, filepath.Base(s))
+		parsed := parseInstallPath(s)
+		if !sameInstallDir(installParent(parsed), stageDir) {
+			continue
+		}
+		base := installBase(parsed)
+		if base == "" {
+			continue
+		}
+		probe[it.key] = joinInstallPath(live, base)
 		changed = true
 	}
 	if !changed {
@@ -254,6 +272,136 @@ func retargetStagedConfig(body []byte, staging, live string) ([]byte, error) {
 		return nil, err
 	}
 	return append(out, '\n'), nil
+}
+
+// isWindowsInstallPath reports a path whose separator or volume is Windows
+// syntax, including when this process is not running on Windows.
+func isWindowsInstallPath(p string) bool {
+	if strings.Contains(p, `\`) {
+		return true
+	}
+	return len(p) >= 2 && p[1] == ':' && isASCIILetter(p[0])
+}
+
+func isASCIILetter(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+}
+
+type installPathParts struct {
+	windows bool
+	volume  string
+	elems   []string
+}
+
+func parseInstallPath(p string) installPathParts {
+	if isWindowsInstallPath(p) {
+		return parseWindowsInstallPath(p)
+	}
+	clean := filepath.Clean(p)
+	vol := filepath.VolumeName(clean)
+	rest := clean
+	if vol != "" {
+		rest = strings.TrimPrefix(clean, vol)
+	}
+	rest = strings.Trim(rest, string(filepath.Separator))
+	var elems []string
+	if rest != "" && rest != "." {
+		elems = strings.Split(rest, string(filepath.Separator))
+	}
+	return installPathParts{windows: false, volume: vol, elems: elems}
+}
+
+func parseWindowsInstallPath(p string) installPathParts {
+	p = strings.ReplaceAll(p, `/`, `\`)
+	if strings.HasPrefix(p, `\\`) {
+		parts := cleanInstallElems(strings.Split(strings.TrimPrefix(p, `\\`), `\`))
+		if len(parts) >= 2 {
+			return installPathParts{
+				windows: true,
+				volume:  `\\` + parts[0] + `\` + parts[1],
+				elems:   parts[2:],
+			}
+		}
+		return installPathParts{windows: true, volume: p}
+	}
+	vol := ""
+	rest := p
+	if len(p) >= 2 && p[1] == ':' && isASCIILetter(p[0]) {
+		vol = p[:2]
+		rest = p[2:]
+	}
+	return installPathParts{
+		windows: true,
+		volume:  vol,
+		elems:   cleanInstallElems(strings.Split(rest, `\`)),
+	}
+}
+
+func cleanInstallElems(in []string) []string {
+	var out []string
+	for _, e := range in {
+		if e == "" || e == "." {
+			continue
+		}
+		if e == ".." && len(out) > 0 {
+			out = out[:len(out)-1]
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+func installParent(p installPathParts) installPathParts {
+	if len(p.elems) == 0 {
+		return p
+	}
+	parent := p
+	parent.elems = append([]string(nil), p.elems[:len(p.elems)-1]...)
+	return parent
+}
+
+func installBase(p installPathParts) string {
+	if len(p.elems) == 0 {
+		return ""
+	}
+	return p.elems[len(p.elems)-1]
+}
+
+func sameInstallDir(a, b installPathParts) bool {
+	if a.windows != b.windows {
+		return false
+	}
+	if a.windows {
+		if !strings.EqualFold(a.volume, b.volume) {
+			return false
+		}
+	} else if a.volume != b.volume {
+		return false
+	}
+	if len(a.elems) != len(b.elems) {
+		return false
+	}
+	for i := range a.elems {
+		if a.windows {
+			if !strings.EqualFold(a.elems[i], b.elems[i]) {
+				return false
+			}
+			continue
+		}
+		if a.elems[i] != b.elems[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func joinInstallPath(dir, base string) string {
+	if isWindowsInstallPath(dir) {
+		dir = strings.TrimRight(strings.ReplaceAll(dir, `/`, `\`), `\`)
+		return dir + `\` + base
+	}
+	return filepath.Join(dir, base)
 }
 
 // waitWindowsImageExit polls tasklist until image has no process left, or
