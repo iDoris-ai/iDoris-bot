@@ -630,8 +630,26 @@ func (e *wizEnv) waitStatus(t *testing.T, host string, budget time.Duration, con
 	panic("stub")
 }
 func (e *wizEnv) mustHealth(t *testing.T, host string, connected bool) {
-	panic("stub")
+	t.Helper()
+	// BusyBox wget drops the body and exits 1 on HTTP 503. A raw request
+	// keeps the status line and the phase name.
+	script := `printf 'GET /healthz HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n' | nc -w 3 127.0.0.1 7845`
+	out, err := e.exec(12*time.Second, "exec", "-T", host, "sh", "-c", script)
+	body := e.redact(out)
+	if err != nil {
+		t.Fatalf("healthz: %v\n%s", err, body)
+	}
+	if connected {
+		if !strings.Contains(body, "200") || !strings.Contains(body, "\nok") {
+			t.Fatalf("healthz want 200 ok:\n%s", body)
+		}
+		return
+	}
+	if !strings.Contains(body, "503") || !strings.Contains(body, string(vpnd.PhaseRoutesPending)) {
+		t.Fatalf("healthz want 503 %s:\n%s", vpnd.PhaseRoutesPending, body)
+	}
 }
+
 func (e *wizEnv) waitRoutes(t *testing.T, host string, budget time.Duration, cond func(gwRouteNode) (bool, string)) gwRouteNode {
 	panic("stub")
 }
