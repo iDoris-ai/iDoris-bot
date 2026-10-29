@@ -1,6 +1,8 @@
 package vpnd
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -49,16 +51,59 @@ func TestResolveStartupControl(t *testing.T) {
 }
 
 func TestRoleWhileEnrollDown(t *testing.T) {
-	if got := RoleWhileEnrollDown("member", "local-ai"); got != "local-ai" {
+	if got := RoleWhileEnrollDown("member", "local-ai", "fp", "fp"); got != "local-ai" {
 		t.Fatal(got)
 	}
-	if got := RoleWhileEnrollDown("member", ""); got != "member" {
+	if got := RoleWhileEnrollDown("member", "", "fp", "fp"); got != "member" {
 		t.Fatal(got)
 	}
-	if got := RoleWhileEnrollDown("admin", "nope"); got != "admin" {
+	if got := RoleWhileEnrollDown("admin", "nope", "fp", "fp"); got != "admin" {
 		t.Fatal(got)
 	}
-	if got := RoleWhileEnrollDown("member", "Gateway"); got != "gateway" {
+	if got := RoleWhileEnrollDown("member", "Gateway", "fp", "fp"); got != "gateway" {
 		t.Fatal(got)
+	}
+	// A saved role from a different token is not this credential.
+	if got := RoleWhileEnrollDown("member", "local-ai", "new", "old"); got != "member" {
+		t.Fatal(got)
+	}
+	if got := RoleWhileEnrollDown("local-ai", "member", "fp", "fp"); got != "local-ai" {
+		t.Fatal(got)
+	}
+}
+
+// TestR3C1MemberBindingDoesNotDowngradeLocalAI is the degraded start where a
+// saved member binding would otherwise replace an explicit local-ai role and
+// let auto mode come up embedded, reporting the old member node connected.
+func TestR3C1MemberBindingDoesNotDowngradeLocalAI(t *testing.T) {
+	const savedFP = "aaaaaaaaaaaaaaaa"
+	const currentFP = "bbbbbbbbbbbbbbbb"
+	role := RoleWhileEnrollDown("local-ai", "member", currentFP, savedFP)
+	if role != "local-ai" {
+		t.Fatalf("role %q", role)
+	}
+	// Same token, saved role still member: an explicit server role stays.
+	if got := RoleWhileEnrollDown("local-ai", "member", savedFP, savedFP); got != "local-ai" {
+		t.Fatalf("same fingerprint downgraded to %q", got)
+	}
+	d, err := DecideMode(ModeAuto, role, false, SystemView{Reachable: false}, ours)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Mode != ModeSystem || !d.Waiting {
+		t.Fatalf("discovery-down local-ai must wait for tailscaled, not run embedded: %+v", d)
+	}
+	be := &fakeBackend{statusErr: errors.New("tailscaled down")}
+	r := newR(t, be, &countingKeys{}, func(o *Options) {
+		o.Role = role
+		o.EnrollUnreachable = true
+		o.Identity = Identity{Known: false}
+	})
+	snap, err := r.Step(context.Background())
+	if err == nil {
+		t.Fatal("unreachable tailscaled must surface")
+	}
+	if snap.Phase == PhaseConnected || snap.Role == "member" || snap.Phase != PhaseWaitingTailscaled {
+		t.Fatalf("reported connected as member: %+v", snap)
 	}
 }
