@@ -20,6 +20,8 @@ import re
 import sys
 from pathlib import Path
 
+from enroll_lock import LeaveUnchanged, locked_update
+
 DEFAULT_ORG = "office"
 DEFAULT_ADMIN = "admin"
 NAME_RE = re.compile(r"^[a-z]([a-z0-9-]*[a-z0-9])?$")
@@ -501,20 +503,14 @@ def reconcile_gateway_lan_cidrs(cfg: dict, state: dict) -> bool:
     return changed
 
 
-def write_enroll_config(path: Path, cfg: dict) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    text = json.dumps(cfg, indent=2) + "\n"
-    tmp.write_text(text)
-    tmp.chmod(0o600)
-    tmp.replace(path)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Render idoris-managed Headscale policy regions.")
     parser.add_argument("command", choices=("init", "add-tenant", "reconcile-enroll"))
     parser.add_argument("--policy", type=Path)
     parser.add_argument("--state", required=True, type=Path)
     parser.add_argument("--config", type=Path)
+    parser.add_argument("--runtime-uid", type=int, default=None)
+    parser.add_argument("--runtime-gid", type=int, default=None)
     parser.add_argument("--org", default="")
     parser.add_argument("--admin", default=DEFAULT_ADMIN)
     parser.add_argument("--lan-cidr", action="append", default=[], dest="lan_cidr")
@@ -542,16 +538,28 @@ def main() -> None:
         state.setdefault("admins", [])
         state.setdefault("orgs", [])
         validate_state(state, allow_public=False, requested=[])
+        changed = {"value": False}
+
+        def mutate(cfg):
+            if not isinstance(cfg, dict):
+                die("enroll config is not an object")
+            changed["value"] = reconcile_gateway_lan_cidrs(cfg, state)
+            if not changed["value"]:
+                return LeaveUnchanged()
+            return cfg
+
         try:
-            cfg = json.loads(args.config.read_text())
+            locked_update(
+                args.config,
+                mutate,
+                runtime_uid=args.runtime_uid,
+                runtime_gid=args.runtime_gid,
+            )
         except json.JSONDecodeError as exc:
             die("cannot parse %s: %s" % (args.config, exc))
-        if not isinstance(cfg, dict):
-            die("enroll config is not an object")
-        changed = reconcile_gateway_lan_cidrs(cfg, state)
-        if changed:
-            write_enroll_config(args.config, cfg)
-        json.dump({"changed": changed}, sys.stdout)
+        except (OSError, ValueError, TypeError) as exc:
+            die("%s" % exc)
+        json.dump({"changed": changed["value"]}, sys.stdout)
         sys.stdout.write("\n")
         return
     if args.policy is None:
