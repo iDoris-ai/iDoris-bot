@@ -108,8 +108,130 @@ func (s *stringList) Set(v string) error {
 }
 
 func joinCmd(args []string, d deps) error {
-	panic("stub")
+	fs := flag.NewFlagSet("join", flag.ContinueOnError)
+	fs.SetOutput(d.stderr)
+	yes := fs.Bool("yes", false, "accept the recommended plan without prompting")
+	noService := fs.Bool("no-service", false, "do not install the user service")
+	roleOverride := fs.String("role-override", "", "member|local-ai|gateway|admin")
+	allowInsecure := fs.Bool("allow-insecure", false, "accept an http:// enrollment URL (labs only)")
+	whole := fs.Bool("whole-subnet", false, "advertise the whole LAN instead of device /32s")
+	var devices stringList
+	fs.Var(&devices, "device", "office device IP to advertise as /32 (repeatable)")
+	configPath := fs.String("config", "", "daemon config path (default ~/.idoris/vpn.json)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("join: expected one join code")
+	}
+	if *roleOverride != "" && !join.ValidRole(*roleOverride) {
+		return fmt.Errorf("join: role %q is not valid", *roleOverride)
+	}
+	// The code is a secret. Decode it and never print it.
+	payload, err := join.Decode(fs.Arg(0), join.Options{AllowInsecure: *allowInsecure})
+	if err != nil {
+		return err
+	}
+	role := payload.Role
+	if *roleOverride != "" {
+		role = *roleOverride
+	}
+	return d.runJoin(joinOpt{
+		payload: payload, role: role, yes: *yes, noService: *noService,
+		devices: []string(devices), whole: *whole, configPath: *configPath,
+	})
 }
+
+type joinOpt struct {
+	payload    join.Payload
+	role       string
+	yes        bool
+	noService  bool
+	devices    []string
+	whole      bool
+	configPath string
+}
+
+func (d *deps) runJoin(opt joinOpt) error {
+	if opt.whole && len(opt.devices) > 0 {
+		return errors.New("join: pass --device or --whole-subnet, not both")
+	}
+	paths, err := d.paths(opt.configPath)
+	if err != nil {
+		return err
+	}
+	approved, err := d.approvedCIDRs(opt.payload.EnrollURL, opt.payload.Token, opt.payload.EnrollURL != "" && strings.HasPrefix(opt.payload.EnrollURL, "http://"))
+	if err != nil {
+		_, _ = fmt.Fprintf(d.stderr, "discover failed (%s); continuing without the pre-approved list\n", err)
+		approved = nil
+	}
+	host, err := d.nodeHostname(opt.payload.HostnameHint)
+	if err != nil {
+		return err
+	}
+	allow := strings.HasPrefix(opt.payload.EnrollURL, "http://")
+	switch opt.role {
+	case join.RoleMember, join.RoleAdmin:
+		plan, err := gateway.SimplePlan(opt.role, opt.payload.Tenant, host)
+		if err != nil {
+			return err
+		}
+		return d.applyPlan(plan, paths, opt.payload, allow, opt.noService, opt.yes)
+	case join.RoleLocalAI:
+		plan, err := gateway.BuildPlan(gateway.Request{
+			ThisMachineIsLocalAI: true,
+			Tenant:               opt.payload.Tenant,
+			Hostname:             host,
+		})
+		if err != nil {
+			return err
+		}
+		return d.applyPlan(plan, paths, opt.payload, allow, opt.noService, opt.yes)
+	case join.RoleGateway:
+		localAI := false
+		if !opt.yes {
+			localAI, err = d.askYes(qLocalAI)
+			if err != nil {
+				return err
+			}
+		}
+		if localAI {
+			plan, err := gateway.BuildPlan(gateway.Request{
+				ThisMachineIsLocalAI: true,
+				Tenant:               opt.payload.Tenant,
+				Hostname:             host,
+			})
+			if err != nil {
+				return err
+			}
+			return d.applyPlan(plan, paths, opt.payload, allow, opt.noService, opt.yes)
+		}
+		devices := opt.devices
+		if !opt.yes && !opt.whole && len(devices) == 0 {
+			line, err := d.ask(qDevice)
+			if err != nil {
+				return err
+			}
+			if line == "" {
+				return errors.New("join: a gateway needs a device IP or --whole-subnet")
+			}
+			devices = []string{line}
+		}
+		if opt.yes && !opt.whole && len(devices) == 0 {
+			return errors.New("join: --yes on a gateway needs --device or --whole-subnet")
+		}
+		return d.gatewayApply(gateway.Request{
+			DeviceIPs:   devices,
+			WholeSubnet: opt.whole,
+			Approved:    approved,
+			Tenant:      opt.payload.Tenant,
+			Hostname:    host,
+		}, paths, opt.payload.Token, opt.payload.EnrollURL, allow, opt.noService, opt.yes)
+	default:
+		return fmt.Errorf("join: role %q is not valid", opt.role)
+	}
+}
+
 func (d *deps) ask(q string) (string, error) {
 	if _, err := fmt.Fprintf(d.stdout, "%s ", q); err != nil {
 		return "", err
@@ -300,6 +422,19 @@ func (d *deps) nodeHostname(hint string) (string, error) {
 		return "", fmt.Errorf("hostname: %w", err)
 	}
 	return strings.TrimSpace(h), nil
+}
+
+func (d *deps) approvedCIDRs(enrollURL, token string, allowInsecure bool) ([]string, error) {
+	if enrollURL == "" || token == "" {
+		return nil, errors.New("enrollment URL or token is empty")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	disc, err := d.doDiscover(ctx, enrollURL, token, allowInsecure)
+	if err != nil {
+		return nil, err
+	}
+	return disc.LANCIDRs, nil
 }
 
 func (d *deps) gatewayApply(req gateway.Request, paths idorisPaths, token, enrollURL string, allowInsecure, noService, yes bool) error {
