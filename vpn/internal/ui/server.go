@@ -172,6 +172,7 @@ type joinView struct {
 	Tenant    string   `json:"tenant"`
 	Hostname  string   `json:"hostname"`
 	Authority string   `json:"authority"`
+	JoinRev   uint64   `json:"join_rev"`
 	Approved  []string `json:"approved,omitempty"`
 	Warning   string   `json:"warning,omitempty"`
 }
@@ -617,6 +618,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	s.joinRev++
+	view.JoinRev = s.joinRev
 	s.join = &held
 	s.paths = paths
 	if s.plan != nil {
@@ -673,6 +675,8 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 		DeviceIPs            []string `json:"device_ips"`
 		WholeSubnet          bool     `json:"whole_subnet"`
 		ConfirmAuthority     bool     `json:"confirm_authority"`
+		Authority            string   `json:"authority"`
+		JoinRev              uint64   `json:"join_rev"`
 	}
 	if !readJSON(w, r, &body) {
 		return
@@ -685,10 +689,11 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Reject before dropping a plan or contacting the enrollment service.
-	// A missing confirmation is not a failed re-plan.
-	if !body.ConfirmAuthority {
+	// The confirmation has to name the authority and join revision now on
+	// the page. A bool left checked after a later save is not enough.
+	if msg := confirmMatches(s.join, s.joinRev, body.ConfirmAuthority, body.Authority, body.JoinRev); msg != "" {
 		s.mu.Unlock()
-		writeErr(w, http.StatusBadRequest, confirmAuthorityMsg)
+		writeErr(w, http.StatusBadRequest, msg)
 		return
 	}
 	if s.plan != nil {
@@ -772,6 +777,8 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		DeviceIPs            []string `json:"device_ips"`
 		WholeSubnet          bool     `json:"whole_subnet"`
 		ConfirmAuthority     bool     `json:"confirm_authority"`
+		Authority            string   `json:"authority"`
+		JoinRev              uint64   `json:"join_rev"`
 		ReplaceExisting      bool     `json:"replace_existing"`
 	}
 	if !readJSON(w, r, &body) {
@@ -784,9 +791,14 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "another apply is already running")
 		return
 	}
-	if !body.ConfirmAuthority {
+	if s.join == nil {
 		s.mu.Unlock()
-		writeErr(w, http.StatusBadRequest, confirmAuthorityMsg)
+		writeErr(w, http.StatusBadRequest, "paste a join code first")
+		return
+	}
+	if msg := confirmMatches(s.join, s.joinRev, body.ConfirmAuthority, body.Authority, body.JoinRev); msg != "" {
+		s.mu.Unlock()
+		writeErr(w, http.StatusBadRequest, msg)
 		return
 	}
 	if s.plan == nil || s.join == nil || s.plan.joinRev != s.joinRev || s.plan.detectGen != s.detectGen {
@@ -846,6 +858,26 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 const stalePlanMsg = "the plan is stale; build it again"
 const answerMismatchMsg = "the plan does not match the answers on the page; build it again"
 const confirmAuthorityMsg = "confirm this is your organization's server before applying"
+const confirmMismatchMsg = "confirmation does not match the displayed enrollment authority and join revision"
+
+// confirmMatches reports why a plan or apply must stop before discovery.
+// An empty string means the request names the join that is stored now.
+func confirmMatches(join *heldJoin, rev uint64, confirmed bool, authority string, gotRev uint64) string {
+	if join == nil {
+		return "paste a join code first"
+	}
+	if !confirmed {
+		return confirmAuthorityMsg
+	}
+	host, err := authorityHost(join.EnrollURL)
+	if err != nil {
+		return err.Error()
+	}
+	if gotRev != rev || !strings.EqualFold(strings.TrimSpace(authority), host) {
+		return confirmMismatchMsg
+	}
+	return ""
+}
 
 // discoverInto contacts the enrollment service only after the operator has
 // confirmed the authority. It records the result on held, which is a copy;
