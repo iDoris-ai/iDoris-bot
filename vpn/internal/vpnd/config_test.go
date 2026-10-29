@@ -115,6 +115,31 @@ func TestForwardsRejectNonLoopback(t *testing.T) {
 	}
 }
 
+func TestRoleDefaultsAndRejectsEmbeddedService(t *testing.T) {
+	c := &Config{AuthKey: "k", ControlURL: "https://x"}
+	if err := c.Resolve(); err != nil || c.Role != "member" {
+		t.Fatalf("default role: %v %+v", err, c.Role)
+	}
+	c = &Config{AuthKey: "k", ControlURL: "https://x", Role: "nope"}
+	if err := c.Resolve(); err == nil || !strings.Contains(err.Error(), "role") {
+		t.Fatalf("bad role: %v", err)
+	}
+	for _, role := range []string{"local-ai", "gateway", "Local-AI"} {
+		c = &Config{AuthKey: "k", ControlURL: "https://x", Mode: ModeEmbedded, Role: role}
+		if err := c.Resolve(); err == nil || !strings.Contains(err.Error(), "embedded") {
+			t.Fatalf("role %s: %v", role, err)
+		}
+	}
+	c = &Config{AuthKey: "k", ControlURL: "https://x", Mode: ModeSystem, Role: "local-ai"}
+	if err := c.Resolve(); err != nil || c.Role != "local-ai" {
+		t.Fatalf("system local-ai: %v %s", err, c.Role)
+	}
+	c = &Config{AuthKey: "k", ControlURL: "https://x", Mode: ModeAuto, Role: "gateway"}
+	if err := c.Resolve(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLoadConfigUnknownField(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "c.json")
 	_ = os.WriteFile(p, []byte(`{"control_url":"https://x","typo":1}`), 0o600)
