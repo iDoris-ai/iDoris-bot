@@ -2,7 +2,10 @@ module github.com/iDoris-ai/iDoris-bridge/vpn
 
 go 1.27.3
 
-require tailscale.com v1.104.2
+require (
+	golang.org/x/term v0.46.0
+	tailscale.com v1.104.2
+)
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
@@ -42,7 +45,6 @@ require (
 	golang.org/x/oauth2 v0.37.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
-	golang.org/x/term v0.46.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/time v0.16.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
