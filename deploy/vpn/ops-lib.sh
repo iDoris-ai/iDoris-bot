@@ -946,3 +946,301 @@ if host != bind or host_port != port:
     sys.exit("headplane binding %s:%s, want %s:%s" % (host, host_port, bind, port))
 ' "$bind" "$port" "$spec"
 }
+
+stop_db_writers() {
+  local svc rc
+  for svc in headplane-tailnet vpn-sidecar headplane headscale enroll; do
+    if service_running "$svc" || [[ -n "$(_compose_ps_id "$svc")" ]]; then
+      set +e
+      if [[ "$svc" == "vpn-sidecar" || "$svc" == "headplane-tailnet" ]]; then
+        compose --profile tailnet-admin stop "$svc"
+      else
+        compose stop "$svc"
+      fi
+      rc=$?
+      set -e
+      if [[ "$rc" -ne 0 ]]; then
+        echo "restore: stop $svc failed" >&2
+        return 1
+      fi
+      if service_running "$svc"; then
+        echo "restore: $svc is still running after stop" >&2
+        return 1
+      fi
+    fi
+  done
+  return 0
+}
+
+_restore_cleanup_temp() {
+  if [[ -n "${_restore_snap:-}" ]]; then
+    rm -f "$_restore_snap"
+  fi
+  if [[ -n "${_restore_host:-}" ]]; then
+    rm -rf "$_restore_host"
+  fi
+  if [[ -n "${_restore_vol:-}" ]]; then
+    rm -rf "$_restore_vol"
+  fi
+  _restore_snap=""
+  _restore_host=""
+  _restore_vol=""
+}
+
+_restore_on_exit() {
+  local rc=$?
+  trap - EXIT
+  if [[ "${_restore_ok:-0}" == "1" || "${_restore_phase:-0}" == "0" ]]; then
+    _restore_cleanup_temp
+    unset COMPOSE_PROJECT_LOCK
+    exit "$rc"
+  fi
+  echo "restore: rolling back after failure" >&2
+  _restore_rollback || echo "restore: rollback failed" >&2
+  _restore_cleanup_temp
+  unset COMPOSE_PROJECT_LOCK
+  exit "$rc"
+}
+
+_restore_rollback() {
+  if [[ -n "${_restore_host:-}" && -d "${_restore_host}" ]]; then
+    python3 - "$here" "$_restore_host" <<'PY'
+import os, shutil, sys
+here, snap = sys.argv[1:]
+meta = os.path.join(snap, "META")
+if os.path.isfile(meta):
+    for line in open(meta):
+        rel, uid, gid, mode = line.rstrip("\n").split(" ", 3)
+        src = os.path.join(snap, "files", rel)
+        dest = os.path.join(here, rel)
+        parent = os.path.dirname(dest)
+        if os.path.islink(parent) or os.path.islink(dest):
+            sys.exit("refusing to roll back through symlink %s" % dest)
+        os.makedirs(parent, exist_ok=True)
+        shutil.copy2(src, dest)
+        os.chmod(dest, int(mode, 8))
+        if os.geteuid() == 0:
+            os.chown(dest, int(uid), int(gid))
+missing = os.path.join(snap, "MISSING")
+if os.path.isfile(missing):
+    for rel in open(missing):
+        rel = rel.strip()
+        if not rel:
+            continue
+        dest = os.path.join(here, rel)
+        if os.path.lexists(dest) and not os.path.islink(dest):
+            os.remove(dest)
+PY
+  fi
+  if [[ -n "${_restore_vol:-}" && -f "${_restore_vol}/HAD" ]]; then
+    COMPOSE_PROJECT_LOCK="${_restore_dest}"
+    if [[ "$(cat "${_restore_vol}/HAD")" == "1" ]]; then
+      _restore_copy_volume_back "$_restore_vol" "${_restore_prev_mode}"
+    else
+      compose --profile tailnet-admin down -v >/dev/null 2>&1 || true
+    fi
+  fi
+  COMPOSE_PROJECT_LOCK="${_restore_current}"
+  if [[ -n "${_restore_snap:-}" && -f "${_restore_snap}" ]]; then
+    restore_running_services "$_restore_snap" "${_restore_prev_mode}" || true
+  fi
+}
+
+_restore_copy_volume_back() {
+  local dest="$1" mode="$2" hsid hpid
+  hsid="$(_compose_ps_id headscale)"
+  [[ -n "$hsid" ]] || return 1
+  compose stop headscale enroll >/dev/null 2>&1 || true
+  if [[ "$mode" == "tailnet-admin" ]]; then
+    compose --profile tailnet-admin stop vpn-sidecar headplane-tailnet >/dev/null 2>&1 || true
+  else
+    compose stop headplane >/dev/null 2>&1 || true
+  fi
+  docker cp "$dest/headscale/db.sqlite" "$hsid:/var/lib/headscale/db.sqlite"
+  docker cp "$dest/headscale/noise_private.key" "$hsid:/var/lib/headscale/noise_private.key"
+  if [[ -f "$dest/headscale/derp_server_private.key" ]]; then
+    docker cp "$dest/headscale/derp_server_private.key" "$hsid:/var/lib/headscale/derp_server_private.key"
+  fi
+  if [[ -f "$dest/headscale/db.sqlite-wal" ]]; then
+    docker cp "$dest/headscale/db.sqlite-wal" "$hsid:/var/lib/headscale/db.sqlite-wal"
+  else
+    wipe_headscale_wal "$hsid"
+  fi
+  if [[ -f "$dest/headscale/db.sqlite-shm" ]]; then
+    docker cp "$dest/headscale/db.sqlite-shm" "$hsid:/var/lib/headscale/db.sqlite-shm"
+  fi
+  chown_volume_to_image "$hsid" /var/lib/headscale
+  if [[ "$mode" == "tailnet-admin" ]]; then
+    hpid="$(_compose_ps_id headplane-tailnet)"
+  else
+    hpid="$(_compose_ps_id headplane)"
+  fi
+  if [[ -n "$hpid" && -d "$dest/headplane" ]]; then
+    docker cp "$dest/headplane/." "$hpid:/var/lib/headplane/"
+    chown_volume_to_image "$hpid" /var/lib/headplane
+  fi
+  if [[ -s "$dest/sidecar-state.tar" && -n "$(_compose_ps_id vpn-sidecar)" ]]; then
+    extract_sidecar_tar "$dest/sidecar-state.tar"
+  fi
+}
+
+_snapshot_host_files() {
+  local dest="$1"
+  python3 - "$here" "$dest" <<'PY'
+import os, shutil, sys
+here, dest = sys.argv[1:]
+rels = [
+    "enroll/config.json",
+    "enroll/headscale.apikey",
+    "enroll/minted-tokens.txt",
+    "headplane/cookie_secret",
+    ".env",
+    "headscale/managed.json",
+    "headscale/config.yaml",
+    "headscale/policy.hujson",
+    "headplane/config.yaml",
+    ".admin-mode",
+]
+meta = []
+missing = []
+for rel in rels:
+    src = os.path.join(here, rel)
+    if os.path.islink(src):
+        sys.exit("refusing to snapshot symlink %s" % src)
+    if os.path.isfile(src):
+        target = os.path.join(dest, "files", rel)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        shutil.copy2(src, target)
+        st = os.stat(src)
+        meta.append("%s %d %d %o" % (rel, st.st_uid, st.st_gid, st.st_mode & 0o777))
+    else:
+        missing.append(rel)
+open(os.path.join(dest, "META"), "w").write("\n".join(meta) + ("\n" if meta else ""))
+open(os.path.join(dest, "MISSING"), "w").write("\n".join(missing) + ("\n" if missing else ""))
+os.chmod(os.path.join(dest, "META"), 0o600)
+os.chmod(os.path.join(dest, "MISSING"), 0o600)
+PY
+}
+
+_snapshot_volumes() {
+  local dest="$1" mode="$2" hsid hpid
+  mkdir -p "$dest/headscale" "$dest/headplane"
+  chmod 700 "$dest" "$dest/headscale" "$dest/headplane"
+  hsid="$(_compose_ps_id headscale)"
+  if [[ -z "$hsid" ]]; then
+    printf '0\n' > "$dest/HAD"
+    return 0
+  fi
+  printf '1\n' > "$dest/HAD"
+  docker cp "$hsid:/var/lib/headscale/db.sqlite" "$dest/headscale/db.sqlite"
+  docker cp "$hsid:/var/lib/headscale/noise_private.key" "$dest/headscale/noise_private.key"
+  docker cp "$hsid:/var/lib/headscale/derp_server_private.key" "$dest/headscale/derp_server_private.key" 2>/dev/null \
+    || rm -f "$dest/headscale/derp_server_private.key"
+  docker cp "$hsid:/var/lib/headscale/db.sqlite-wal" "$dest/headscale/db.sqlite-wal" 2>/dev/null \
+    || rm -f "$dest/headscale/db.sqlite-wal"
+  docker cp "$hsid:/var/lib/headscale/db.sqlite-shm" "$dest/headscale/db.sqlite-shm" 2>/dev/null \
+    || rm -f "$dest/headscale/db.sqlite-shm"
+  if [[ ! -s "$dest/headscale/db.sqlite" || ! -s "$dest/headscale/noise_private.key" ]]; then
+    echo "restore: volume snapshot is missing the database" >&2
+    return 1
+  fi
+  if [[ "$mode" == "tailnet-admin" ]]; then
+    hpid="$(_compose_ps_id headplane-tailnet)"
+  else
+    hpid="$(_compose_ps_id headplane)"
+  fi
+  if [[ -n "$hpid" ]]; then
+    docker cp "$hpid:/var/lib/headplane/." "$dest/headplane/"
+  fi
+  if [[ -n "$(_compose_ps_id vpn-sidecar)" ]]; then
+    copy_sidecar_state "$dest/sidecar-state.tar" || true
+  fi
+  return 0
+}
+
+_install_bundle_host() {
+  local bundle="$1" info="$2" rel mode uid gid
+  local -a rels=(
+    "state/enroll/config.json|enroll/config.json"
+    "state/enroll/headscale.apikey|enroll/headscale.apikey"
+    "state/headplane/cookie_secret|headplane/cookie_secret"
+    "state/headscale/managed.json|headscale/managed.json"
+    "state/headscale/config.yaml|headscale/config.yaml"
+    "state/headscale/policy.hujson|headscale/policy.hujson"
+    "state/headplane/config.yaml|headplane/config.yaml"
+  )
+  for rel in "${rels[@]}"; do
+    restore_private "$bundle/${rel%%|*}" "$here/${rel#*|}"
+    apply_restored_mode "$bundle/manifest.json" "${rel%%|*}" "$here/${rel#*|}"
+  done
+  python3 -c '
+import json, os, sys
+info = json.loads(sys.argv[1])
+lines = ["%s=%s\n" % (key, info["dotenv"][key]) for key in sorted(info["dotenv"])]
+open(sys.argv[2], "w").writelines(lines)
+os.chmod(sys.argv[2], 0o600)
+' "$info" "$here/.env"
+  apply_restored_mode "$bundle/manifest.json" "state/dotenv" "$here/.env"
+  mode="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("admin_mode") or "")' "$info")"
+  if [[ -n "$mode" ]]; then
+    write_admin_mode "$mode"
+  fi
+  if ! cmp -s "$bundle/state/compose.yaml" "$here/compose.yaml"; then
+    echo "restore: bundle compose.yaml differs from this checkout; keeping the checkout file" >&2
+  fi
+  uid="$(dotenv_value ENROLL_UID || true)"
+  gid="$(dotenv_value ENROLL_GID || true)"
+  chown_enroll_runtime "${uid:-65532}" "${gid:-65532}"
+}
+
+_install_bundle_volumes() {
+  local bundle="$1" mode="$2" hsid hpid
+  ensure_mode_containers "$mode"
+  hsid="$(_compose_ps_id headscale)"
+  [[ -n "$hsid" ]] || die "headscale container is missing after create"
+  if [[ ! -f "$bundle/headscale/db.sqlite-wal" ]]; then
+    wipe_headscale_wal "$hsid"
+  fi
+  docker cp "$bundle/headscale/db.sqlite" "$hsid:/var/lib/headscale/db.sqlite"
+  docker cp "$bundle/headscale/noise_private.key" "$hsid:/var/lib/headscale/noise_private.key"
+  if [[ -f "$bundle/headscale/derp_server_private.key" ]]; then
+    docker cp "$bundle/headscale/derp_server_private.key" "$hsid:/var/lib/headscale/derp_server_private.key"
+  else
+    echo "restore: backup has no DERP key (embedded DERP was off); leaving it unset" >&2
+  fi
+  if [[ -f "$bundle/headscale/db.sqlite-wal" ]]; then
+    docker cp "$bundle/headscale/db.sqlite-wal" "$hsid:/var/lib/headscale/db.sqlite-wal"
+  fi
+  if [[ -f "$bundle/headscale/db.sqlite-shm" ]]; then
+    docker cp "$bundle/headscale/db.sqlite-shm" "$hsid:/var/lib/headscale/db.sqlite-shm"
+  fi
+  chown_volume_to_image "$hsid" /var/lib/headscale
+  hpid="$(headplane_writer_id "$mode")"
+  if [[ -d "$bundle/headplane" ]]; then
+    docker cp "$bundle/headplane/." "$hpid:/var/lib/headplane/"
+    chown_volume_to_image "$hpid" /var/lib/headplane
+  fi
+  if [[ "$mode" == "tailnet-admin" && -f "$bundle/sidecar/state.tar" ]]; then
+    extract_sidecar_tar "$bundle/sidecar/state.tar"
+  fi
+}
+
+_start_restored_stack() {
+  local mode="$1" bundle="$2"
+  enforce_headplane_exclusion "$mode"
+  assert_compose_bindings "$mode"
+  if [[ "$mode" == "tailnet-admin" ]]; then
+    compose up -d --force-recreate --wait --wait-timeout 180 headscale enroll
+    if [[ -f "$bundle/sidecar/state.tar" || -n "${VPN_SERVER_ENROLL_TOKEN:-}" ]]; then
+      compose --profile tailnet-admin up -d --force-recreate --wait --wait-timeout 180 vpn-sidecar headplane-tailnet
+    else
+      echo "restore: no sidecar state and no VPN_SERVER_ENROLL_TOKEN; headscale and enroll are up" >&2
+      echo "restore: recover the admin node with:" >&2
+      echo "  bash $here/ctl.sh token new --entry vpn-server --label recovery --enroll-url https://enroll.example.org" >&2
+      echo "  export VPN_SERVER_ENROLL_TOKEN from that command, then: bash $here/ctl.sh up --tailnet-admin" >&2
+    fi
+  else
+    compose up -d --force-recreate --wait --wait-timeout 180 headscale enroll headplane
+  fi
+  verify_published_bindings "$mode"
+}
