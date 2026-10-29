@@ -45,8 +45,27 @@ type wizNets struct {
 }
 
 func wizChooseNets() (wizNets, error) {
-	panic("stub")
+	var b [2]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return wizNets{}, err
+	}
+	// 200-219 stays clear of the LAN suite, which uses 240-254.
+	second := 200 + int(b[0]%20)
+	third := int(b[1] % 200)
+	octet := func(n int) string { return fmt.Sprintf("%d", n) }
+	host := func(th, last int) string {
+		return "10." + octet(second) + "." + octet(th) + "." + octet(last)
+	}
+	return wizNets{
+		officeCIDR: "10." + octet(second) + "." + octet(third) + ".0/24",
+		officeGW:   host(third, 1),
+		homeCIDR:   "10." + octet(second) + "." + octet(third+1) + ".0/24",
+		homeGW:     host(third+1, 1),
+		echo:       host(third, 10),
+		echoB:      host(third, 11),
+	}, nil
 }
+
 func wizProjectName() (string, error) {
 	var b [3]byte
 	if _, err := rand.Read(b[:]); err != nil {
