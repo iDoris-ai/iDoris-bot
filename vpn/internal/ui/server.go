@@ -672,6 +672,7 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 		ThisMachineIsLocalAI bool     `json:"this_machine_is_local_ai"`
 		DeviceIPs            []string `json:"device_ips"`
 		WholeSubnet          bool     `json:"whole_subnet"`
+		ConfirmAuthority     bool     `json:"confirm_authority"`
 	}
 	if !readJSON(w, r, &body) {
 		return
@@ -681,6 +682,13 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	if s.join == nil {
 		s.mu.Unlock()
 		writeErr(w, http.StatusBadRequest, "paste a join code first")
+		return
+	}
+	// Reject before dropping a plan or contacting the enrollment service.
+	// A missing confirmation is not a failed re-plan.
+	if !body.ConfirmAuthority {
+		s.mu.Unlock()
+		writeErr(w, http.StatusBadRequest, confirmAuthorityMsg)
 		return
 	}
 	if s.plan != nil {
@@ -758,6 +766,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		ThisMachineIsLocalAI bool     `json:"this_machine_is_local_ai"`
 		DeviceIPs            []string `json:"device_ips"`
 		WholeSubnet          bool     `json:"whole_subnet"`
+		ConfirmAuthority     bool     `json:"confirm_authority"`
 	}
 	if !readJSON(w, r, &body) {
 		return
@@ -767,6 +776,11 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	if s.applying {
 		s.mu.Unlock()
 		writeErr(w, http.StatusConflict, "another apply is already running")
+		return
+	}
+	if !body.ConfirmAuthority {
+		s.mu.Unlock()
+		writeErr(w, http.StatusBadRequest, confirmAuthorityMsg)
 		return
 	}
 	if s.plan == nil || s.join == nil || s.plan.joinRev != s.joinRev || s.plan.detectGen != s.detectGen {
@@ -823,6 +837,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 
 const stalePlanMsg = "the plan is stale; build it again"
 const answerMismatchMsg = "the plan does not match the answers on the page; build it again"
+const confirmAuthorityMsg = "confirm this is your organization's server before applying"
 
 // discoverInto contacts the enrollment service only after the operator has
 // confirmed the authority. It records the result on held, which is a copy;
