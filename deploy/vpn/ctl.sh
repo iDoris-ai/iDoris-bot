@@ -18,7 +18,7 @@ die() { echo "ctl: $*" >&2; exit 1; }
 # shellcheck source=ops-lib.sh
 source "$here/ops-lib.sh"
 
-hs() { docker compose exec -T headscale headscale "$@"; }
+hs() { compose exec -T headscale headscale "$@"; }
 
 # Copy one file out of a container. A missing path is skipped: Headscale does
 # not create derp_server_private.key while embedded DERP is disabled. docker cp
@@ -164,7 +164,7 @@ enroll_dir() {
 # Writable mount of the enroll directory: invite writes a temp file next to
 # config.json. The image rootfs is read-only; this directory is not.
 enroll_cli() {
-  docker compose run --rm --no-deps -T \
+  compose run --rm --no-deps -T \
     --user "$(enroll_run_user)" \
     --entrypoint idoris-vpn-enroll \
     -v "$(enroll_dir):/work" \
@@ -176,7 +176,7 @@ reload_enroll() {
     # invite and revoke replace config.json by rename. A file bind keeps the
     # old inode, so SIGHUP does not see the new file. Restart re-binds the
     # path. bootstrap.sh does the same after it renames this file.
-    docker compose restart enroll >/dev/null
+    compose restart enroll >/dev/null
     echo "restarted enroll so it reloads config.json"
   else
     echo "enroll is not running; the next start reads config.json"
@@ -307,7 +307,7 @@ case "$cmd" in
     usage
     ;;
   status)
-    docker compose ps
+    compose ps
     hs health
     ;;
   health)
@@ -434,7 +434,7 @@ case "$cmd" in
         ;;
       reload)
         hs policy check -f /etc/headscale/policy.hujson
-        docker compose kill -s HUP headscale >/dev/null
+        compose kill -s HUP headscale >/dev/null
         echo "policy reloaded (SIGHUP)"
         ;;
       *)
@@ -500,9 +500,9 @@ case "$cmd" in
     done
     [[ "$tailn" =~ ^[0-9]+$ ]] || die "--tail needs an integer"
     if [[ -n "$service" ]]; then
-      docker compose logs --tail "$tailn" "$service" | redact
+      compose logs --tail "$tailn" "$service" | redact
     else
-      docker compose logs --tail "$tailn" | redact
+      compose logs --tail "$tailn" | redact
     fi
     ;;
   backup)
@@ -522,22 +522,28 @@ case "$cmd" in
     prepare_backup_dest "$dest"
     hs_version="not-running"
     if service_running headscale; then
-      hs_version="$(docker compose exec -T headscale headscale version 2>/dev/null | tr -d '\r' || echo unknown)"
+      hs_version="$(compose exec -T headscale headscale version 2>/dev/null | tr -d '\r' || echo unknown)"
     fi
     snap="$(mktemp "$here/.running.XXXXXX")"
     snapshot_running "$snap"
     mkdir -p "$dest/headscale" "$dest/headplane" "$dest/state"
-    echo "stopping the running Headplane writer and headscale (mode=$mode)..."
-    if snapshot_has "$snap" headscale; then
-      docker compose stop headscale
-    fi
-    stop_headplane_writers
     cleanup_backup() {
       restore_running_services "$snap" "$mode" || true
       rm -f "$snap"
     }
     trap cleanup_backup EXIT
-    hsid="$(docker compose ps -aq headscale)"
+    echo "stopping the running Headplane writer, sidecar and headscale (mode=$mode)..."
+    if snapshot_has "$snap" headplane-tailnet; then
+      compose --profile tailnet-admin stop headplane-tailnet
+    fi
+    if [[ -n "$(_compose_ps_id vpn-sidecar)" ]]; then
+      compose --profile tailnet-admin stop vpn-sidecar
+    fi
+    if snapshot_has "$snap" headscale; then
+      compose stop headscale
+    fi
+    stop_headplane_writers
+    hsid="$(compose ps -aq headscale)"
     hpid="$(headplane_writer_id "$mode")"
     [[ -n "$hsid" ]] || die "headscale container is missing; start the stack first"
     docker cp "$hsid:/var/lib/headscale/db.sqlite" "$dest/headscale/db.sqlite"
@@ -564,6 +570,7 @@ case "$cmd" in
     copy_private "$here/headscale/policy.hujson" "$dest/state/headscale/policy.hujson"
     copy_private "$here/headplane/config.yaml" "$dest/state/headplane/config.yaml"
     copy_private "$here/compose.yaml" "$dest/state/compose.yaml"
+    copy_sidecar_state "$dest/sidecar/state.tar"
     if [[ -f "$(admin_mode_file)" ]]; then
       copy_private "$(admin_mode_file)" "$dest/admin-mode"
     fi
@@ -572,6 +579,7 @@ case "$cmd" in
     trap - EXIT
     restore_running_services "$snap" "$mode"
     rm -f "$snap"
+    printf 'backup_dir=%s\n' "$dest"
     echo "backup written to $dest (admin mode $mode; the other Headplane was not started)"
     cat <<EOF
 
@@ -579,12 +587,15 @@ Restore (overwrites the live database and the host state files):
   bash $here/ctl.sh restore $dest --force
 The other Headplane stays stopped. Do not restore a backup onto a newer
 Headscale minor than the one that wrote it.
+The checkout compose.yaml is not replaced. sidecar/state.tar, when present,
+is the admin node's private key: mode 0700 on the directory, encrypt it
+before it leaves the machine.
 
-Off-host copy (encrypt before the archive leaves this machine; this repo
-does not ship a key). cron, every day at 03:15 UTC:
-  15 3 * * * umask 077; tar -C $(dirname "$dest") -cf - $(basename "$dest") | age -r AGE_RECIPIENT -o /mnt/offhost/idoris-vpn-\$(date -u +\\%Y\\%m\\%d).tar.age
-A systemd timer that runs the same command is equivalent. Keep the age
-identity off this host.
+Off-host copy. Each run takes a new snapshot, then archives that snapshot.
+Monitor idoris-vpn-backup.created (the bundle created_utc), not the archive mtime.
+Keep the age identity off this host.
+
+$(offhost_cron_line "$here/offhost-backup.sh" "/mnt/offhost")
 EOF
     ;;
   restore)
@@ -599,110 +610,7 @@ EOF
       esac
     done
     (( force )) || die "refusing to overwrite the live deployment without --force"
-    for rel in \
-      manifest.json \
-      headscale/db.sqlite \
-      headscale/noise_private.key \
-      state/enroll/config.json \
-      state/enroll/headscale.apikey \
-      state/headplane/cookie_secret \
-      state/dotenv \
-      state/headscale/managed.json \
-      state/headscale/config.yaml \
-      state/headscale/policy.hujson \
-      state/headplane/config.yaml \
-      state/compose.yaml
-    do
-      [[ -f "$dest/$rel" && ! -L "$dest/$rel" ]] || die "backup is missing $rel"
-    done
-    # Bundles taken while labels lived in a sidecar may still contain this
-    # file. It is not a credential store anymore. Missing is fine; present
-    # is ignored and not copied back.
-    if [[ -e "$dest/state/enroll/token-labels.json" || -L "$dest/state/enroll/token-labels.json" ]]; then
-      echo "restore: ignoring obsolete state/enroll/token-labels.json" >&2
-    fi
-    mode="$(read_admin_mode)"
-    if [[ -f "$dest/admin-mode" ]]; then
-      saved="$(sed -n 's/^mode=//p' "$dest/admin-mode" | head -n1 | tr -d '[:space:]')"
-      case "$saved" in
-        published|tailnet-admin) mode="$saved" ;;
-        *) die "backup admin-mode is '$saved'" ;;
-      esac
-    fi
-    # Host files first: compose refuses to create missing secret bind sources.
-    restore_private "$dest/state/enroll/config.json" "$here/enroll/config.json"
-    restore_private "$dest/state/enroll/headscale.apikey" "$here/enroll/headscale.apikey"
-    restore_private "$dest/state/headplane/cookie_secret" "$here/headplane/cookie_secret"
-    restore_private "$dest/state/dotenv" "$here/.env"
-    restore_private "$dest/state/headscale/managed.json" "$here/headscale/managed.json"
-    restore_private "$dest/state/headscale/config.yaml" "$here/headscale/config.yaml"
-    restore_private "$dest/state/headscale/policy.hujson" "$here/headscale/policy.hujson"
-    restore_private "$dest/state/headplane/config.yaml" "$here/headplane/config.yaml"
-    restore_private "$dest/state/compose.yaml" "$here/compose.yaml"
-    apply_restored_mode "$dest/manifest.json" "state/dotenv" "$here/.env"
-    apply_restored_mode "$dest/manifest.json" "state/enroll/config.json" "$here/enroll/config.json"
-    apply_restored_mode "$dest/manifest.json" "state/enroll/headscale.apikey" "$here/enroll/headscale.apikey"
-    apply_restored_mode "$dest/manifest.json" "state/headplane/cookie_secret" "$here/headplane/cookie_secret"
-    apply_restored_mode "$dest/manifest.json" "state/headscale/managed.json" "$here/headscale/managed.json"
-    apply_restored_mode "$dest/manifest.json" "state/headscale/config.yaml" "$here/headscale/config.yaml"
-    apply_restored_mode "$dest/manifest.json" "state/headscale/policy.hujson" "$here/headscale/policy.hujson"
-    apply_restored_mode "$dest/manifest.json" "state/headplane/config.yaml" "$here/headplane/config.yaml"
-    apply_restored_mode "$dest/manifest.json" "state/compose.yaml" "$here/compose.yaml"
-    write_admin_mode "$mode"
-    snap="$(mktemp "$here/.running.XXXXXX")"
-    snapshot_running "$snap"
-    if snapshot_has "$snap" headscale || [[ -n "$(_compose_ps_id headscale)" ]]; then
-      docker compose stop headscale >/dev/null 2>&1 || true
-    fi
-    stop_headplane_writers
-    if snapshot_has "$snap" enroll || [[ -n "$(_compose_ps_id enroll)" ]]; then
-      docker compose stop enroll >/dev/null 2>&1 || true
-    fi
-    ensure_mode_containers "$mode"
-    docker compose stop headscale enroll >/dev/null 2>&1 || true
-    stop_headplane_writers
-    hsid="$(_compose_ps_id headscale)"
-    hpid="$(headplane_writer_id "$mode")"
-    [[ -n "$hsid" ]] || die "headscale container is missing after create"
-    # A newer WAL would replay over the restored database. Remove it when
-    # this backup has none, before the database file is copied in.
-    if [[ ! -f "$dest/headscale/db.sqlite-wal" ]]; then
-      wipe_headscale_wal "$hsid"
-    fi
-    docker cp "$dest/headscale/db.sqlite" "$hsid:/var/lib/headscale/db.sqlite"
-    docker cp "$dest/headscale/noise_private.key" "$hsid:/var/lib/headscale/noise_private.key"
-    if [[ -f "$dest/headscale/derp_server_private.key" && ! -L "$dest/headscale/derp_server_private.key" ]]; then
-      [[ -s "$dest/headscale/derp_server_private.key" ]] || die "backup DERP key is empty"
-      docker cp "$dest/headscale/derp_server_private.key" "$hsid:/var/lib/headscale/derp_server_private.key"
-    else
-      echo "restore: backup has no DERP key (embedded DERP was off); leaving it unset" >&2
-    fi
-    if [[ -f "$dest/headscale/db.sqlite-wal" ]]; then
-      docker cp "$dest/headscale/db.sqlite-wal" "$hsid:/var/lib/headscale/db.sqlite-wal"
-    fi
-    if [[ -f "$dest/headscale/db.sqlite-shm" ]]; then
-      docker cp "$dest/headscale/db.sqlite-shm" "$hsid:/var/lib/headscale/db.sqlite-shm"
-    fi
-    chown_volume_to_image "$hsid" /var/lib/headscale
-    if [[ -d "$dest/headplane" ]]; then
-      docker cp "$dest/headplane/." "$hpid:/var/lib/headplane/"
-      chown_volume_to_image "$hpid" /var/lib/headplane
-    fi
-    if ! snapshot_has "$snap" headscale; then
-      printf 'headscale\n' >> "$snap"
-    fi
-    if ! snapshot_has "$snap" enroll; then
-      printf 'enroll\n' >> "$snap"
-    fi
-    if [[ "$mode" == "tailnet-admin" ]]; then
-      snapshot_has "$snap" headplane-tailnet || printf 'headplane-tailnet\n' >> "$snap"
-      snapshot_has "$snap" vpn-sidecar || printf 'vpn-sidecar\n' >> "$snap"
-    elif ! snapshot_has "$snap" headplane; then
-      printf 'headplane\n' >> "$snap"
-    fi
-    restore_running_services "$snap" "$mode"
-    rm -f "$snap"
-    echo "restored from $dest (admin mode $mode; the other Headplane stays stopped)"
+    restore_deployment "$dest"
     ;;
   up)
     mode="$(read_admin_mode)"
@@ -756,7 +664,7 @@ EOF
     start_stack_for_mode "$mode"
     ;;
   down)
-    docker compose --profile tailnet-admin down
+    compose --profile tailnet-admin down
     ;;
   upgrade)
     cat <<'EOF'
