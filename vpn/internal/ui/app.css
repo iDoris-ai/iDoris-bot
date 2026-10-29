@@ -1,0 +1,65 @@
+:root {
+  color: #1c1915;
+  background: #f6f3ee;
+  font-family: "Iowan Old Style", "Palatino Linotype", Palatino, serif;
+}
+body {
+  margin: 0 auto;
+  max-width: 42rem;
+  padding: 1.5rem 1.2rem 3rem;
+}
+h1 { font-size: 1.6rem; margin-bottom: 0.2rem; }
+h2 { font-size: 1.15rem; margin-top: 1.6rem; }
+section {
+  background: #fff;
+  border: 1px solid #e4ddd2;
+  border-radius: 8px;
+  padding: 0.2rem 1rem 1rem;
+  margin-top: 1rem;
+}
+button {
+  font: inherit;
+  background: #2c4a3e;
+  color: #fff;
+  border: 0;
+  border-radius: 6px;
+  padding: 0.45rem 0.8rem;
+  margin: 0.3rem 0.4rem 0.3rem 0;
+  cursor: pointer;
+}
+button.choice { background: #5c5346; }
+button.on { outline: 2px solid #2c4a3e; }
+label.block { display: block; margin: 0.6rem 0; }
+input[type="text"], input[type="password"] {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  margin-top: 0.25rem;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid #cfc6b8;
+  border-radius: 6px;
+}
+.hint { color: #5c5346; }
+.error { color: #8c2f2f; min-height: 1.2rem; }
+.badge {
+  display: inline-block;
+  background: #e7f0ea;
+  color: #1e4d38;
+  border-radius: 999px;
+  padding: 0 0.45rem;
+  font-size: 0.85rem;
+}
+.card {
+  border-top: 1px solid #eee;
+  padding: 0.45rem 0;
+}
+pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #f6f3ee;
+  padding: 0.7rem;
+  border-radius: 6px;
+}
+.ok { color: #1e4d38; }
+.bad { color: #8c2f2f; }
