@@ -192,6 +192,7 @@ func inviteCmd(args []string, stdout io.Writer) error {
 	configPath := fs.String("config", "", "JSON config")
 	entry := fs.String("entry", "", "tenant entry name")
 	hint := fs.String("hostname-hint", "", "optional hostname stored in the join code")
+	label := fs.String("label", "", "credential label (default: hostname hint, else cred-<hash prefix>)")
 	enrollURL := fs.String("enroll-url", "", "enrollment service URL stored in the join code")
 	allow := fs.Bool("allow-insecure", false, "allow an http:// enroll URL (labs only)")
 	if err := fs.Parse(args); err != nil {
@@ -200,7 +201,7 @@ func inviteCmd(args []string, stdout io.Writer) error {
 	if *entry == "" || *enrollURL == "" {
 		return errors.New("--entry and --enroll-url are required")
 	}
-	code, err := enroll.Invite(*configPath, *entry, *hint, *enrollURL, *allow)
+	code, err := enroll.Invite(*configPath, *entry, *hint, *enrollURL, *label, *allow)
 	if err != nil {
 		return err
 	}

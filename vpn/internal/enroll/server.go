@@ -32,7 +32,12 @@ type Tenant struct {
 	// HeadscaleUserID is the numeric id (decimal string) of the Headscale user.
 	HeadscaleUserID string `json:"headscale_user_id"`
 	// TokenHashes are hex-encoded SHA-256 digests of accepted enrollment tokens.
+	// On disk each entry is either a legacy hex string or a Credential object.
+	// Credentials holds the same entries with labels. The two slices stay aligned.
 	TokenHashes []string `json:"token_hashes"`
+	// Credentials is the labeled form of TokenHashes. It is not a separate
+	// JSON field; MarshalJSON writes it back into token_hashes.
+	Credentials []Credential `json:"-"`
 	// ACLTags are applied to nodes enrolled with this tenant (optional).
 	ACLTags []string `json:"acl_tags,omitempty"`
 	// Role is the join-code role minted for this entry: member, local-ai,
@@ -101,7 +106,11 @@ func (c *Config) Validate() error {
 		return errors.New("at least one tenant is required")
 	}
 	seen := map[string]bool{}
-	for i, t := range c.Tenants {
+	for i := range c.Tenants {
+		if err := c.Tenants[i].normalize(); err != nil {
+			return err
+		}
+		t := c.Tenants[i]
 		if t.Name == "" {
 			return fmt.Errorf("tenant[%d]: name is required", i)
 		}
@@ -269,30 +278,36 @@ func (s *Server) Reload(cfg Config) error {
 
 // lookupLocked finds the tenant owning token. The caller holds s.mu. It always
 // walks every hash so the match does not leak which entry succeeded.
-func (s *Server) lookupLocked(token string) (Tenant, bool) {
+func (s *Server) lookupLocked(token string) (Tenant, string, bool) {
 	s.authScans++
 	want := sha256.Sum256([]byte(token))
 	found := -1
+	label := ""
 	for i := range s.cfg.Tenants {
 		t := &s.cfg.Tenants[i]
-		for _, h := range t.TokenHashes {
+		aligned := len(t.Credentials) == len(t.TokenHashes)
+		for j, h := range t.TokenHashes {
 			b, err := hex.DecodeString(h)
 			if err != nil || len(b) != sha256.Size {
 				continue
 			}
 			if subtle.ConstantTimeCompare(b, want[:]) == 1 && found < 0 {
 				found = i
+				if aligned {
+					label = t.Credentials[j].Label
+				}
 			}
 		}
 	}
 	if found < 0 {
-		return Tenant{}, false
+		return Tenant{}, "", false
 	}
-	return cloneTenant(s.cfg.Tenants[found]), true
+	return cloneTenant(s.cfg.Tenants[found]), label, true
 }
 
 func cloneTenant(t Tenant) Tenant {
 	t.TokenHashes = append([]string(nil), t.TokenHashes...)
+	t.Credentials = append([]Credential(nil), t.Credentials...)
 	t.ACLTags = append([]string(nil), t.ACLTags...)
 	t.LANCIDRs = append([]string(nil), t.LANCIDRs...)
 	return t
@@ -314,30 +329,37 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 // authenticate applies the pre-authentication limiters, then resolves the
 // bearer token. remote is the client IP used for the per-IP bucket. The
 // returned tenant is a copy, safe to use after a concurrent Reload.
-func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (Tenant, string, bool) {
+func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (Tenant, string, string, bool) {
 	remote, ok := s.admit(w, r)
 	if !ok {
-		return Tenant{}, remote, false
+		return Tenant{}, remote, "", false
 	}
 	auth := r.Header.Get("Authorization")
 	const prefix = "Bearer "
 	if !strings.HasPrefix(auth, prefix) || len(auth) <= len(prefix) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing bearer token"})
-		return Tenant{}, remote, false
+		return Tenant{}, remote, "", false
 	}
 	s.mu.Lock()
-	tenant, ok := s.lookupLocked(strings.TrimSpace(auth[len(prefix):]))
+	tenant, label, ok := s.lookupLocked(strings.TrimSpace(auth[len(prefix):]))
 	s.mu.Unlock()
 	if !ok {
 		s.sampleWarn("rejected: unknown token", "path", r.URL.Path, "remote", remote)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid token"})
-		return Tenant{}, remote, false
+		return Tenant{}, remote, "", false
 	}
-	return tenant, remote, true
+	return tenant, remote, label, true
+}
+
+func auditLabel(label string) string {
+	if label == "" {
+		return "-"
+	}
+	return label
 }
 
 func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
-	tenant, remote, ok := s.authenticate(w, r)
+	tenant, remote, _, ok := s.authenticate(w, r)
 	if !ok {
 		return
 	}
@@ -355,7 +377,7 @@ func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
-	tenant, remote, ok := s.authenticate(w, r)
+	tenant, remote, label, ok := s.authenticate(w, r)
 	if !ok {
 		return
 	}
@@ -388,7 +410,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "control server unavailable"})
 		return
 	}
-	s.log.Info("enrolled", "tenant", tenant.Name, "remote", remote, "hostname", req.Hostname, "os", req.OS, "key_id", key.ID, "expires_at", exp.UTC().Format(time.RFC3339))
+	s.log.Info("enrolled", "tenant", tenant.Name, "label", auditLabel(label), "remote", remote, "hostname", req.Hostname, "os", req.OS, "key_id", key.ID, "expires_at", exp.UTC().Format(time.RFC3339))
 	writeJSON(w, http.StatusOK, Response{
 		ControlURL: s.controlURL(),
 		AuthKey:    key.Key,

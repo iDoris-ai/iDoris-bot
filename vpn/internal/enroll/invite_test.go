@@ -36,7 +36,7 @@ func TestInviteAppendsHashAndPreservesMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	code, err := Invite(path, "acme", "office-gw", "https://enroll.example.org", false)
+	code, err := Invite(path, "acme", "office-gw", "https://enroll.example.org", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,6 +63,9 @@ func TestInviteAppendsHashAndPreservesMode(t *testing.T) {
 	if cfg.Tenants[0].TokenHashes[0] != HashToken("seed-token") {
 		t.Fatal("original hash was dropped")
 	}
+	if cfg.Tenants[0].Credentials[1].Label != "office-gw" {
+		t.Fatalf("label %q", cfg.Tenants[0].Credentials[1].Label)
+	}
 	st, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
@@ -70,7 +73,7 @@ func TestInviteAppendsHashAndPreservesMode(t *testing.T) {
 	if st.Mode().Perm() != 0o640 {
 		t.Fatalf("mode %o", st.Mode().Perm())
 	}
-	code2, err := Invite(path, "acme", "", "https://enroll.example.org", false)
+	code2, err := Invite(path, "acme", "", "https://enroll.example.org", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,23 +91,26 @@ func TestInviteAppendsHashAndPreservesMode(t *testing.T) {
 	if len(cfg.Tenants[0].TokenHashes) != 3 || cfg.Tenants[0].LANCIDRs[0] != "10.251.73.10/32" {
 		t.Fatalf("after second invite %+v", cfg.Tenants[0])
 	}
+	if !strings.HasPrefix(cfg.Tenants[0].Credentials[2].Label, "cred-") {
+		t.Fatalf("fallback label %q", cfg.Tenants[0].Credentials[2].Label)
+	}
 	_ = before
 }
 
 func TestInviteRefusesUnknownEntryAndBadURL(t *testing.T) {
 	path := writeTenantFile(t, 0o600)
 	before := mustRead(t, path)
-	if _, err := Invite(path, "other", "", "https://enroll.example.org", false); err == nil || !strings.Contains(err.Error(), "unknown entry") {
+	if _, err := Invite(path, "other", "", "https://enroll.example.org", "", false); err == nil || !strings.Contains(err.Error(), "unknown entry") {
 		t.Fatalf("unknown: %v", err)
 	}
-	if _, err := Invite(path, "acme", "", "http://enroll.example.org", false); err == nil || !strings.Contains(err.Error(), "https") {
+	if _, err := Invite(path, "acme", "", "http://enroll.example.org", "", false); err == nil || !strings.Contains(err.Error(), "https") {
 		t.Fatalf("http: %v", err)
 	}
 	after := mustRead(t, path)
 	if string(before) != string(after) {
 		t.Fatal("failed invite changed the file")
 	}
-	code, err := Invite(path, "acme", "", "http://enroll.lab", true)
+	code, err := Invite(path, "acme", "", "http://enroll.lab", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +121,7 @@ func TestInviteRefusesUnknownEntryAndBadURL(t *testing.T) {
 
 func TestRevokeByPrefix(t *testing.T) {
 	path := writeTenantFile(t, 0o600)
-	code, err := Invite(path, "acme", "", "https://enroll.example.org", false)
+	code, err := Invite(path, "acme", "", "https://enroll.example.org", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +214,7 @@ func TestEmptyRoleInviteDefaultsToMember(t *testing.T) {
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	code, err := Invite(path, "acme", "", "https://enroll.example.org", false)
+	code, err := Invite(path, "acme", "", "https://enroll.example.org", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
