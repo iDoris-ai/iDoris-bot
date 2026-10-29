@@ -294,7 +294,7 @@ func TestEnrollAuditIncludesRemote(t *testing.T) {
 		t.Fatalf("status %d %s", rr.Code, rr.Body.String())
 	}
 	line := buf.joined()
-	if !strings.Contains(line, "enrolled") || !strings.Contains(line, "remote=203.0.113.40") {
+	if !strings.Contains(line, "enrolled") || !strings.Contains(line, "remote=203.0.113.40") || !strings.Contains(line, "label=-") {
 		t.Fatalf("audit line %q", line)
 	}
 	if strings.Contains(line, tok) {
