@@ -331,7 +331,7 @@ start_node() {
   if [[ -n "$sysctl" ]]; then
     args+=(--sysctl "$sysctl")
   fi
-  args+=(tailscale/tailscale:v1.104.2)
+  args+=(tailscale/tailscale:v1.104.2@sha256:b11583ad2e93e4671128538c88cf11f460444a5d7e449311dd1933a400ab849d)
   "${args[@]}" >/dev/null
 }
 
@@ -543,7 +543,7 @@ docker run -d --name "${PROJ}-lanbox" \
   --cap-add NET_ADMIN --cap-add NET_RAW \
   --network "${PROJ}-lan" --ip "$LAN_IP" \
   --entrypoint /bin/sh \
-  tailscale/tailscale:v1.104.2 \
+  tailscale/tailscale:v1.104.2@sha256:b11583ad2e93e4671128538c88cf11f460444a5d7e449311dd1933a400ab849d \
   -c 'nc -lk -p 8740 -e /bin/cat & nc -lk -p 22 -e /bin/cat & wait' >/dev/null
 docker network connect "${PROJ}-lan" "${PROJ}-acme-gateway"
 gw_lan="$(docker inspect -f "{{(index .NetworkSettings.Networks \"${PROJ}-lan\").IPAddress}}" "${PROJ}-acme-gateway")"
