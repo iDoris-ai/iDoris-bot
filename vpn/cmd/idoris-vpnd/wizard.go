@@ -192,11 +192,12 @@ func (d *deps) runJoin(opt joinOpt) error {
 		return err
 	}
 	allow := strings.HasPrefix(opt.payload.EnrollURL, "http://")
-	approved, discovered, err := d.discoverJoin(opt.payload.EnrollURL, opt.payload.Token, allow)
+	approved, discovered, controlURL, err := d.discoverJoin(opt.payload.EnrollURL, opt.payload.Token, allow)
 	if err != nil {
 		_, _ = fmt.Fprintf(d.stderr, "discover failed (%s); continuing without the pre-approved list\n", err)
 		approved = nil
 		discovered = ""
+		controlURL = ""
 	}
 	role, err := gateway.ReconcileRole(opt.payload.Role, opt.override, discovered)
 	if err != nil {
@@ -214,7 +215,7 @@ func (d *deps) runJoin(opt joinOpt) error {
 		if err != nil {
 			return err
 		}
-		return d.applyPlan(plan, paths, opt.payload, allow, opt.noService, opt.yes, opt.replace)
+		return d.applyPlan(plan, paths, opt.payload, controlURL, allow, opt.noService, opt.yes, opt.replace)
 	case join.RoleLocalAI:
 		if err := gateway.ValidateRoleChoice(credentialRole(opt), true); err != nil {
 			return err
@@ -227,7 +228,7 @@ func (d *deps) runJoin(opt joinOpt) error {
 		if err != nil {
 			return err
 		}
-		return d.applyPlan(plan, paths, opt.payload, allow, opt.noService, opt.yes, opt.replace)
+		return d.applyPlan(plan, paths, opt.payload, controlURL, allow, opt.noService, opt.yes, opt.replace)
 	case join.RoleGateway:
 		localAI := false
 		if !opt.yes {
@@ -248,7 +249,7 @@ func (d *deps) runJoin(opt joinOpt) error {
 			if err != nil {
 				return err
 			}
-			return d.applyPlan(plan, paths, opt.payload, allow, opt.noService, opt.yes, opt.replace)
+			return d.applyPlan(plan, paths, opt.payload, controlURL, allow, opt.noService, opt.yes, opt.replace)
 		}
 		devices := opt.devices
 		if !opt.yes && !opt.whole && len(devices) == 0 {
@@ -270,7 +271,7 @@ func (d *deps) runJoin(opt joinOpt) error {
 			Approved:    approved,
 			Tenant:      opt.payload.Tenant,
 			Hostname:    host,
-		}, paths, opt.payload.Token, opt.payload.EnrollURL, allow, opt.noService, opt.yes, opt.replace)
+		}, paths, opt.payload.Token, opt.payload.EnrollURL, controlURL, allow, opt.noService, opt.yes, opt.replace)
 	default:
 		return fmt.Errorf("join: role %q is not valid", opt.role)
 	}
@@ -390,7 +391,7 @@ func (d *deps) setupCmd(args []string) error {
 		if err != nil {
 			return err
 		}
-		return d.applyPlan(plan, paths, payload, insecure, *noService, *yes, *replace)
+		return d.applyPlan(plan, paths, payload, disc.ControlURL, insecure, *noService, *yes, *replace)
 	}
 	devs := []string(devices)
 	if !*yes && !*whole && len(devs) == 0 {
@@ -408,7 +409,7 @@ func (d *deps) setupCmd(args []string) error {
 	}
 	return d.gatewayApply(gateway.Request{
 		DeviceIPs: devs, WholeSubnet: *whole, Approved: disc.LANCIDRs, Tenant: disc.Tenant, Hostname: host,
-	}, paths, token, cfg.EnrollURL, insecure, *noService, *yes, *replace)
+	}, paths, token, cfg.EnrollURL, disc.ControlURL, insecure, *noService, *yes, *replace)
 }
 
 // readPlanHandoff stats the plan file the unprivileged wizard wrote.
@@ -541,23 +542,23 @@ func (d *deps) nodeHostname(hint string) (string, error) {
 	return strings.TrimSpace(h), nil
 }
 
-func (d *deps) discoverJoin(enrollURL, token string, allowInsecure bool) (approved []string, role string, err error) {
+func (d *deps) discoverJoin(enrollURL, token string, allowInsecure bool) (approved []string, role, controlURL string, err error) {
 	if enrollURL == "" || token == "" {
-		return nil, "", errors.New("enrollment URL or token is empty")
+		return nil, "", "", errors.New("enrollment URL or token is empty")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	disc, err := d.doDiscover(ctx, enrollURL, token, allowInsecure)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	if disc == nil {
-		return nil, "", errors.New("discovery returned nothing")
+		return nil, "", "", errors.New("discovery returned nothing")
 	}
-	return disc.LANCIDRs, disc.Role, nil
+	return disc.LANCIDRs, disc.Role, strings.TrimSpace(disc.ControlURL), nil
 }
 
-func (d *deps) gatewayApply(req gateway.Request, paths idorisPaths, token, enrollURL string, allowInsecure, noService, yes, replace bool) error {
+func (d *deps) gatewayApply(req gateway.Request, paths idorisPaths, token, enrollURL, controlURL string, allowInsecure, noService, yes, replace bool) error {
 	rep, err := d.doDetect("system")
 	if err != nil {
 		return err
@@ -573,14 +574,15 @@ func (d *deps) gatewayApply(req gateway.Request, paths idorisPaths, token, enrol
 		return errors.New(plan.BlockReason)
 	}
 	payload := join.Payload{EnrollURL: enrollURL, Token: token}
-	return d.applyPlan(plan, paths, payload, allowInsecure, noService, yes, replace)
+	return d.applyPlan(plan, paths, payload, controlURL, allowInsecure, noService, yes, replace)
 }
 
-func (d *deps) applyPlan(plan gateway.Plan, paths idorisPaths, payload join.Payload, allowInsecure, noService, yes, replace bool) error {
+func (d *deps) applyPlan(plan gateway.Plan, paths idorisPaths, payload join.Payload, controlURL string, allowInsecure, noService, yes, replace bool) error {
 	plan.EnrollURL = payload.EnrollURL
 	plan.TokenFile = paths.token
 	plan.ConfigPath = paths.config
 	plan.AllowInsecure = allowInsecure
+	plan.DiscoveryControlURL = strings.TrimSpace(controlURL)
 	if replace {
 		if raw, err := d.host.ReadFile(paths.config); err == nil {
 			gateway.NoteControlPinDrop(&plan, gateway.PreviousEnrollURL(raw))
