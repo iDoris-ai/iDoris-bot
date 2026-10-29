@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
+	"reflect"
+	"strings"
 
 	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/join"
+	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/vpnd"
 )
 
 // Host is the sliver of the OS Apply needs. Tests use a fake. The command
@@ -19,6 +21,7 @@ type Host interface {
 	MkdirAll(path string, mode os.FileMode) error
 	Stat(path string) (os.FileInfo, error)
 	Chmod(path string, mode os.FileMode) error
+	ReadFile(path string) ([]byte, error)
 	IsRoot() bool
 	GOOS() string
 	EnableIPForward(path, content string) error
@@ -52,9 +55,14 @@ type ApplyResult struct {
 }
 
 // SudoApplyCommand is the exact command a non-root gateway prints.
-// It never includes the enrollment token.
+// It never includes the enrollment token. The path is POSIX single-quoted
+// so `$()`, backticks and other expansions stay literal.
 func SudoApplyCommand(planPath string) string {
-	return "sudo idoris-vpnd gateway apply --plan " + strconv.Quote(planPath)
+	return "sudo idoris-vpnd gateway apply --plan " + shellSingleQuote(planPath)
+}
+
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // Apply writes the daemon config and, on a Linux gateway running as root,
@@ -77,6 +85,23 @@ func Apply(plan Plan, host Host, opt ApplyOptions) (ApplyResult, error) {
 	if err := host.MkdirAll(filepath.Dir(plan.TokenFile), 0o700); err != nil {
 		return ApplyResult{}, err
 	}
+	existing, haveConfig, err := readExistingConfig(host, plan.ConfigPath)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	if haveConfig {
+		oldURL, hasURL := jsonStringField(existing, "enroll_url")
+		if hasURL && oldURL != "" && oldURL != plan.EnrollURL && !opt.ReplaceExisting {
+			return ApplyResult{}, fmt.Errorf("gateway: %s is already enrolled with %s; pass --replace to switch it to %s", plan.ConfigPath, oldURL, plan.EnrollURL)
+		}
+	}
+	raw, access, err := mergeConfig(existing, haveConfig, plan)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	if err := validateConfigBytes(raw); err != nil {
+		return ApplyResult{}, err
+	}
 	if opt.Token != "" {
 		if err := host.WriteFile(plan.TokenFile, []byte(opt.Token+"\n"), 0o600); err != nil {
 			return ApplyResult{}, err
@@ -84,17 +109,10 @@ func Apply(plan Plan, host Host, opt ApplyOptions) (ApplyResult, error) {
 	} else if _, err := host.Stat(plan.TokenFile); err != nil {
 		return ApplyResult{}, fmt.Errorf("gateway: enrollment token file: %w", err)
 	}
-	if err := host.Chmod(plan.TokenFile, 0o600); err != nil {
-		return ApplyResult{}, err
-	}
-	raw, err := marshalConfig(plan)
-	if err != nil {
-		return ApplyResult{}, err
-	}
 	if err := host.WriteFile(plan.ConfigPath, raw, 0o600); err != nil {
 		return ApplyResult{}, err
 	}
-	res := ApplyResult{ConfigPath: plan.ConfigPath, TokenFile: plan.TokenFile}
+	res := ApplyResult{ConfigPath: plan.ConfigPath, TokenFile: plan.TokenFile, AccessInfo: access}
 	if wantsForward(plan) {
 		if host.GOOS() != "linux" {
 			return res, errors.New("gateway: refusing to enable forwarding on a non-Linux host")
@@ -140,42 +158,322 @@ func wantsForward(plan Plan) bool {
 	return plan.Role == join.RoleGateway && len(plan.Routes) > 0
 }
 
-// fileConfig is the JSON written for idoris-vpnd. It is a subset of
-// vpnd.Config so the file cannot carry an auth key or a plaintext token.
-// Field names match vpnd.Config so LoadConfig accepts the file.
-type fileConfig struct {
-	EnrollURL           string   `json:"enroll_url,omitempty"`
-	EnrollTokenFile     string   `json:"enroll_token_file,omitempty"`
-	EnrollAllowInsecure bool     `json:"enroll_allow_insecure,omitempty"`
-	Hostname            string   `json:"hostname,omitempty"`
-	AcceptRoutes        bool     `json:"accept_routes,omitempty"`
-	AdvertiseTags       []string `json:"advertise_tags,omitempty"`
-	Mode                string   `json:"mode,omitempty"`
-	Role                string   `json:"role,omitempty"`
-	Listen              string   `json:"listen,omitempty"`
-	AdvertiseRoutes     []string `json:"advertise_routes,omitempty"`
+// defaultSOCKSListen is the authenticated loopback proxy a member or admin
+// gets when the config is embedded, or auto (which becomes embedded when the
+// system tailnet is foreign or down). The daemon writes the credential to
+// <state_dir>/socks5.auth. local-ai and gateway stay on system mode and do
+// not get this listener.
+const defaultSOCKSListen = "127.0.0.1:1080"
+
+func mergeConfig(existing []byte, have bool, plan Plan) ([]byte, []string, error) {
+	var keys []string
+	vals := map[string]json.RawMessage{}
+	if have {
+		var err error
+		keys, vals, err = parseObject(existing)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	var err error
+	keys, err = assignOwned(keys, vals, plan)
+	if err != nil {
+		return nil, nil, err
+	}
+	if memberEmbeddedAccess(plan) {
+		if _, ok := vals["socks5_listen"]; !ok {
+			keys, err = assignRaw(keys, vals, "socks5_listen", defaultSOCKSListen, true)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+	access := accessLines(plan, vals)
+	return emitObject(keys, vals), access, nil
 }
 
-func marshalConfig(plan Plan) ([]byte, error) {
-	cfg := fileConfig{
-		EnrollURL:           plan.EnrollURL,
-		EnrollTokenFile:     plan.TokenFile,
-		EnrollAllowInsecure: plan.AllowInsecure,
-		Hostname:            plan.Hostname,
-		AcceptRoutes:        plan.AcceptRoutes,
-		Mode:                plan.Mode,
-		Role:                plan.Role,
-		Listen:              plan.Listen,
-	}
-	if plan.Tag != "" {
-		cfg.AdvertiseTags = []string{plan.Tag}
-	}
-	if len(plan.Routes) > 0 {
-		cfg.AdvertiseRoutes = append([]string(nil), plan.Routes...)
-	}
-	raw, err := json.MarshalIndent(cfg, "", "  ")
+func assignOwned(keys []string, vals map[string]json.RawMessage, plan Plan) ([]string, error) {
+	var err error
+	keys, err = assignRaw(keys, vals, "enroll_url", plan.EnrollURL, plan.EnrollURL != "")
 	if err != nil {
 		return nil, err
 	}
-	return append(raw, '\n'), nil
+	keys, err = assignRaw(keys, vals, "enroll_token_file", plan.TokenFile, plan.TokenFile != "")
+	if err != nil {
+		return nil, err
+	}
+	keys, err = assignRaw(keys, vals, "enroll_allow_insecure", true, plan.AllowInsecure)
+	if err != nil {
+		return nil, err
+	}
+	keys, err = assignRaw(keys, vals, "hostname", plan.Hostname, plan.Hostname != "")
+	if err != nil {
+		return nil, err
+	}
+	keys, err = assignRaw(keys, vals, "accept_routes", true, plan.AcceptRoutes)
+	if err != nil {
+		return nil, err
+	}
+	var tags []string
+	if plan.Tag != "" {
+		tags = []string{plan.Tag}
+	}
+	keys, err = assignRaw(keys, vals, "advertise_tags", tags, len(tags) > 0)
+	if err != nil {
+		return nil, err
+	}
+	keys, err = assignRaw(keys, vals, "mode", plan.Mode, plan.Mode != "")
+	if err != nil {
+		return nil, err
+	}
+	keys, err = assignRaw(keys, vals, "role", plan.Role, plan.Role != "")
+	if err != nil {
+		return nil, err
+	}
+	keys, err = assignRaw(keys, vals, "listen", plan.Listen, plan.Listen != "")
+	if err != nil {
+		return nil, err
+	}
+	routes := append([]string(nil), plan.Routes...)
+	return assignRaw(keys, vals, "advertise_routes", routes, len(routes) > 0)
+}
+
+func assignRaw(keys []string, vals map[string]json.RawMessage, key string, v any, include bool) ([]string, error) {
+	if !include {
+		if _, ok := vals[key]; !ok {
+			return keys, nil
+		}
+		delete(vals, key)
+		next := make([]string, 0, len(keys))
+		for _, k := range keys {
+			if k != key {
+				next = append(next, k)
+			}
+		}
+		return next, nil
+	}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	vals[key] = raw
+	for _, k := range keys {
+		if k == key {
+			return keys, nil
+		}
+	}
+	return append(keys, key), nil
+}
+
+func memberEmbeddedAccess(plan Plan) bool {
+	switch plan.Role {
+	case join.RoleMember, join.RoleAdmin:
+	default:
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(plan.Mode)) {
+	case "", "auto", "embedded":
+		return true
+	default:
+		return false
+	}
+}
+
+func accessLines(plan Plan, vals map[string]json.RawMessage) []string {
+	if plan.Role != join.RoleMember && plan.Role != join.RoleAdmin {
+		return nil
+	}
+	addr, ok := jsonString(vals, "socks5_listen")
+	if !ok || addr == "" {
+		return nil
+	}
+	host := strings.TrimSpace(plan.Hostname)
+	if host == "" {
+		host = "<hostname>"
+	}
+	return []string{
+		"SOCKS5 " + addr,
+		"SOCKS5 credential file " + socksAuthPath(plan.ConfigPath, vals),
+		"Reach the Local AI through this proxy by its MagicDNS name " + host + ".idoris.internal",
+	}
+}
+
+func socksAuthPath(configPath string, vals map[string]json.RawMessage) string {
+	if path, ok := jsonString(vals, "socks5_auth_file"); ok && path != "" {
+		return path
+	}
+	dir, ok := jsonString(vals, "state_dir")
+	if !ok || dir == "" {
+		parent := filepath.Dir(configPath)
+		if filepath.Base(parent) == ".idoris" {
+			dir = filepath.Join(parent, "vpn-state")
+		} else if d, err := vpnd.DefaultStateDir(); err == nil {
+			dir = d
+		} else {
+			dir = filepath.Join(parent, "vpn-state")
+		}
+	}
+	return filepath.Join(dir, "socks5.auth")
+}
+
+func emitObject(keys []string, vals map[string]json.RawMessage) []byte {
+	var buf bytes.Buffer
+	buf.WriteString("{\n")
+	n := 0
+	for _, key := range keys {
+		raw, ok := vals[key]
+		if !ok {
+			continue
+		}
+		if n > 0 {
+			buf.WriteString(",\n")
+		}
+		buf.WriteString("  ")
+		buf.WriteString(strconvQuote(key))
+		buf.WriteString(": ")
+		buf.Write(raw)
+		n++
+	}
+	buf.WriteString("\n}\n")
+	return buf.Bytes()
+}
+
+func strconvQuote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+func parseObject(data []byte) ([]string, map[string]json.RawMessage, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, nil, fmt.Errorf("gateway: existing config: %w", err)
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return nil, nil, errors.New("gateway: existing config is not a JSON object")
+	}
+	var keys []string
+	vals := map[string]json.RawMessage{}
+	for dec.More() {
+		tok, err = dec.Token()
+		if err != nil {
+			return nil, nil, fmt.Errorf("gateway: existing config: %w", err)
+		}
+		key, ok := tok.(string)
+		if !ok {
+			return nil, nil, errors.New("gateway: existing config key is not a string")
+		}
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return nil, nil, fmt.Errorf("gateway: existing config: %w", err)
+		}
+		if _, seen := vals[key]; !seen {
+			keys = append(keys, key)
+		}
+		vals[key] = bytes.TrimSpace(raw)
+	}
+	tok, err = dec.Token()
+	if err != nil {
+		return nil, nil, fmt.Errorf("gateway: existing config: %w", err)
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '}' {
+		return nil, nil, errors.New("gateway: existing config is not a JSON object")
+	}
+	return keys, vals, nil
+}
+
+func jsonStringField(data []byte, key string) (string, bool) {
+	_, vals, err := parseObject(data)
+	if err != nil {
+		return "", false
+	}
+	return jsonString(vals, key)
+}
+
+func jsonString(vals map[string]json.RawMessage, key string) (string, bool) {
+	raw, ok := vals[key]
+	if !ok {
+		return "", false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", false
+	}
+	return s, true
+}
+
+func readExistingConfig(host Host, path string) ([]byte, bool, error) {
+	b, err := host.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if len(bytes.TrimSpace(b)) == 0 {
+		return nil, false, nil
+	}
+	return b, true, nil
+}
+
+// validateConfigBytes loads the merged document with vpnd.LoadConfig.
+// Keys the daemon schema does not know are kept in the written file, and the
+// loader sees a projection of the known keys so a forward-compatible field
+// does not fail the type check. Resolve then checks mode, role, forwards and
+// routes. A placeholder token avoids reading the real token file, which may
+// not have been written yet.
+func validateConfigBytes(data []byte) error {
+	projected, err := projectKnownConfig(data)
+	if err != nil {
+		return err
+	}
+	dir, err := os.MkdirTemp("", "idoris-vpn-cfg-")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	path := filepath.Join(dir, "vpn.json")
+	if err := os.WriteFile(path, projected, 0o600); err != nil { //nolint:gosec // G703: path is under MkdirTemp
+		return err
+	}
+	cfg, err := vpnd.LoadConfig(path)
+	if err != nil {
+		return fmt.Errorf("gateway: config: %w", err)
+	}
+	if cfg.EnrollToken == "" && cfg.AuthKey == "" {
+		cfg.EnrollToken = "validation-placeholder"
+	}
+	if err := cfg.Resolve(); err != nil {
+		return fmt.Errorf("gateway: config: %w", err)
+	}
+	return nil
+}
+
+func projectKnownConfig(data []byte) ([]byte, error) {
+	keys, vals, err := parseObject(data)
+	if err != nil {
+		return nil, err
+	}
+	known := knownConfigKeys()
+	var keep []string
+	for _, key := range keys {
+		if _, ok := known[key]; ok {
+			keep = append(keep, key)
+		}
+	}
+	return emitObject(keep, vals), nil
+}
+
+func knownConfigKeys() map[string]struct{} {
+	t := reflect.TypeOf(vpnd.Config{})
+	out := make(map[string]struct{}, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		tag := t.Field(i).Tag.Get("json")
+		name := strings.Split(tag, ",")[0]
+		if name == "" || name == "-" {
+			continue
+		}
+		out[name] = struct{}{}
+	}
+	return out
 }
