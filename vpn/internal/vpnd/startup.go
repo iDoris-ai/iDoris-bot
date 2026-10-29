@@ -46,11 +46,22 @@ func ResolveStartupControl(pinned, discovered, saved string, discoveredOK bool) 
 	return "", false, errors.New("enrollment service is unreachable and no control URL is pinned or saved")
 }
 
-// RoleWhileEnrollDown keeps the identity that was bound at the last successful
-// discovery. An empty or unknown saved role leaves the configured role alone.
-func RoleWhileEnrollDown(configRole, savedRole string) string {
+// RoleWhileEnrollDown keeps the role bound at the last successful discovery
+// only when that binding was made with the credential we still hold.
+// currentFP and savedFP are TokenFingerprint values. A missing or different
+// fingerprint means the saved role belongs to some other token, so the
+// configured role stands. An explicit server role (local-ai, gateway) is
+// never replaced by a saved member or admin role: that would let a degraded
+// start fall through to embedded mode and report the old node connected.
+func RoleWhileEnrollDown(configRole, savedRole, currentFP, savedFP string) string {
 	savedRole = strings.ToLower(strings.TrimSpace(savedRole))
-	if savedRole == "" || !ValidRole(savedRole) {
+	currentFP = strings.TrimSpace(currentFP)
+	savedFP = strings.TrimSpace(savedFP)
+	trusted := savedRole != "" && ValidRole(savedRole) && currentFP != "" && currentFP == savedFP
+	if !trusted {
+		return configRole
+	}
+	if RequiresSystem(configRole) && !RequiresSystem(savedRole) {
 		return configRole
 	}
 	return savedRole
