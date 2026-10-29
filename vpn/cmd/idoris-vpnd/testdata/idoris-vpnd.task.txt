@@ -1,0 +1,12 @@
+/Create
+/TN
+idoris-vpnd
+/SC
+ONSTART
+/RU
+SYSTEM
+/RL
+HIGHEST
+/F
+/TR
+/usr/local/bin/idoris-vpnd run --config /etc/idoris/vpn.json
