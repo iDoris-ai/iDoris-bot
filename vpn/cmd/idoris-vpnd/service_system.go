@@ -755,11 +755,6 @@ func stageSystemSecrets(cfg []byte, destDir string) ([]byte, error) {
 	if dec.More() {
 		return nil, errors.New("config: trailing data")
 	}
-	items := []struct{ key, name string }{
-		{"enroll_token_file", "enroll_token"},
-		{"auth_key_file", "auth_key"},
-		{"socks5_auth_file", "socks5.auth"},
-	}
 	var written []string
 	rollback := func() {
 		for _, f := range written {
@@ -767,7 +762,7 @@ func stageSystemSecrets(cfg []byte, destDir string) ([]byte, error) {
 		}
 	}
 	changed := false
-	for _, it := range items {
+	for _, it := range stagedCredentialFiles {
 		raw, ok := probe[it.key]
 		if !ok || raw == nil {
 			continue
