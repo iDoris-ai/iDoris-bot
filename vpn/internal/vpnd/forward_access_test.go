@@ -2,6 +2,7 @@ package vpnd
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -321,4 +323,92 @@ func TestAcceptTemporaryRetriesAndFatalFails(t *testing.T) {
 	if st.State != "failed" || !bytes.Contains([]byte(st.Error), []byte("listener exploded")) {
 		t.Fatalf("status %+v", st)
 	}
+}
+
+func TestForwardLimitsAndAbandonedDialDoNotLeak(t *testing.T) {
+	before := runtime.NumGoroutine()
+	dialer := &fakeDialer{err: errors.New("no route")}
+	access, err := StartAccess(dialer, []Forward{{Listen: "127.0.0.1:0", Target: "peer:1"}}, "", AccessOptions{MaxConnections: 1}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := access.ForwardStatus()[0].Listen
+	deadline := time.Now().Add(2 * time.Second)
+	for len(dialer.got()) < 2 && time.Now().Before(deadline) {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+		_, _ = io.ReadAll(c)
+		_ = c.Close()
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(dialer.got()) != 2 {
+		t.Fatalf("slot was not released: %v", dialer.got())
+	}
+	_ = access.Close()
+
+	entered := make(chan struct{})
+	returned := make(chan struct{})
+	var once sync.Once
+	blocker := &callbackDialer{fn: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		once.Do(func() { close(entered) })
+		<-ctx.Done()
+		close(returned)
+		return nil, ctx.Err()
+	}}
+	held, err := StartAccess(blocker, []Forward{{Listen: "127.0.0.1:0", Target: "peer:2"}}, "", AccessOptions{MaxConnections: 1}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c1, err := net.Dial("tcp", held.ForwardStatus()[0].Listen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dial did not start")
+	}
+	c2, err := net.Dial("tcp", held.ForwardStatus()[0].Listen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c2.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadAll(c2); err != nil && !errors.Is(err, io.EOF) {
+		var ne net.Error
+		if !errors.As(err, &ne) || !ne.Timeout() {
+			t.Fatalf("overflow read: %v", err)
+		}
+		t.Fatal("connection over the cap was not closed")
+	}
+	_ = c2.Close()
+	start := time.Now()
+	_ = c1.Close()
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("client disconnect did not cancel the dial")
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("client disconnect waited for the dial deadline")
+	}
+	_ = held.Close()
+	wait := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > before+2 && time.Now().Before(wait) {
+		time.Sleep(20 * time.Millisecond)
+		runtime.Gosched()
+	}
+	if got := runtime.NumGoroutine(); got > before+2 {
+		t.Fatalf("goroutines before=%d after=%d", before, got)
+	}
+}
+
+type callbackDialer struct {
+	fn func(context.Context, string, string) (net.Conn, error)
+}
+
+func (c *callbackDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return c.fn(ctx, network, address)
 }
