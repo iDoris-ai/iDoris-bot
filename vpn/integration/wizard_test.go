@@ -387,11 +387,79 @@ func (e *wizEnv) probeEnroll(t *testing.T, host, enrollURL string) string {
 }
 
 func (e *wizEnv) memberUp(t *testing.T, hs *headscale.Client, userID string) {
-	panic("stub")
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	key, err := hs.CreatePreAuthKey(ctx, headscale.CreatePreAuthKeyRequest{
+		UserID:     userID,
+		Reusable:   true,
+		Expiration: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.secrets = append(e.secrets, key.Key)
+	e.pinHeadscale(t, "wiz-member")
+	e.must(t, 70*time.Second, "exec", "-T", "wiz-member", "tailscale", "up",
+		"--reset",
+		"--login-server=https://headscale",
+		"--auth-key="+key.Key,
+		"--accept-routes",
+		"--accept-dns=true",
+		"--hostname=wiz-member",
+		"--timeout=45s",
+	)
+	waitFor(t, "wiz-member online", 60*time.Second, func() (bool, string) {
+		st, err := e.exec(15*time.Second, "exec", "-T", "wiz-member", "tailscale", "status", "--json")
+		if err != nil {
+			return false, e.redact(err.Error())
+		}
+		parsed, err := lanParseStatus(st)
+		if err != nil {
+			return false, err.Error()
+		}
+		if parsed.BackendState != "Running" {
+			return false, parsed.BackendState
+		}
+		nodes, err := hs.ListNodes(context.Background(), "wiz")
+		if err != nil {
+			return false, err.Error()
+		}
+		for _, n := range nodes {
+			if lanNodeHost(n) == "wiz-member" && n.Online {
+				return true, ""
+			}
+		}
+		return false, "running, not online in headscale yet"
+	})
 }
+
+func (e *wizEnv) pinHeadscale(t *testing.T, host string) {
+	t.Helper()
+	out := e.must(t, 15*time.Second, "exec", "-T", host, "getent", "hosts", "headscale")
+	ip := lanFirstIPv4(out)
+	if ip == "" {
+		t.Fatalf("getent headscale on %s: %q", host, out)
+	}
+	script := fmt.Sprintf("grep -q '[[:space:]]headscale$' /etc/hosts || echo '%s headscale' >> /etc/hosts", ip)
+	e.must(t, 10*time.Second, "exec", "-T", host, "sh", "-c", script)
+}
+
 func (e *wizEnv) join(t *testing.T, host, code, device string) string {
-	panic("stub")
+	t.Helper()
+	out, err := e.exec(60*time.Second, "exec", "-e", "HOME=/root", "-T", host,
+		"/opt/idoris-vpnd", "join",
+		"--yes", "--device", device, "--no-service", "--allow-insecure", code)
+	red := e.redact(out)
+	if err != nil {
+		t.Fatalf("join %s: %v\n%s", host, err, red)
+	}
+	if strings.Contains(out, code) || strings.Contains(out, "idv1_") {
+		t.Fatal("join stdout contains the join code or token")
+	}
+	return red
 }
+
 func (e *wizEnv) assertJoinPlan(t *testing.T, out string, nets wizNets, route string, auto bool) {
 	panic("stub")
 }
