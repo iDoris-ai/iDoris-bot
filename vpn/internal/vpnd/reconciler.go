@@ -52,10 +52,14 @@ func (k StaticKey) AuthKey(context.Context) (string, error) {
 
 // Options drive one Reconciler.
 type Options struct {
-	ControlURL    string
-	Hostname      string
-	AcceptRoutes  bool
-	AcceptDNS     bool
+	ControlURL   string
+	Hostname     string
+	AcceptRoutes bool
+	AcceptDNS    bool
+	// AdvertiseTags is recorded for operators. It is not sent at login.
+	// Headscale v0.29.6 rejects a pre-auth-key registration whose hostinfo
+	// requests tags. The key minted by the enrollment service carries
+	// tenants[].acl_tags, and that is what tags the node.
 	AdvertiseTags []string
 	// AdvertiseRoutes, when non-empty, is written into prefs at login and
 	// re-applied with EditPrefs while Running if the node has drifted.
@@ -373,7 +377,10 @@ func (r *Reconciler) login(ctx context.Context, reason string) (Snapshot, error)
 	prefs.CorpDNS = r.opt.AcceptDNS
 	prefs.RouteAll = r.opt.AcceptRoutes
 	prefs.Hostname = r.opt.Hostname
-	prefs.AdvertiseTags = r.opt.AdvertiseTags
+	// Leave AdvertiseTags unset. See Options.AdvertiseTags.
+	if len(r.opt.AdvertiseTags) > 0 {
+		r.log.Info("not sending advertise tags; the pre-auth key's acl tags are applied by Headscale")
+	}
 	if len(r.opt.AdvertiseRoutes) > 0 {
 		prefs.AdvertiseRoutes = append([]netip.Prefix(nil), r.opt.AdvertiseRoutes...)
 	}

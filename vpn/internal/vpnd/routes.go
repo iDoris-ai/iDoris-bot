@@ -8,10 +8,13 @@ import (
 	"tailscale.com/types/views"
 )
 
-// RouteReport is one configured advertise_routes entry and whether Headscale
-// has approved it. Approval is read from Status.Self.PrimaryRoutes and
-// AllowedIPs (tailscale.com v1.104.2 copies both onto Self). The node stays
-// logged in either way; an unapproved route only changes the phase.
+// RouteReport is one configured advertise_routes entry and whether the local
+// tailscaled reports it as approved. tailscale.com v1.104.2 copies
+// Status.Self.PrimaryRoutes and AllowedIPs from the netmap self node.
+// Headscale v0.29.6 fills those only when this node can access the prefix
+// (the gateway tag, or the prefix itself, has to be an ACL source). A route
+// the server has approved still looks pending here when the policy hides it.
+// The node stays logged in either way; an unapproved route only changes the phase.
 type RouteReport struct {
 	CIDR       string `json:"cidr"`
 	Advertised bool   `json:"advertised"`
@@ -73,12 +76,14 @@ func sliceCovers(set *views.Slice[netip.Prefix], want netip.Prefix) bool {
 	return false
 }
 
-// adminApproveCommand is the Headscale command an operator runs. identifier
-// is the node hostname; Headscale also accepts the numeric id from `nodes list`.
+// adminApproveCommand is the Headscale command an operator runs.
+// v0.29.6 --identifier is the numeric node id from `headscale nodes list`.
+// A hostname is rejected (ParseUint). The name is only a comment so the
+// operator can find the row.
 func adminApproveCommand(hostname string, routes []string) string {
-	id := strings.TrimSpace(hostname)
-	if id == "" {
-		id = "<NODE>"
+	name := strings.TrimSpace(hostname)
+	if name == "" {
+		name = "<NODE>"
 	}
-	return "headscale nodes approve-routes --identifier " + id + " --routes " + strings.Join(routes, ",")
+	return "headscale nodes approve-routes --identifier <ID> --routes " + strings.Join(routes, ",") + "  # <ID> is the numeric id of " + name + " from `headscale nodes list`"
 }

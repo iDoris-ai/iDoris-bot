@@ -2,7 +2,7 @@ GO ?= go
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X github.com/iDoris-ai/iDoris-bridge/vpn/internal/version.Version=$(VERSION)
 
-.PHONY: build test lint integration build-linux clean
+.PHONY: build test lint integration integration-lan integration-wizard lint-integration build-linux clean
 
 build:
 	$(GO) build -ldflags '$(LDFLAGS)' -o bin/idoris-vpnd ./cmd/idoris-vpnd
@@ -29,6 +29,10 @@ clean:
 # Own compose project inside the test (idoris-vpn-lan-*). See docs/15.
 integration-lan:
 	cd integration && $(GO) test -tags integration -count=1 -v -timeout 20m -run 'TestLanDirect|TestLanAwayRelay|TestGatewaySubnetRoute' ./...
+
+# Join-code gateway wizard. Own compose project (idoris-vpn-wizard-*).
+integration-wizard:
+	cd integration && $(GO) test -tags integration -count=1 -v -timeout 20m -run 'TestWizardGatewayJoin' ./...
 
 lint-integration:
 	golangci-lint run --build-tags integration ./...
