@@ -576,6 +576,61 @@ func TestStoppedIsResumed(t *testing.T) {
 	}
 }
 
+func TestEnrollDownResumesSavedIdentityWithoutMinting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vpnd-state.json")
+	st, err := OpenState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetIdentity(ours, "acme", "member", "fp"); err != nil {
+		t.Fatal(err)
+	}
+	be := &fakeBackend{state: ipn.Running, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true, CorpDNS: true}}
+	keys := &countingKeys{}
+	r := newR(t, be, keys, func(o *Options) {
+		o.State = st
+		o.Role = "member"
+		o.EnrollUnreachable = true
+		o.Identity = Identity{Known: false}
+	})
+	snap, err := r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseConnected || keys.n != 0 || snap.EnrollReachable {
+		t.Fatalf("resume: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+	if len(snap.Warnings) != 1 || snap.Warnings[0] != EnrollUnreachableWarning {
+		t.Fatalf("warnings %+v", snap.Warnings)
+	}
+	if got := st.Get(); got.Tenant != "acme" || got.Role != "member" || got.TokenFingerprint != "fp" {
+		t.Fatalf("binding changed: %+v", got)
+	}
+}
+
+func TestEnrollDownMintsOnlyWhenLoginIsRequired(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vpnd-state.json")
+	st, err := OpenState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetIdentity(ours, "acme", "local-ai", "fp"); err != nil {
+		t.Fatal(err)
+	}
+	be := &fakeBackend{state: ipn.NeedsLogin, prefs: ipn.Prefs{ControlURL: ours}}
+	keys := &countingKeys{}
+	r := newR(t, be, keys, func(o *Options) {
+		o.State = st
+		o.Role = "local-ai"
+		o.EnrollUnreachable = true
+		o.Identity = Identity{Known: false}
+	})
+	snap, err := r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseStarting || keys.n != 1 || !snap.EnrollReachable {
+		t.Fatalf("login required: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+	if got := st.Get(); got.Role != "local-ai" || got.Tenant != "acme" {
+		t.Fatalf("binding rewritten without a confirmed identity: %+v", got)
+	}
+}
+
 func TestUnreachableDaemonAndKeyFailure(t *testing.T) {
 	be := &fakeBackend{statusErr: errors.New("dial unix: no such file")}
 	r := newR(t, be, &countingKeys{}, nil)
