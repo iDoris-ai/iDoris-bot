@@ -5,7 +5,7 @@
 set -eu
 
 root="$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)"
-image="${TS_IMAGE:-tailscale/tailscale:v1.104.2}"
+image="${TS_IMAGE:-tailscale/tailscale:v1.104.2@sha256:b11583ad2e93e4671128538c88cf11f460444a5d7e449311dd1933a400ab849d}"
 work="$(mktemp -d "${TMPDIR:-/tmp}/ts-entry.XXXXXX")"
 chmod 700 "$work"
 cleanup() {
