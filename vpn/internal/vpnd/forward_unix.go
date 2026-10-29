@@ -102,9 +102,3 @@ func peerClosed(fd int, buf []byte) (closed, halt bool) {
 		return true, false
 	}
 }
-
-func init() {
-	_ = isTemporaryAccept
-	_ = watchDisconnect
-	_ = peerClosed
-}
