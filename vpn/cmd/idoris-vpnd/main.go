@@ -42,7 +42,9 @@ Usage:
 
 Config keys may also be given as IDORIS_VPN_* environment variables.
 --mode auto (default) leaves a foreign system Tailscale alone and uses an
-in-process node. --takeover switches that system Tailscale; the default is not to.
+in-process node. local-ai and gateway never use that fallback: they wait until
+the official tailscaled is reachable. --takeover switches the system Tailscale;
+the default is not to.
 
 join accepts one code. A gateway code asks whether this machine is the Local AI
 host. --yes skips prompts: a gateway then needs --device or --whole-subnet.
@@ -245,14 +247,46 @@ func runCmd(args []string) error {
 	}
 	cfg.ControlURL = controlURL
 	if ident.Role != "" {
-		cfg.Role = ident.Role
+		role := strings.ToLower(strings.TrimSpace(ident.Role))
+		if !vpnd.ValidRole(role) {
+			return fmt.Errorf("enrollment discovery role %q: want member, local-ai, gateway, or admin", ident.Role)
+		}
+		cfg.Role = role
+	}
+	if err := cfg.RejectEmbeddedRole(); err != nil {
+		return err
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	node, err := openNode(ctx, cfg, controlURL, log)
+	ln, err := vpnd.Listen(cfg.Listen)
 	if err != nil {
+		return err
+	}
+	defer func() { _ = ln.Close() }()
+	holder := &vpnd.StatusSwap{}
+	errc := make(chan error, 2)
+	go func() { errc <- vpnd.ServeStatus(ctx, ln, vpnd.StatusHandler(holder, version.Version)) }()
+
+	node, err := openNode(ctx, cfg, controlURL, log, func(d vpnd.ModeDecision) {
+		msg := vpnd.WaitingTailscaledMessage(cfg.Role)
+		log.Warn(msg, "role", cfg.Role)
+		holder.Store(vpnd.FixedSnapshot(vpnd.Snapshot{
+			Phase:      vpnd.PhaseWaitingTailscaled,
+			Role:       cfg.Role,
+			Mode:       d.Mode,
+			ModeReason: d.Reason,
+			ControlURL: controlURL,
+			LastError:  msg,
+			Warnings:   []string{msg},
+		}))
+	})
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			log.Info("idoris-vpnd stopping")
+			return nil
+		}
 		return err
 	}
 	defer func() { _ = node.Close() }()
@@ -293,17 +327,8 @@ func runCmd(args []string) error {
 	}
 	defer func() { _ = access.Close() }()
 
-	ln, err := vpnd.Listen(cfg.Listen)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = ln.Close() }()
-
-	log.Info("idoris-vpnd starting", "version", version.Version, "mode", node.Mode, "mode_reason", node.Reason, "control_url", controlURL, "status_api", cfg.Listen, "os", runtime.GOOS)
-	src := vpnd.View{Source: rec, Mode: node.Mode, ModeReason: node.Reason, Access: access}
-
-	errc := make(chan error, 2)
-	go func() { errc <- vpnd.ServeStatus(ctx, ln, vpnd.StatusHandler(src, version.Version)) }()
+	log.Info("idoris-vpnd starting", "version", version.Version, "mode", node.Mode, "mode_reason", node.Reason, "role", cfg.Role, "control_url", controlURL, "status_api", cfg.Listen, "os", runtime.GOOS)
+	holder.Store(vpnd.View{Source: rec, Mode: node.Mode, ModeReason: node.Reason, Access: access})
 	go func() { errc <- rec.Run(ctx) }()
 	select {
 	case <-ctx.Done():
@@ -468,25 +493,38 @@ func (n *runningNode) Close() error {
 	return n.close()
 }
 
-// openNode decides system vs embedded once, then opens that backend.
-// The probe is read-only and only runs for auto. advertise_routes is rejected
-// again after auto resolves, before an embedded node is started.
-func openNode(ctx context.Context, cfg *vpnd.Config, controlURL string, log *slog.Logger) (*runningNode, error) {
+// openNode decides system vs embedded, then opens that backend.
+// The probe is read-only. auto always probes. local-ai and gateway also
+// probe when mode is system, and retry while tailscaled is down instead of
+// starting an embedded node. advertise_routes is rejected again after auto
+// resolves, before an embedded node is started.
+func openNode(ctx context.Context, cfg *vpnd.Config, controlURL string, log *slog.Logger, onWait func(vpnd.ModeDecision)) (*runningNode, error) {
 	req := cfg.Mode
 	if req == "" {
 		req = vpnd.ModeAuto
 	}
-	var view vpnd.SystemView
-	if req == vpnd.ModeAuto {
-		probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		view = vpnd.ProbeSystem(probeCtx, vpnd.NewLocalBackend(cfg.TailscaleSocket), controlURL)
-		cancel()
-	}
-	d, err := vpnd.DecideMode(req, cfg.TakeoverValue(), view, controlURL)
+	d, err := vpnd.ProbeUntilReady(ctx, req, cfg.Role, cfg.TakeoverValue(), controlURL,
+		func(pctx context.Context) vpnd.SystemView {
+			probeCtx, cancel := context.WithTimeout(pctx, 3*time.Second)
+			defer cancel()
+			return vpnd.ProbeSystem(probeCtx, vpnd.NewLocalBackend(cfg.TailscaleSocket), controlURL)
+		},
+		onWait,
+		func(sctx context.Context, d time.Duration) error {
+			t := time.NewTimer(d)
+			defer t.Stop()
+			select {
+			case <-sctx.Done():
+				return sctx.Err()
+			case <-t.C:
+				return nil
+			}
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
-	log.Info("vpn mode", "mode", d.Mode, "reason", d.Reason)
+	log.Info("vpn mode", "mode", d.Mode, "reason", d.Reason, "role", cfg.Role)
 	if err := cfg.RejectEmbeddedRoutes(d.Mode); err != nil {
 		return nil, err
 	}
