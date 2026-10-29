@@ -16,21 +16,26 @@ func TestUserServiceNotice(t *testing.T) {
 }
 
 func TestRenderServiceDefinitions(t *testing.T) {
-	const exe = "/usr/local/bin/idoris-vpnd"
+	const userExe = "/usr/local/bin/idoris-vpnd"
+	_, systemExe := systemExecutable("linux", "")
+	_, winExe := systemExecutable("windows", `C:\Program Files`)
 	const cfgPath = "/etc/idoris/vpn.json"
 	cfg := []byte(`{
 	  "state_dir": "/var/lib/idoris/node",
 	  "socks5_listen": "unix:/var/lib/idoris/socks",
 	  "forwards": [{"listen": "unix:/run/idoris/fwd.sock", "target": "10.0.0.1:1"}]
 	}`)
-	unit, err := renderSystemdSystemUnit(exe, cfgPath, cfg)
+	unit, err := renderSystemdSystemUnit(systemExe, cfgPath, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertGolden(t, "testdata/idoris-vpnd.system.service", unit)
-	assertGolden(t, "testdata/idoris-vpnd.user.service", renderSystemdUserUnit(exe, cfgPath))
-	assertGolden(t, "testdata/ai.idoris.vpnd.daemon.plist", renderLaunchdPlist(exe, cfgPath, "/var/log/idoris"))
-	assertGolden(t, "testdata/idoris-vpnd.task.txt", strings.Join(renderSchtasksCreate(exe, cfgPath), "\n")+"\n")
+	assertGolden(t, "testdata/idoris-vpnd.user.service", renderSystemdUserUnit(userExe, cfgPath))
+	assertGolden(t, "testdata/ai.idoris.vpnd.daemon.plist", renderLaunchdPlist(systemExe, cfgPath, "/var/log/idoris"))
+	assertGolden(t, "testdata/idoris-vpnd.task.txt", strings.Join(renderSchtasksCreate(winExe, windowsConfigPath), "\n")+"\n")
+	if systemExe != "/usr/local/lib/idoris/idoris-vpnd" || winExe != `C:\Program Files\iDoris\idoris-vpnd.exe` {
+		t.Fatalf("protected paths linux %s windows %s", systemExe, winExe)
+	}
 
 	quoted, err := renderSystemdSystemUnit("/opt/iDoris VPN/idoris-vpnd", "/etc/idoris/my vpn.json", cfg)
 	if err != nil {
@@ -47,7 +52,7 @@ func TestRenderServiceDefinitions(t *testing.T) {
 	if strings.Join(del, " ") != "/Delete /TN idoris-vpnd /F" {
 		t.Fatalf("delete %v", del)
 	}
-	if _, err := renderSystemdSystemUnit(exe, cfgPath, []byte("{")); err == nil {
+	if _, err := renderSystemdSystemUnit(systemExe, cfgPath, []byte("{")); err == nil {
 		t.Fatal("broken config was accepted")
 	}
 	paths, err := systemReadWritePaths([]byte(`{"state_dir":"relative","socks5_listen":"127.0.0.1:1"}`))
