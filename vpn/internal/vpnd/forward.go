@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	"tailscale.com/net/socks5"
 )
@@ -50,10 +51,14 @@ type AccessOptions struct {
 // It dials through Dialer and does not know whether that dialer is tsnet or
 // the kernel.
 type LocalAccess struct {
-	dial   Dialer
-	log    *slog.Logger
-	ctx    context.Context
-	cancel context.CancelFunc
+	dial        Dialer
+	log         *slog.Logger
+	ctx         context.Context
+	cancel      context.CancelFunc
+	gate        func() bool
+	dialTimeout time.Duration
+	user        string
+	pass        string
 
 	mu       sync.Mutex
 	closed   bool
@@ -185,6 +190,24 @@ func (a *LocalAccess) serveConn(client net.Conn, target string) {
 	go func() { defer wg.Done(); copyHalf(upstream, client) }()
 	go func() { defer wg.Done(); copyHalf(client, upstream) }()
 	wg.Wait()
+}
+
+// dialUpstream cancels the dial when the daemon stops, the timeout fires, or
+// the client goes away. The watch is armed before DialContext and stopped
+// before the byte copy, so it does not run for the life of the session.
+func (a *LocalAccess) dialUpstream(client net.Conn, target string) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(a.ctx, a.dialTimeout)
+	defer cancel()
+	stop := watchDisconnect(client, cancel)
+	defer stop()
+	return a.dial.DialContext(ctx, "tcp", target)
+}
+
+func (a *LocalAccess) gateOpen() bool {
+	if a.gate == nil {
+		return true
+	}
+	return a.gate()
 }
 
 func (a *LocalAccess) track(c net.Conn) bool {
