@@ -89,6 +89,80 @@ func hardARedact(s string) string {
 	return hardASecret.ReplaceAllString(s, "REDACTED")
 }
 
+// hardAProfile is one row of `tailscale switch --list --json`.
+type hardAProfile struct {
+	ID       string `json:"id"`
+	Tailnet  string `json:"tailnet"`
+	Account  string `json:"account"`
+	Selected bool   `json:"selected"`
+}
+
+func (h hardA) profilesOK(service string) ([]hardAProfile, error) {
+	raw, err := h.composeOK("exec", "-T", service, "/usr/local/bin/tailscale", "--socket", tsSock, "switch", "--list", "--json")
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", err, strings.TrimSpace(hardARedact(raw)))
+	}
+	var list []hardAProfile
+	if err := json.Unmarshal([]byte(hardAJSONArray(raw)), &list); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+func (h hardA) profiles(t *testing.T, service string) []hardAProfile {
+	t.Helper()
+	list, err := h.profilesOK(service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return list
+}
+
+func hardAJSONArray(s string) string {
+	i := strings.IndexByte(s, '[')
+	j := strings.LastIndexByte(s, ']')
+	if i < 0 || j < i {
+		return s
+	}
+	return s[i : j+1]
+}
+
+// controlURLsInState returns the distinct control URLs stored in tailscaled's
+// state file. Values in that file are base64, so the URLs are decoded here
+// and nothing else from the file is returned or logged.
+func (h hardA) controlURLsInState(t *testing.T, service string) []string {
+	t.Helper()
+	dest := filepath.Join(t.TempDir(), "tailscaled.state")
+	if out, err := h.composeOK("cp", service+":/var/lib/tailscale/tailscaled.state", dest); err != nil {
+		t.Fatalf("copy tailscaled state: %v\n%s", err, out)
+	}
+	b, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := append([]byte(nil), b...)
+	var cache map[string][]byte
+	if err := json.Unmarshal(b, &cache); err == nil {
+		for _, v := range cache {
+			blob = append(blob, v...)
+			blob = append(blob, '\n')
+		}
+	}
+	seen := map[string]bool{}
+	var urls []string
+	for _, m := range hardAControlURL.FindAll(blob, -1) {
+		u := string(m)
+		if seen[u] {
+			continue
+		}
+		seen[u] = true
+		urls = append(urls, u)
+	}
+	return urls
+}
+
+var hardAControlURL = regexp.MustCompile(`https://headscale(?:-foreign)?`)
+
 type hardAIdentity struct {
 	BackendState string
 	SelfID       string
@@ -201,6 +275,15 @@ func hardAHasRoute(routes []string, want string) bool {
 	return false
 }
 
+func hardASelected(list []hardAProfile) string {
+	for _, p := range list {
+		if p.Selected {
+			return p.ID
+		}
+	}
+	return ""
+}
+
 // TestHardAClientCore covers the docker cases that need a real Headscale:
 //
 //	(a) system mode, takeover off, foreign login active, saved iDoris profile
@@ -300,8 +383,118 @@ func TestHardAClientCore(t *testing.T) {
 }
 
 func hardAForeignStays(t *testing.T, ctx context.Context, h hardA, our, foreign *headscale.Client, ourUser, foreignUser string) {
-	panic("stub")
+	t.Helper()
+	// Foreign first. A client that has already used the iDoris DERP (region 999)
+	// then logs into this placeholder map never reaches Running: magicsock
+	// keeps asking for region 999, which the foreign map does not have.
+	// `tailscale login` keeps the previous profile, so the iDoris login below
+	// is the saved one. Switch back so the foreign login is active.
+	frKey, err := foreign.CreatePreAuthKey(ctx, headscale.CreatePreAuthKeyRequest{
+		UserID: foreignUser, Expiration: time.Now().Add(30 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.tailscale(t, "member", "up",
+		"--login-server", "https://headscale-foreign", "--auth-key", frKey.Key,
+		"--hostname", "harda-foreign", "--accept-dns=false", "--timeout", "90s")
+
+	ourKey, err := our.CreatePreAuthKey(ctx, headscale.CreatePreAuthKeyRequest{
+		UserID: ourUser, Expiration: time.Now().Add(30 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.tailscale(t, "member", "login",
+		"--login-server", "https://headscale", "--auth-key", ourKey.Key,
+		"--hostname", "harda-saved", "--accept-dns=false", "--timeout", "90s")
+
+	profiles := h.profiles(t, "member")
+	if len(profiles) < 2 {
+		t.Fatalf("switch --list has %d profiles, want a saved iDoris profile and the active foreign one: %+v", len(profiles), profiles)
+	}
+	var foreignID string
+	for _, p := range profiles {
+		if !p.Selected {
+			foreignID = p.ID
+			break
+		}
+	}
+	if foreignID == "" {
+		t.Fatalf("no saved profile to switch back to: %+v", profiles)
+	}
+	// switch blocks until Running. After the iDoris session, magicsock still
+	// wants DERP region 999, which this foreign map does not have, so the
+	// CLI would wait forever. Start the switch, then restart tailscaled so
+	// the saved foreign profile comes up in a fresh process.
+	h.compose(t, "exec", "-d", "member", "/usr/local/bin/tailscale", "--socket", tsSock, "switch", foreignID)
+	waitFor(t, "current profile is the foreign one", 20*time.Second, func() (bool, string) {
+		list, err := h.profilesOK("member")
+		if err != nil {
+			return false, err.Error()
+		}
+		return hardASelected(list) == foreignID, fmt.Sprintf("%+v", list)
+	})
+	if id, err := h.identityOK("member"); err != nil || id.BackendState != "Running" || !strings.Contains(id.ControlURL, "headscale-foreign") {
+		h.compose(t, "restart", "member")
+		h.waitSock(t, "member")
+	}
+	waitFor(t, "foreign profile running again", 60*time.Second, func() (bool, string) {
+		id, err := h.identityOK("member")
+		if err != nil {
+			return false, err.Error()
+		}
+		return id.BackendState == "Running" && strings.Contains(id.ControlURL, "headscale-foreign"),
+			fmt.Sprintf("%+v", id)
+	})
+	profiles = h.profiles(t, "member")
+	if hardASelected(profiles) != foreignID {
+		t.Fatalf("switch did not return to %s: %+v", foreignID, profiles)
+	}
+	urls := h.controlURLsInState(t, "member")
+	if !hardAURLSet(urls, "https://headscale") || !hardAURLSet(urls, "https://headscale-foreign") {
+		t.Fatalf("state control URLs = %v, want both https://headscale and https://headscale-foreign", urls)
+	}
+	before := h.identity(t, "member")
+	if before.BackendState != "Running" || before.SelfID == "" || !strings.Contains(before.ControlURL, "headscale-foreign") {
+		t.Fatalf("foreign tailscale not ready: %+v", before)
+	}
+	selected := hardASelected(profiles)
+	t.Logf("profiles=%d selected=%s foreign id=%s control=%s urls=%v", len(profiles), selected, before.SelfID, before.ControlURL, urls)
+
+	const script = `/opt/idoris-vpnd run --mode system --control-url https://headscale --auth-key hardA-unused-key --listen tcp:127.0.0.1:7845 --state-file /tmp/hardA-a-state.json --tailscale-socket /var/run/tailscale/tailscaled.sock --interval 2s --log-level info`
+	h.startDaemon(t, "member", script, "/tmp/vpnd-a.log")
+
+	var got map[string]any
+	waitFor(t, "blocked-foreign-tailnet", 60*time.Second, func() (bool, string) {
+		m, err := h.status(t, "member", "http://127.0.0.1:7845/v1/status")
+		if err != nil {
+			return false, err.Error()
+		}
+		got = m
+		return m["phase"] == "blocked-foreign-tailnet" && m["login_attempts"] == float64(0),
+			fmt.Sprintf("phase=%v attempts=%v err=%v", m["phase"], m["login_attempts"], m["last_error"])
+	})
+	after := h.identity(t, "member")
+	afterProfiles := h.profiles(t, "member")
+	if after.SelfID != before.SelfID || after.BackendState != "Running" || after.ControlURL != before.ControlURL || after.Hostname != before.Hostname {
+		t.Fatalf("foreign login changed: before %+v after %+v", before, after)
+	}
+	if hardASelected(afterProfiles) != selected || len(afterProfiles) != len(profiles) {
+		t.Fatalf("profiles changed: before %+v after %+v", profiles, afterProfiles)
+	}
+	t.Logf("foreign untouched: phase=%v attempts=%v self=%s control=%s", got["phase"], got["login_attempts"], after.SelfID, after.ControlURL)
 }
+
+func hardAURLSet(urls []string, want string) bool {
+	for _, got := range urls {
+		if got == want {
+			return true
+		}
+	}
+	return false
+}
+
 func hardAUnmanagedPrefs(t *testing.T, ctx context.Context, h hardA, our *headscale.Client, mints *countingMinter, enrollURL, token string) {
 	t.Helper()
 	script := fmt.Sprintf(
@@ -408,4 +601,10 @@ func hardAEnrollDown(t *testing.T, h hardA, mints *countingMinter, enrollURL, to
 	}
 	t.Logf("enroll down resume: phase=%v reachable=%v attempts=%v warnings=%v keys=%d",
 		got["phase"], got["enroll_reachable"], got["login_attempts"], got["warnings"], mints.n.Load())
+}
+
+func init() {
+	var touch1 hardAProfile
+	_ = touch1.Tailnet
+	_ = touch1.Account
 }
