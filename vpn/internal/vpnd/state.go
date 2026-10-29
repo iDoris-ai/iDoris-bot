@@ -32,16 +32,43 @@ type DaemonState struct {
 	ProfileID        string    `json:"profile_id,omitempty"`
 	NextLoginAt      time.Time `json:"next_login_at,omitzero"`
 	LoginFailures    int       `json:"login_failures,omitempty"`
+	// Static is set when this binding was confirmed for a config with no
+	// enrollment URL. Tenant and role stay empty; discovery did not run.
+	Static bool `json:"static,omitempty"`
+	// Pending* is an identity transition a restart must finish instead of
+	// minting again. PendingNodeKey and PendingNodeID identify the node that
+	// was running when the transition began. PendingProfileID is the profile
+	// the login returned under, in system mode. PendingLoginOK is set only
+	// after Start and StartLoginInteractive have both returned.
+	PendingNodeID    string    `json:"pending_node_id,omitempty"`
+	PendingNodeKey   string    `json:"pending_node_key,omitempty"`
+	PendingProfileID string    `json:"pending_profile_id,omitempty"`
+	PendingStarted   time.Time `json:"pending_started,omitzero"`
+	PendingLoginOK   bool      `json:"pending_login_ok,omitempty"`
+}
+
+// PendingLogin is the on-disk identity transition. It is small on purpose:
+// enough for the next process to recognise the login it already started.
+type PendingLogin struct {
+	NodeID    string
+	NodeKey   string
+	ProfileID string
+	Started   time.Time
+	LoginOK   bool
 }
 
 // Identity is the credential the enrollment service just described.
-// Known is false when discovery did not run (static auth key, or discovery
-// failed and the daemon is resuming from DaemonState).
+// Known is false when discovery did not run. Static is true for a
+// pre-provisioned auth key (no enroll URL): discovery is not applicable,
+// and the gate trusts the running node of that key once it is on our
+// control server. TokenFingerprint is set even when Known is false, so a
+// degraded start can compare the token in hand with the saved binding.
 type Identity struct {
 	Tenant           string
 	Role             string
 	TokenFingerprint string
 	Known            bool
+	Static           bool
 }
 
 // TokenFingerprint is hex(SHA-256(token)[:8]). An empty token yields an empty
@@ -185,6 +212,7 @@ func (s *StateFile) SetIdentity(controlURL, tenant, role, fingerprint, nodeID, p
 	next.TokenFingerprint = fingerprint
 	next.NodeID = nodeID
 	next.ProfileID = profileID
+	next.Static = false
 	if next == s.st {
 		return nil
 	}
@@ -224,6 +252,83 @@ func (s *StateFile) SetLoginBackoff(next time.Time, failures int) error {
 // ClearLoginBackoff forgets a persisted login delay after the node is up.
 func (s *StateFile) ClearLoginBackoff() error {
 	return s.SetLoginBackoff(time.Time{}, 0)
+}
+
+// SetStaticIdentity records that the running node belongs to a static auth
+// key. Discovery did not produce a tenant or role, so those fields are cleared.
+func (s *StateFile) SetStaticIdentity(controlURL, nodeID, profileID string) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := s.st
+	next.ControlURL = controlURL
+	next.Tenant = ""
+	next.Role = ""
+	next.TokenFingerprint = ""
+	next.NodeID = nodeID
+	next.ProfileID = profileID
+	next.Static = true
+	if next == s.st {
+		return nil
+	}
+	if err := s.saveLocked(next); err != nil {
+		return err
+	}
+	s.st = next
+	return nil
+}
+
+// SetPending persists an in-progress identity transition. The in-memory copy
+// changes only after the file is replaced.
+func (s *StateFile) SetPending(p PendingLogin) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := s.st
+	next.PendingNodeID = p.NodeID
+	next.PendingNodeKey = p.NodeKey
+	next.PendingProfileID = p.ProfileID
+	if p.Started.IsZero() {
+		next.PendingStarted = time.Time{}
+	} else {
+		next.PendingStarted = p.Started.UTC()
+	}
+	next.PendingLoginOK = p.LoginOK
+	if next == s.st {
+		return nil
+	}
+	if err := s.saveLocked(next); err != nil {
+		return err
+	}
+	s.st = next
+	return nil
+}
+
+// ClearPending drops a finished or abandoned identity transition.
+func (s *StateFile) ClearPending() error {
+	return s.SetPending(PendingLogin{})
+}
+
+// Pending returns the persisted identity transition. The bool is false when
+// no transition was saved.
+func (s *StateFile) Pending() (PendingLogin, bool) {
+	if s == nil {
+		return PendingLogin{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := PendingLogin{
+		NodeID:    s.st.PendingNodeID,
+		NodeKey:   s.st.PendingNodeKey,
+		ProfileID: s.st.PendingProfileID,
+		Started:   s.st.PendingStarted,
+		LoginOK:   s.st.PendingLoginOK,
+	}
+	return p, p.LoginOK || p.NodeID != "" || p.NodeKey != "" || p.ProfileID != "" || !p.Started.IsZero()
 }
 
 // LoginBackoff returns the persisted next-eligible time and failure count.
