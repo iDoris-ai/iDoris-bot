@@ -364,6 +364,44 @@ func TestForeignTailnetBlockedWithoutTakeover(t *testing.T) {
 	}
 }
 
+func TestServiceRoleForeignBlockDoesNotSuggestEmbedded(t *testing.T) {
+	be := &fakeBackend{
+		state: ipn.Running,
+		prefs: ipn.Prefs{ControlURL: "https://controlplane.tailscale.com", WantRunning: true},
+	}
+	r := newR(t, be, &countingKeys{}, func(o *Options) {
+		o.Takeover = false
+		o.Role = "local-ai"
+	})
+	snap, err := r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseBlocked || snap.Role != "local-ai" {
+		t.Fatalf("%+v err=%v", snap, err)
+	}
+	if strings.Contains(snap.LastError, "Set mode: embedded") {
+		t.Fatalf("must not suggest embedded: %s", snap.LastError)
+	}
+	if !strings.Contains(snap.LastError, "takeover: true") || !strings.Contains(snap.LastError, "local-ai") {
+		t.Fatalf("message: %s", snap.LastError)
+	}
+	for _, c := range be.calls {
+		if c == "ProfileStatus" || strings.HasPrefix(c, "Switch") || c == "Start" {
+			t.Fatalf("mutated profile: %v", be.calls)
+		}
+	}
+}
+
+func TestServiceRoleUnreachableWaits(t *testing.T) {
+	be := &fakeBackend{statusErr: errors.New("dial unix: no such file")}
+	r := newR(t, be, &countingKeys{}, func(o *Options) { o.Role = "gateway" })
+	snap, err := r.Step(context.Background())
+	if err == nil || snap.Phase != PhaseWaitingTailscaled || len(snap.Warnings) == 0 {
+		t.Fatalf("%+v err=%v", snap, err)
+	}
+	if !strings.Contains(snap.LastError, "gateway") || strings.Contains(snap.LastError, "mode: embedded") {
+		t.Fatalf("message: %s", snap.LastError)
+	}
+}
+
 func TestForeignStatesBlockedBeforeProfileMutation(t *testing.T) {
 	foreign := "https://controlplane.tailscale.com"
 	cases := []struct {
