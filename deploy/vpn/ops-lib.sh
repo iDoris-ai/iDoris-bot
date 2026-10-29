@@ -1244,3 +1244,61 @@ _start_restored_stack() {
   fi
   verify_published_bindings "$mode"
 }
+
+restore_deployment() {
+  local bundle="$1" info bundle_project ignored
+  [[ -d "$bundle" && ! -L "$bundle" ]] || die "backup directory is missing"
+  info="$(python3 "$here/bundle.py" tree "$bundle")"
+  bundle_project="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("dotenv", {}).get("COMPOSE_PROJECT_NAME", ""))' "$info")"
+  ignored="$(python3 -c 'import json,sys; print("\n".join(json.loads(sys.argv[1]).get("ignored") or []))' "$info")"
+  if [[ -n "$ignored" ]]; then
+    echo "restore: ignoring obsolete state/enroll/token-labels.json" >&2
+  fi
+  _restore_ok=0
+  _restore_phase=0
+  _restore_prev_mode="$(read_admin_mode)"
+  _restore_current="$(current_project_name)"
+  if [[ -n "$bundle_project" ]]; then
+    _restore_dest="$bundle_project"
+  else
+    _restore_dest="$_restore_current"
+  fi
+  if [[ -n "${COMPOSE_PROJECT_NAME:-}" && "$COMPOSE_PROJECT_NAME" != "$_restore_dest" ]]; then
+    die "COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME} does not match the bundle project ${_restore_dest}"
+  fi
+  reject_project_named "$_restore_current"
+  if [[ "$_restore_dest" != "$_restore_current" ]]; then
+    reject_project_named "$_restore_dest"
+  fi
+  _restore_host="$(mktemp -d "${TMPDIR:-/tmp}/idoris-vpn.XXXXXX")"
+  _restore_vol="$(mktemp -d "${TMPDIR:-/tmp}/idoris-vpn.XXXXXX")"
+  _restore_snap="$(mktemp "${TMPDIR:-/tmp}/idoris-vpn.XXXXXX")"
+  chmod 700 "$_restore_host" "$_restore_vol"
+  chmod 600 "$_restore_snap"
+  trap _restore_on_exit EXIT
+  _snapshot_host_files "$_restore_host"
+  COMPOSE_PROJECT_LOCK="$_restore_current"
+  snapshot_running "$_restore_snap"
+  _restore_phase=1
+  if ! stop_db_writers; then
+    restore_running_services "$_restore_snap" "$_restore_prev_mode" || true
+    _restore_phase=0
+    die "refusing to restore; a database writer did not stop"
+  fi
+  COMPOSE_PROJECT_LOCK="$_restore_dest"
+  if ! _snapshot_volumes "$_restore_vol" "$_restore_prev_mode"; then
+    COMPOSE_PROJECT_LOCK="$_restore_current"
+    restore_running_services "$_restore_snap" "$_restore_prev_mode" || true
+    _restore_phase=0
+    die "refusing to restore; could not snapshot the live volumes"
+  fi
+  _restore_phase=2
+  _install_bundle_host "$bundle" "$info"
+  _install_bundle_volumes "$bundle" "$(read_admin_mode)"
+  _start_restored_stack "$(read_admin_mode)" "$bundle"
+  _restore_ok=1
+  trap - EXIT
+  _restore_cleanup_temp
+  unset COMPOSE_PROJECT_LOCK
+  echo "restored from $bundle (admin mode $(read_admin_mode); the other Headplane stays stopped)"
+}
