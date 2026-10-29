@@ -169,9 +169,14 @@ func TestPageRequiresHostSecretAndCSRF(t *testing.T) {
 		t.Fatal(res.Header.Get("Referrer-Policy"))
 	}
 	html := string(page)
-	for _, want := range []string{"这台机器就是 Local AI 吗？", "识别网络", "使用建议", "启用"} {
+	for _, want := range []string{"这台机器就是 Local AI 吗？", "识别网络", "使用建议", "启用", "这是我组织的服务器", "this is my organisation's server", "通过你信任的渠道"} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("page missing %q", want)
+		}
+	}
+	for _, bad := range []string{"命令行", "--yes", "--code"} {
+		if strings.Contains(html, bad) {
+			t.Fatalf("page suggests entering the join code on a command line: %q", bad)
 		}
 	}
 	if strings.Contains(html, "http://") || strings.Contains(html, "https://") || strings.Contains(html, srv.secret) || strings.Contains(html, srv.csrf) || strings.Contains(html, "csrf-token") {
@@ -301,7 +306,7 @@ func TestJoinPlanAndApplyHideTheToken(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("detect %d %s", status, body)
 	}
-	status, body = call("/api/plan", map[string]any{"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"}})
+	status, body = call("/api/plan", map[string]any{"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"}, "confirm_authority": true})
 	var plan gateway.Plan
 	if err := json.Unmarshal(body, &plan); err != nil {
 		t.Fatalf("plan %d %s", status, body)
@@ -310,7 +315,7 @@ func TestJoinPlanAndApplyHideTheToken(t *testing.T) {
 		t.Fatalf("plan %d %+v %s", status, plan.Routes, body)
 	}
 	status, body = call("/api/apply", map[string]any{
-		"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"},
+		"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"}, "confirm_authority": true,
 	})
 	if status != http.StatusOK || bytes.Contains(body, []byte(uiToken)) || !bytes.Contains(body, []byte("sudo idoris-vpnd gateway apply")) {
 		t.Fatalf("apply %d %s", status, body)
@@ -375,7 +380,7 @@ func TestLocalAIPlanHasNoRoute(t *testing.T) {
 	}
 	_, _ = io.ReadAll(res.Body)
 	_ = res.Body.Close()
-	raw, _ = json.Marshal(map[string]any{"this_machine_is_local_ai": true})
+	raw, _ = json.Marshal(map[string]any{"this_machine_is_local_ai": true, "confirm_authority": true})
 	req, _ = http.NewRequest(http.MethodPost, base+"/api/plan", bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "http://"+srv.bound)
