@@ -33,12 +33,15 @@ import (
 	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/netdetect"
 )
 
-const cookieName = "idoris_ui"
-const secretHeader = "X-Idoris-UI-Secret" //nolint:gosec // header name, not a credential
-const csrfHeader = "X-CSRF-Token"
-const maxBody = 64 << 10
-const defaultIdle = 15 * time.Minute
-const csp = "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+const (
+	cookieName   = "idoris_ui"
+	secretHeader = "X-Idoris-UI-Secret" //nolint:gosec // header name, not a credential
+	csrfHeader   = "X-CSRF-Token"
+	maxBody      = 64 << 10
+	defaultIdle  = 15 * time.Minute
+
+	csp = "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+)
 
 //go:embed index.html app.js app.css
 var assets embed.FS
