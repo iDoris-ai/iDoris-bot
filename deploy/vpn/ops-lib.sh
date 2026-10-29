@@ -101,6 +101,7 @@ start_stack_for_mode() {
     compose up -d --wait --wait-timeout 180 headscale enroll headplane
     verify_published_bindings "$mode"
   fi
+  mark_deploy_dir
 }
 
 # Write one service name per line for every service that is running now.
@@ -241,6 +242,12 @@ PY
   chmod 600 "$dest"
 }
 
+# docker outside `compose`. An inherited COMPOSE_PROFILES must not select a
+# profile on a later compose command, and it must not reach this process either.
+_docker_host() {
+  env -u COMPOSE_PROFILES -u COMPOSE_FILE -u COMPOSE_PATH_SEPARATOR docker "$@"
+}
+
 # Compose volume for this project, by label or by the conventional name.
 # Empty output means the volume does not exist. A down stack keeps the volume.
 _project_volume_name() {
@@ -249,13 +256,13 @@ _project_volume_name() {
   if [[ -z "$project" ]]; then
     project="$(current_project_name)"
   fi
-  labeled="$(docker volume ls -q --filter "label=com.docker.compose.project=${project}" --filter "label=com.docker.compose.volume=${short}" 2>/dev/null | head -n1 || true)"
+  labeled="$(_docker_host volume ls -q --filter "label=com.docker.compose.project=${project}" --filter "label=com.docker.compose.volume=${short}" 2>/dev/null | head -n1 || true)"
   if [[ -n "$labeled" ]]; then
     printf '%s' "$labeled"
     return 0
   fi
   name="${project}_${short}"
-  if docker volume inspect "$name" >/dev/null 2>&1; then
+  if _docker_host volume inspect "$name" >/dev/null 2>&1; then
     printf '%s' "$name"
     return 0
   fi
@@ -268,8 +275,32 @@ sidecar_has_identity() {
   local vol
   vol="$(_project_volume_name vpn-sidecar-state 2>/dev/null || true)"
   [[ -n "$vol" ]] || return 1
-  docker run --rm --network none -v "${vol}:/state:ro" "$ALPINE_VOLUME_IMAGE" \
+  _docker_host run --rm --network none -v "${vol}:/state:ro" "$ALPINE_VOLUME_IMAGE" \
     sh -c 'test -s /state/tailscaled.state'
+}
+
+# Compose 5.1 keeps the project label on a volume and drops the container
+# (and its working_dir label) on `down`. The marker is the directory that
+# created the volume. It is not a secret.
+mark_deploy_dir() {
+  local vol dir
+  vol="$(_project_volume_name headscale-data 2>/dev/null || true)"
+  [[ -n "$vol" ]] || return 0
+  dir="$(cd "$here" && pwd -P)"
+  # $1 is the container shell's argument, not this shell's.
+  # shellcheck disable=SC2016
+  _docker_host run --rm --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
+    sh -c 'umask 022; printf %s "$1" > /data/.idoris-deploy-dir' _ "$dir"
+}
+
+_volume_deploy_dir() {
+  local vol="$1"
+  docker run --rm --network none -v "${vol}:/data:ro" "$ALPINE_VOLUME_IMAGE" \
+    sh -c 'if [ -f /data/.idoris-deploy-dir ]; then cat /data/.idoris-deploy-dir; fi'
+}
+
+_safe_volume_name() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]+$ ]]
 }
 
 # Named volume mounted at a container path. Bind mounts have an empty Name.
@@ -568,6 +599,103 @@ for item in data:
 ' "$want" "$mine" "$json" 2>&1)"; then
     die "${err:-compose project ${want} collides with another directory}"
   fi
+  reject_project_volumes "$want"
+}
+
+# Volumes survive `compose down`. A working_dir label, when the volume has
+# one, or the deploy-dir marker must be this directory. No label and no
+# marker is not proof of another directory.
+reject_project_volumes() {
+  local want="$1" ours names name short labels marker err collision=""
+  ours="$(cd "$here" && pwd -P)"
+  names="$(mktemp "$here/.running.XXXXXX")"
+  chmod 600 "$names"
+  if ! docker volume ls -q --filter "label=com.docker.compose.project=${want}" > "$names"; then
+    rm -f "$names"
+    die "could not list volumes for ${want}"
+  fi
+  for short in headscale-data headscale-run headplane-data vpn-sidecar-state; do
+    name="${want}_${short}"
+    if _safe_volume_name "$name" && docker volume inspect "$name" >/dev/null 2>&1; then
+      printf '%s\n' "$name" >> "$names"
+    fi
+  done
+  sort -u -o "$names" "$names"
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    _safe_volume_name "$name" || continue
+    labels="$(docker volume inspect -f '{{json .Labels}}' "$name" 2>/dev/null || true)"
+    if ! err="$(python3 -c '
+import json, os, sys
+ours, raw, name, want = sys.argv[1:]
+ours = os.path.realpath(ours)
+text = (raw or "").strip()
+if text in ("", "null"):
+    raise SystemExit(0)
+try:
+    labels = json.loads(text)
+except ValueError:
+    raise SystemExit(0)
+if not isinstance(labels, dict):
+    raise SystemExit(0)
+
+def foreign(path):
+    sys.stderr.write(
+        "compose project %s has volume %s from %s; pass --instance NAME or set COMPOSE_PROJECT_NAME\n"
+        % (want, name, path))
+    raise SystemExit(1)
+
+wd = labels.get("com.docker.compose.project.working_dir") or ""
+cf = labels.get("com.docker.compose.project.config_files") or ""
+if isinstance(wd, str) and wd:
+    try:
+        same = os.path.realpath(wd) == ours
+    except OSError:
+        same = False
+    if not same:
+        foreign(wd)
+if isinstance(cf, str) and cf:
+    ours_file = os.path.realpath(os.path.join(ours, "compose.yaml"))
+    matched = False
+    for part in cf.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            if os.path.realpath(part) == ours_file:
+                matched = True
+                break
+        except OSError:
+            continue
+    if not matched:
+        foreign(cf)
+' "$ours" "$labels" "$name" "$want" 2>&1)"; then
+      collision="${err:-compose project ${want} has volume ${name} from another directory}"
+      break
+    fi
+    if [[ "$name" == *_headscale-data || "$labels" == *'"com.docker.compose.volume":"headscale-data"'* || "$labels" == *'"com.docker.compose.volume": "headscale-data"'* ]]; then
+      marker="$(_volume_deploy_dir "$name" 2>/dev/null || true)"
+      marker="${marker//$'\r'/}"
+      marker="${marker//$'\n'/}"
+      if [[ -n "$marker" ]]; then
+        if ! err="$(python3 -c '
+import os, sys
+ours, marker, name, want = sys.argv[1:]
+if os.path.realpath(marker) == os.path.realpath(ours):
+    raise SystemExit(0)
+sys.stderr.write(
+    "compose project %s has volume %s from %s; pass --instance NAME or set COMPOSE_PROJECT_NAME\n"
+    % (want, name, marker))
+raise SystemExit(1)
+' "$ours" "$marker" "$name" "$want" 2>&1)"; then
+          collision="${err:-compose project ${want} has volume ${name} from another directory}"
+          break
+        fi
+      fi
+    fi
+  done < "$names"
+  rm -f "$names"
+  [[ -z "$collision" ]] || die "$collision"
 }
 
 # One knob for Headplane's origin and cookie. tunnel, lan and proxy publish
@@ -1042,15 +1170,21 @@ _restore_on_exit() {
     exit "$rc"
   fi
   echo "restore: rolling back after failure" >&2
-  _restore_rollback || echo "restore: rollback failed" >&2
-  _restore_cleanup_temp
+  if _restore_rollback; then
+    echo "restore: rollback complete" >&2
+    _restore_cleanup_temp
+  else
+    echo "restore: rollback incomplete; keeping snapshots" >&2
+    echo "restore: host=${_restore_host:-} vol=${_restore_vol:-} snap=${_restore_snap:-}" >&2
+  fi
   unset COMPOSE_PROJECT_LOCK
   exit "$rc"
 }
 
 _restore_rollback() {
+  local rc=0
   if [[ -n "${_restore_host:-}" && -d "${_restore_host}" ]]; then
-    python3 - "$here" "$_restore_host" <<'PY'
+    python3 - "$here" "$_restore_host" <<'PY' || return 1
 import os, shutil, sys
 here, snap = sys.argv[1:]
 meta = os.path.join(snap, "META")
@@ -1080,16 +1214,19 @@ PY
   fi
   if [[ -n "${_restore_vol:-}" && -f "${_restore_vol}/HAD" ]]; then
     COMPOSE_PROJECT_LOCK="${_restore_dest}"
+    stop_db_writers || rc=1
+    _restore_drop_created "$_restore_vol" || rc=1
     if [[ "$(cat "${_restore_vol}/HAD")" == "1" ]]; then
-      _restore_copy_volume_back "$_restore_vol" "${_restore_prev_mode}"
-    else
-      compose --profile tailnet-admin down -v >/dev/null 2>&1 || true
+      if ! _restore_copy_volume_back "$_restore_vol" "${_restore_prev_mode}"; then
+        _restore_copy_volume_alpine "$_restore_vol" || rc=1
+      fi
     fi
   fi
   COMPOSE_PROJECT_LOCK="${_restore_current}"
   if [[ -n "${_restore_snap:-}" && -f "${_restore_snap}" ]]; then
-    restore_running_services "$_restore_snap" "${_restore_prev_mode}" || true
+    _recreate_original_services "$_restore_snap" "${_restore_prev_mode}" || rc=1
   fi
+  return "$rc"
 }
 
 _restore_copy_volume_back() {
@@ -1168,13 +1305,301 @@ os.chmod(os.path.join(dest, "MISSING"), 0o600)
 PY
 }
 
+_record_project_resources() {
+  local dest="$1" project short name
+  project="${COMPOSE_PROJECT_LOCK:-}"
+  if [[ -z "$project" ]]; then
+    project="$(current_project_name)"
+  fi
+  : > "$dest/containers.before"
+  : > "$dest/volumes.before"
+  : > "$dest/networks.before"
+  docker ps -aq --filter "label=com.docker.compose.project=${project}" > "$dest/containers.before" \
+    || return 1
+  docker volume ls -q --filter "label=com.docker.compose.project=${project}" > "$dest/volumes.before" \
+    || return 1
+  for short in headscale-data headscale-run headplane-data vpn-sidecar-state; do
+    name="${project}_${short}"
+    if _safe_volume_name "$name" && docker volume inspect "$name" >/dev/null 2>&1; then
+      printf '%s\n' "$name" >> "$dest/volumes.before"
+    fi
+  done
+  sort -u -o "$dest/volumes.before" "$dest/volumes.before"
+  docker network ls -q --filter "label=com.docker.compose.project=${project}" > "$dest/networks.before" \
+    || return 1
+}
+
+# Delete only containers, volumes and networks that this restore created.
+# A name in the before list is pre-existing data and stays.
+_restore_drop_created() {
+  local before="$1" project tmp name id
+  if [[ ! -f "$before/containers.before" || ! -f "$before/volumes.before" || ! -f "$before/networks.before" ]]; then
+    echo "restore: resource snapshot is incomplete; not deleting anything" >&2
+    return 0
+  fi
+  project="${COMPOSE_PROJECT_LOCK:-}"
+  if [[ -z "$project" ]]; then
+    project="$(current_project_name)"
+  fi
+  tmp="$(mktemp "$here/.running.XXXXXX")"
+  if ! docker ps -aq --filter "label=com.docker.compose.project=${project}" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    if ! grep -qx "$id" "$before/containers.before"; then
+      docker rm -f "$id" >/dev/null 2>&1 || true
+    fi
+  done < "$tmp"
+  if ! docker volume ls -q --filter "label=com.docker.compose.project=${project}" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  for short in headscale-data headscale-run headplane-data vpn-sidecar-state; do
+    name="${project}_${short}"
+    if _safe_volume_name "$name" && docker volume inspect "$name" >/dev/null 2>&1; then
+      printf '%s\n' "$name" >> "$tmp"
+    fi
+  done
+  sort -u -o "$tmp" "$tmp"
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    _safe_volume_name "$name" || continue
+    if ! grep -qx "$name" "$before/volumes.before"; then
+      docker volume rm "$name" >/dev/null 2>&1 || true
+    fi
+  done < "$tmp"
+  if ! docker network ls -q --filter "label=com.docker.compose.project=${project}" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    if ! grep -qx "$id" "$before/networks.before"; then
+      docker network rm "$id" >/dev/null 2>&1 || true
+    fi
+  done < "$tmp"
+  rm -f "$tmp"
+}
+
+# Copy one file out of a named volume. Exit 2 when the file is absent.
+# stdout is a tar, so this does not bind-mount the host temp directory.
+_copy_volume_file_out() {
+  local vol="$1" src="$2" dest="$3" rc archive
+  archive="$(mktemp "$here/.running.XXXXXX")"
+  set +e
+  docker run --rm --network none -e SRC="$src" -v "${vol}:/data:ro" "$ALPINE_VOLUME_IMAGE" \
+    sh -c 'if [ ! -f "/data/$SRC" ]; then exit 2; fi; tar -C /data -cf - "$SRC"' > "$archive"
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 2 ]]; then
+    rm -f "$archive" "$dest"
+    return 2
+  fi
+  if [[ "$rc" -ne 0 || ! -s "$archive" ]]; then
+    rm -f "$archive"
+    return 1
+  fi
+  mkdir -p "$(dirname "$dest")"
+  tar -C "$(dirname "$dest")" -xf "$archive"
+  rm -f "$archive"
+  [[ -f "$dest" ]] || return 1
+  return 0
+}
+
+_archive_volume_to_dir() {
+  local vol="$1" dest="$2" archive rc
+  mkdir -p "$dest"
+  archive="$(mktemp "$here/.running.XXXXXX")"
+  set +e
+  docker run --rm --network none -v "${vol}:/data:ro" "$ALPINE_VOLUME_IMAGE" \
+    tar -C /data --exclude '*.sock' -cf - . > "$archive"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 || ! -s "$archive" ]]; then
+    rm -f "$archive"
+    return 1
+  fi
+  tar -C "$dest" -xf "$archive"
+  rm -f "$archive"
+}
+
+_format_image_user() {
+  python3 -c 'import sys
+u = sys.argv[1].strip()
+if u == "":
+    print("0:0")
+    raise SystemExit
+if u == "nonroot":
+    print("65532:65532")
+    raise SystemExit
+if ":" not in u:
+    u = u + ":" + u
+a, b = u.split(":", 1)
+if a == "nonroot" or not a.isdigit():
+    a = "65532"
+if b == "nonroot" or not b.isdigit():
+    b = "65532"
+print("%s:%s" % (a, b))' "$1"
+}
+
+_image_user_from_compose() {
+  local svc="$1" image spec
+  image="$(compose config --format json 2>/dev/null | python3 -c '
+import json, sys
+svc = sys.argv[1]
+try:
+    cfg = json.load(sys.stdin)
+except ValueError:
+    raise SystemExit(1)
+print(((cfg.get("services") or {}).get(svc) or {}).get("image") or "")
+' "$svc" 2>/dev/null || true)"
+  [[ -n "$image" ]] || return 1
+  spec="$(docker image inspect "$image" --format '{{.Config.User}}' 2>/dev/null || true)"
+  _format_image_user "$spec"
+}
+
+# Put snapshotted bytes back when no container is left to docker-cp into.
+_restore_copy_volume_alpine() {
+  local dest="$1" vol owner archive hp
+  local -a files=()
+  vol="$(_project_volume_name headscale-data 2>/dev/null || true)"
+  [[ -n "$vol" ]] || return 1
+  if [[ ! -s "$dest/headscale/db.sqlite" ]]; then
+    # The retained volume had no database. A failed restore may have added one.
+    docker run --rm --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
+      rm -f /data/db.sqlite /data/db.sqlite-wal /data/db.sqlite-shm || return 1
+    return 0
+  fi
+  files=(db.sqlite)
+  [[ -s "$dest/headscale/noise_private.key" ]] && files+=(noise_private.key)
+  [[ -s "$dest/headscale/derp_server_private.key" ]] && files+=(derp_server_private.key)
+  [[ -s "$dest/headscale/db.sqlite-wal" ]] && files+=(db.sqlite-wal)
+  [[ -s "$dest/headscale/db.sqlite-shm" ]] && files+=(db.sqlite-shm)
+  archive="$(mktemp "$here/.running.XXXXXX")"
+  tar -C "$dest/headscale" -cf "$archive" "${files[@]}"
+  docker run --rm -i --user 0 --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
+    tar -C /data -xf - < "$archive" || { rm -f "$archive"; return 1; }
+  rm -f "$archive"
+  if [[ ! -s "$dest/headscale/db.sqlite-wal" ]]; then
+    docker run --rm --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
+      rm -f /data/db.sqlite-wal /data/db.sqlite-shm || return 1
+  fi
+  owner="$(_image_user_from_compose headscale 2>/dev/null || true)"
+  owner="${owner:-65532:65532}"
+  [[ "$owner" =~ ^[0-9]+:[0-9]+$ ]] || owner="65532:65532"
+  docker run --rm --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
+    chown -R "$owner" /data || return 1
+  if [[ -d "$dest/headplane" ]] && [[ -n "$(ls -A "$dest/headplane" 2>/dev/null || true)" ]]; then
+    hp="$(_project_volume_name headplane-data 2>/dev/null || true)"
+    if [[ -n "$hp" ]]; then
+      archive="$(mktemp "$here/.running.XXXXXX")"
+      tar -C "$dest/headplane" -cf "$archive" .
+      docker run --rm -i --user 0 --network none -v "${hp}:/data" "$ALPINE_VOLUME_IMAGE" \
+        tar -C /data -xf - < "$archive" || { rm -f "$archive"; return 1; }
+      rm -f "$archive"
+    fi
+  fi
+  return 0
+}
+
+_recreate_original_services() {
+  local snap="$1" mode="$2" svc
+  local -a plain=() profile=()
+  [[ -f "$snap" ]] || return 0
+  enforce_headplane_exclusion "$mode"
+  while IFS= read -r svc; do
+    [[ -n "$svc" ]] || continue
+    case "$svc" in
+      headplane)
+        [[ "$mode" == "published" ]] && plain+=("$svc")
+        ;;
+      vpn-sidecar|headplane-tailnet)
+        [[ "$mode" == "tailnet-admin" ]] && profile+=("$svc")
+        ;;
+      *)
+        plain+=("$svc")
+        ;;
+    esac
+  done < "$snap"
+  if [[ ${#plain[@]} -gt 0 ]]; then
+    compose up -d --force-recreate --wait --wait-timeout 180 "${plain[@]}" || return 1
+  fi
+  if [[ ${#profile[@]} -gt 0 ]]; then
+    compose --profile tailnet-admin up -d --force-recreate --wait --wait-timeout 180 "${profile[@]}" || return 1
+  fi
+  verify_published_bindings "$mode" || return 1
+  if snapshot_has "$snap" headscale; then
+    compose exec -T headscale headscale health || return 1
+  fi
+}
+
+_restored_enroll_check() {
+  local _
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if compose exec -T enroll idoris-vpn-enroll check --config /etc/idoris/enroll.json >/dev/null; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "restore: enroll config check failed" >&2
+  return 1
+}
+
 _snapshot_volumes() {
-  local dest="$1" mode="$2" hsid hpid
+  local dest="$1" mode="$2" hsid hpid vol rc hp sid
   mkdir -p "$dest/headscale" "$dest/headplane"
   chmod 700 "$dest" "$dest/headscale" "$dest/headplane"
+  _record_project_resources "$dest" || return 1
   hsid="$(_compose_ps_id headscale)"
   if [[ -z "$hsid" ]]; then
-    printf '0\n' > "$dest/HAD"
+    vol="$(_project_volume_name headscale-data 2>/dev/null || true)"
+    if [[ -z "$vol" ]]; then
+      printf '0\n' > "$dest/HAD"
+      return 0
+    fi
+    printf '1\n' > "$dest/HAD"
+    set +e
+    _copy_volume_file_out "$vol" db.sqlite "$dest/headscale/db.sqlite"
+    rc=$?
+    set -e
+    if [[ "$rc" -eq 1 ]]; then
+      echo "restore: volume snapshot could not copy the database" >&2
+      return 1
+    fi
+    if [[ -s "$dest/headscale/db.sqlite" ]]; then
+      _copy_volume_file_out "$vol" noise_private.key "$dest/headscale/noise_private.key" || rc=1
+      if [[ "$rc" -eq 1 || ! -s "$dest/headscale/noise_private.key" ]]; then
+        echo "restore: volume snapshot is missing the database" >&2
+        return 1
+      fi
+    fi
+    _copy_volume_file_out "$vol" derp_server_private.key "$dest/headscale/derp_server_private.key" \
+      || rm -f "$dest/headscale/derp_server_private.key"
+    _copy_volume_file_out "$vol" db.sqlite-wal "$dest/headscale/db.sqlite-wal" \
+      || rm -f "$dest/headscale/db.sqlite-wal"
+    _copy_volume_file_out "$vol" db.sqlite-shm "$dest/headscale/db.sqlite-shm" \
+      || rm -f "$dest/headscale/db.sqlite-shm"
+    hp="$(_project_volume_name headplane-data 2>/dev/null || true)"
+    if [[ -n "$hp" ]]; then
+      _archive_volume_to_dir "$hp" "$dest/headplane" || return 1
+    fi
+    sid="$(_project_volume_name vpn-sidecar-state 2>/dev/null || true)"
+    if [[ -n "$sid" ]]; then
+      set +e
+      docker run --rm --network none -v "${sid}:/data:ro" "$ALPINE_VOLUME_IMAGE" \
+        sh -c 'cd /data && find . -type f ! -name "*.sock" > /tmp/list && if grep -q "tailscaled.state" /tmp/list; then tar -cf - -T /tmp/list; exit 0; fi; exit 42' \
+        > "$dest/sidecar-state.tar"
+      rc=$?
+      set -e
+      if [[ "$rc" -eq 42 ]]; then
+        rm -f "$dest/sidecar-state.tar"
+      elif [[ "$rc" -ne 0 ]]; then
+        rm -f "$dest/sidecar-state.tar"
+        return 1
+      fi
+    fi
     return 0
   fi
   printf '1\n' > "$dest/HAD"
@@ -1289,6 +1714,7 @@ _start_restored_stack() {
     compose up -d --force-recreate --wait --wait-timeout 180 headscale enroll headplane
   fi
   verify_published_bindings "$mode"
+  _restored_enroll_check
 }
 
 restore_deployment() {
@@ -1342,6 +1768,7 @@ restore_deployment() {
   _install_bundle_host "$bundle" "$info"
   _install_bundle_volumes "$bundle" "$(read_admin_mode)"
   _start_restored_stack "$(read_admin_mode)" "$bundle"
+  mark_deploy_dir
   _restore_ok=1
   trap - EXIT
   _restore_cleanup_temp
