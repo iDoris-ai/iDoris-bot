@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -103,17 +104,15 @@ func Apply(plan Plan, host Host, opt ApplyOptions) (ApplyResult, error) {
 	if err != nil {
 		return ApplyResult{}, err
 	}
+	// A token path named by a different config in this directory is read-only.
+	// The new credential goes to this config's own sidecar. This runs before
+	// any mkdir or write, including when the selected config does not exist yet.
+	dest, err := chooseTokenFile(plan, existing, haveConfig)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	plan.TokenFile = dest
 	if haveConfig {
-		// A config that still points at another file (the historical shared
-		// enroll.token, or a previous sidecar) keeps that file's bytes. The new
-		// token is written to this config's own sidecar and the config is updated
-		// to point there.
-		if pointer, ok := jsonStringField(existing, "enroll_token_file"); ok && strings.TrimSpace(pointer) != "" {
-			own := PathsFor("", plan.ConfigPath).Token
-			if filepath.Clean(pointer) != filepath.Clean(own) {
-				plan.TokenFile = own
-			}
-		}
 		oldURL, hasURL := jsonStringField(existing, "enroll_url")
 		if hasURL && oldURL != "" && oldURL != plan.EnrollURL && !opt.ReplaceExisting {
 			return ApplyResult{}, fmt.Errorf("gateway: %s is already enrolled with %s; pass --replace to switch it to %s", plan.ConfigPath, oldURL, plan.EnrollURL)
@@ -517,6 +516,109 @@ func jsonString(vals map[string]json.RawMessage, key string) (string, bool) {
 		return "", false
 	}
 	return s, true
+}
+
+// chooseTokenFile picks the file that receives the new credential.
+// own is this config's sidecar. A pointer in the selected config that names
+// a different file, or a destination named by a different config's
+// enroll_token_file, moves the write to own. own itself is refused when any
+// other existing config already references it. Sibling plans use token_file
+// and do not count. A missing directory means there are no siblings.
+func chooseTokenFile(plan Plan, existing []byte, haveConfig bool) (string, error) {
+	selected := filepath.Clean(plan.ConfigPath)
+	own := filepath.Clean(PathsFor("", selected).Token)
+	dest := resolveTokenRef(selected, plan.TokenFile)
+	if haveConfig {
+		if pointer, ok := jsonStringField(existing, "enroll_token_file"); ok && strings.TrimSpace(pointer) != "" {
+			if resolveTokenRef(selected, pointer) != own {
+				dest = own
+			}
+		}
+	}
+	refs, err := tokenRefsIn(filepath.Dir(selected))
+	if err != nil {
+		return "", err
+	}
+	if len(otherThan(refs[dest], selected)) > 0 {
+		dest = own
+	}
+	if others := otherThan(refs[dest], selected); len(others) > 0 {
+		names := append([]string(nil), refs[dest]...)
+		sort.Strings(names)
+		return "", fmt.Errorf("gateway: refusing to write %s: referenced by %s", dest, strings.Join(names, ", "))
+	}
+	return dest, nil
+}
+
+func otherThan(paths []string, selected string) []string {
+	var out []string
+	for _, p := range paths {
+		if filepath.Clean(p) != selected {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func resolveTokenRef(configPath, ref string) string {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return ""
+	}
+	if filepath.IsAbs(ref) {
+		return filepath.Clean(ref)
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(configPath), ref))
+}
+
+// tokenRefsIn maps a cleaned token path to the configs that name it in
+// enroll_token_file. Relative names are resolved against the config's directory.
+func tokenRefsIn(dir string) (map[string][]string, error) {
+	entries, err := os.ReadDir(dir) //nolint:gosec // G304: dir is the selected config's own directory
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("gateway: read %s: %w", dir, err)
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+	refs := map[string][]string{}
+	for _, name := range names {
+		path := filepath.Join(dir, name)
+		b, err := os.ReadFile(path) //nolint:gosec // G304: sibling *.json next to the selected config
+		if err != nil {
+			return nil, fmt.Errorf("gateway: read %s: %w", path, err)
+		}
+		if len(bytes.TrimSpace(b)) == 0 {
+			continue
+		}
+		pointer, ok, err := enrollTokenPointer(b)
+		if err != nil {
+			return nil, fmt.Errorf("gateway: %s: %w", path, err)
+		}
+		if !ok || strings.TrimSpace(pointer) == "" {
+			continue
+		}
+		resolved := resolveTokenRef(path, pointer)
+		refs[resolved] = append(refs[resolved], path)
+	}
+	return refs, nil
+}
+
+func enrollTokenPointer(data []byte) (string, bool, error) {
+	_, vals, err := parseObject(data)
+	if err != nil {
+		return "", false, err
+	}
+	s, ok := jsonString(vals, "enroll_token_file")
+	return s, ok, nil
 }
 
 func readExistingConfig(host Host, path string) ([]byte, bool, error) {
