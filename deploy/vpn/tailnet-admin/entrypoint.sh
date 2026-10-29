@@ -5,10 +5,17 @@
 #
 # VPN_SERVER_ENROLL_TOKEN is the enrollment token for the "vpn-server" entry
 # (bootstrap.sh init --tailnet-admin). The pre-auth key minted here is not
-# printed. A persisted TS_STATE_DIR skips enrollment on later starts.
+# printed. A non-empty tailscaled.state means this node already joined, so
+# later starts must not mint another key.
 set -eu
 
 if [ -n "${TS_AUTHKEY:-}" ]; then
+  exec /usr/local/bin/containerboot
+fi
+
+state="${TS_STATE_DIR:-/var/lib/tailscale}/tailscaled.state"
+if [ -s "$state" ]; then
+  echo "tailnet-admin: persisted tailscale state present; not minting a key" >&2
   exec /usr/local/bin/containerboot
 fi
 
@@ -32,9 +39,12 @@ if [ -z "$key" ] || [ -z "$control" ]; then
 fi
 
 # Optional override when the public server_url is not reachable from this
-# container (hairpin NAT). The default is the control_url enroll returns,
-# which is headscale's server_url.
-login="${VPN_SERVER_LOGIN_SERVER:-$control}"
+# container (hairpin NAT). Compose passes VPN_SERVER_LOGIN_SERVER through;
+# an empty value means "use the control_url enroll returned".
+login="${VPN_SERVER_LOGIN_SERVER:-}"
+if [ -z "$login" ]; then
+  login="$control"
+fi
 
 export TS_AUTHKEY="$key"
 export TS_HOSTNAME="${TS_HOSTNAME:-vpn-server}"
