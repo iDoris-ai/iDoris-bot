@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/fsutil"
 )
 
 // icaclsProtectCommands is the exact argv of the icacls sequence that removes
@@ -40,90 +42,12 @@ func renderICACLSCommands(cmds [][]string) string {
 	return b.String()
 }
 
-// knownACEPrincipals are matched as a suffix of the text before ":(", longest
-// first, so a path on the same line is not the principal.
-var knownACEPrincipals = []string{
-	`NT AUTHORITY\Authenticated Users`,
-	`NT AUTHORITY\SYSTEM`,
-	`BUILTIN\Administrators`,
-	`BUILTIN\Users`,
-	`*S-1-5-32-544`,
-	`*S-1-5-32-545`,
-	`*S-1-5-18`,
-	`*S-1-5-11`,
-	`*S-1-1-0`,
-	`S-1-5-32-544`,
-	`S-1-5-32-545`,
-	`S-1-5-18`,
-	`S-1-5-11`,
-	`S-1-1-0`,
-	`Administrators`,
-	`Everyone`,
-	`SYSTEM`,
-	`Users`,
-}
-
-func principalOfACE(left string) string {
-	left = strings.TrimSpace(left)
-	upper := strings.ToUpper(left)
-	best := ""
-	bestLen := 0
-	for _, c := range knownACEPrincipals {
-		cu := strings.ToUpper(c)
-		if strings.HasSuffix(upper, cu) && len(cu) > bestLen {
-			best = c
-			bestLen = len(cu)
-		}
-	}
-	if best != "" {
-		return best
-	}
-	fields := strings.Fields(left)
-	if len(fields) == 0 {
-		return left
-	}
-	return fields[len(fields)-1]
-}
-
-func aceClass(principal string) string {
-	switch strings.ToUpper(principal) {
-	case `NT AUTHORITY\SYSTEM`, `SYSTEM`, `*S-1-5-18`, `S-1-5-18`:
-		return "system"
-	case `BUILTIN\ADMINISTRATORS`, `ADMINISTRATORS`, `*S-1-5-32-544`, `S-1-5-32-544`:
-		return "administrators"
-	default:
-		return ""
-	}
-}
-
-// parseICACLSProtected accepts icacls query output only when every ACE is
-// SYSTEM or Administrators and both are present. Other lines (the success
-// summary, blank lines) are ignored.
-func parseICACLSProtected(out string) error {
-	sawSystem := false
-	sawAdmin := false
-	aces := 0
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimRight(line, "\r")
-		i := strings.Index(line, ":(")
-		if i < 0 {
-			continue
-		}
-		aces++
-		class := aceClass(principalOfACE(line[:i]))
-		switch class {
-		case "system":
-			sawSystem = true
-		case "administrators":
-			sawAdmin = true
-		default:
-			return fmt.Errorf("unexpected ACE %q", strings.TrimSpace(line))
-		}
-	}
-	if aces == 0 || !sawSystem || !sawAdmin {
-		return errors.New("ACL does not grant only SYSTEM and Administrators")
-	}
-	return nil
+// verifyServiceDACL accepts the DACL icaclsProtectCommands writes: explicit
+// allow ACEs for SYSTEM and Administrators, and no other SID. The comparison
+// is on SIDs from the security descriptor, so a localised account name cannot
+// change the result. SYSTEM as owner is accepted.
+func verifyServiceDACL(view fsutil.ACLView) error {
+	return fsutil.VerifyOwnerDACL(view, []string{fsutil.SIDLocalSystem, fsutil.SIDAdministrators})
 }
 
 // stageWindowsConfig copies credential files named by the config into destDir
