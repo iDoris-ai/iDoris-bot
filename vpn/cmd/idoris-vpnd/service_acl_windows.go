@@ -30,13 +30,20 @@ func protectWindowsPath(path string, directory bool) error {
 }
 
 func protectWindowsInstall(dir, config, exeDir, exe string, creds []string) error {
-	if err := protectWindowsPath(dir, true); err != nil {
-		return err
+	if dir != "" {
+		if err := protectWindowsPath(dir, true); err != nil {
+			return err
+		}
 	}
-	if err := protectWindowsPath(config, false); err != nil {
-		return err
+	if config != "" {
+		if err := protectWindowsPath(config, false); err != nil {
+			return err
+		}
 	}
 	for _, f := range creds {
+		if strings.TrimSpace(f) == "" {
+			continue
+		}
 		if err := protectWindowsPath(f, false); err != nil {
 			return err
 		}

@@ -141,7 +141,8 @@ func TestR3svcSystemdMachineService(t *testing.T) {
 	}
 
 	// Same config and the same STATE_DIRECTORY systemd injected. A different
-	// listen address so the refusal is the controller lock, not the status socket.
+	// listen address so the refusal is the state-file lock, not the status socket.
+	// OpenState holds that lock before the backend controller lock.
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	second := exec.CommandContext(ctx, "docker", "exec",
@@ -154,19 +155,75 @@ func TestR3svcSystemdMachineService(t *testing.T) {
 	)
 	out, err := second.CombinedOutput()
 	text := string(out)
-	if err == nil || !strings.Contains(text, "another idoris-vpnd") || !strings.Contains(text, "system backend") {
+	if err == nil || !strings.Contains(text, "another idoris-vpnd") || !strings.Contains(text, "state file backend") {
 		t.Fatalf("second instance: %v\n%s", err, text)
 	}
 	if got := r3svcActive(t, name); got != "active" {
 		t.Fatalf("service left %s after the second instance", got)
 	}
+
+	// Reinstall an active unit with a state_file outside /var/lib/idoris.
+	// The parent is created and listed in ReadWritePaths. /srv itself is left
+	// alone. The new process has a different MainPID. This runs after the
+	// controller-lock check so that check still sees the default state file.
+	pid := r3svcShow(t, name, "MainPID")
+	if pid == "" || pid == "0" {
+		t.Fatalf("MainPID %q before reinstall", pid)
+	}
+	srvBefore := strings.TrimSpace(r3svcMust(t, name, "stat", "-c", "%a", "/srv"))
+	reCfg := []byte(`{"control_url":"https://vpn.example.org/r4c","auth_key":"hskey-lab","mode":"system","state_file":"/srv/idoris/vpnd-state.json"}` + "\n")
+	rePath := filepath.Join(cfgDir, "vpn-r4c.json")
+	if err := os.WriteFile(rePath, reCfg, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("docker", "cp", rePath, name+":/tmp/vpn-r4c.json").CombinedOutput(); err != nil {
+		t.Fatalf("docker cp reinstall config: %v\n%s", err, out)
+	}
+	r3svcMust(t, name, "chown", "0:0", "/tmp/vpn-r4c.json")
+	r3svcMust(t, name, "chmod", "600", "/tmp/vpn-r4c.json")
+	r3svcMust(t, name, "/tmp/idoris-vpnd", "service", "install", "--system", "--config", "/tmp/vpn-r4c.json")
+	r3svcWaitActive(t, name)
+	newPID := r3svcShow(t, name, "MainPID")
+	if newPID == "" || newPID == "0" || newPID == pid {
+		t.Fatalf("reinstall MainPID %s, was %s\n%s", newPID, pid, r3svcJournal(name))
+	}
+	unit := r3svcMust(t, name, "cat", "/etc/systemd/system/idoris-vpnd.service")
+	if !strings.Contains(unit, "ReadWritePaths=/srv/idoris") || strings.Contains(unit, "RuntimeDirectory=user") {
+		t.Fatalf("unit after reinstall\n%s", unit)
+	}
+	if got := strings.TrimSpace(r3svcMust(t, name, "stat", "-c", "%a", "/srv")); got != srvBefore {
+		t.Fatalf("/srv mode %s, was %s", got, srvBefore)
+	}
+	if got := strings.TrimSpace(r3svcMust(t, name, "stat", "-c", "%a", "/srv/idoris")); got != "750" {
+		t.Fatalf("/srv/idoris mode %s", got)
+	}
+	var reState string
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		out, err := r3svcOutput(name, "cat", "/srv/idoris/vpnd-state.json")
+		if err == nil && strings.Contains(out, "https://vpn.example.org/r4c") && !strings.Contains(out, "hskey") {
+			reState = out
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("reinstall state: %v\n%s\n%s", err, strings.ReplaceAll(out, "hskey-lab", "[redacted]"), r3svcJournal(name))
+		}
+		time.Sleep(time.Second)
+	}
+	if !strings.Contains(reState, "https://vpn.example.org/r4c") {
+		t.Fatalf("reinstall state %s", reState)
+	}
 }
 
-const r3svcDockerfile = `FROM debian:bookworm
-RUN apt-get update && apt-get install -y --no-install-recommends systemd systemd-sysv procps iproute2 ca-certificates
-STOPSIGNAL SIGRTMIN+3
-CMD ["/sbin/init"]
-`
+// r3svcAptPackages pins the packages observed in r4cDebianBookworm on
+// 2026-10-28. apt-get update still contacts the mirror; a missing version
+// fails the image build.
+const r3svcAptPackages = "systemd=252.39-1~deb12u2 systemd-sysv=252.39-1~deb12u2 procps=2:4.0.2-3 iproute2=6.1.0-3 ca-certificates=20250419~deb12u2"
+
+const r3svcDockerfile = "FROM " + r4cDebianBookworm + "\n" +
+	"RUN apt-get update && apt-get install -y --no-install-recommends " + r3svcAptPackages + " && rm -rf /var/lib/apt/lists/*\n" +
+	"STOPSIGNAL SIGRTMIN+3\n" +
+	"CMD [\"/sbin/init\"]\n"
 
 func r3svcSuffix(t *testing.T) string {
 	t.Helper()
