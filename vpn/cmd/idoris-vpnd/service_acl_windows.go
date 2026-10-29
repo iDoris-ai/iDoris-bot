@@ -7,11 +7,15 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+
+	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/fsutil"
 )
 
 // protectWindowsPath runs icacls and refuses to continue unless the resulting
-// DACL lists only SYSTEM and Administrators. icacls is not available on the
-// macOS tree where the unit tests run; those tests lock the argv and the parser.
+// DACL is exactly SYSTEM and Administrators. The read-back uses
+// GetNamedSecurityInfo, not icacls display names. icacls is not available on
+// the macOS tree where the unit tests run; those tests lock the argv and the
+// SID verifier.
 func protectWindowsPath(path string, directory bool) error {
 	for _, args := range icaclsProtectCommands(path, directory) {
 		out, err := exec.Command(args[0], args[1:]...).CombinedOutput() //nolint:gosec // G204: argv is the fixed icacls sequence, path is the install path
@@ -19,12 +23,12 @@ func protectWindowsPath(path string, directory bool) error {
 			return fmt.Errorf("%s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 		}
 	}
-	out, err := exec.Command("icacls", path).CombinedOutput() //nolint:gosec // G204: read-back of the ACL just written
+	view, err := fsutil.ReadACL(path)
 	if err != nil {
-		return fmt.Errorf("icacls %s: %w: %s", path, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("read DACL %s: %w", path, err)
 	}
-	if err := parseICACLSProtected(string(out)); err != nil {
-		return fmt.Errorf("icacls %s: %w\n%s", path, err, strings.TrimSpace(string(out)))
+	if err := verifyServiceDACL(view); err != nil {
+		return fmt.Errorf("DACL %s: %w", path, err)
 	}
 	return nil
 }
