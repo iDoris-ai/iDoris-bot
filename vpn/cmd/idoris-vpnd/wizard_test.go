@@ -120,7 +120,7 @@ func TestJoinGatewayYesRequiresDevice(t *testing.T) {
 func TestJoinGatewayPrompts(t *testing.T) {
 	host := newFakeOS(true, "linux")
 	code := codeFor(t, join.RoleGateway, "https://enroll.example.org", false)
-	d := testDeps(host, "n\n10.251.73.10\ny\n")
+	d := testDeps(host, "y\nn\n10.251.73.10\ny\n")
 	if err := joinCmd([]string{code}, d); err != nil {
 		t.Fatal(err)
 	}
@@ -135,12 +135,14 @@ func TestJoinGatewayPrompts(t *testing.T) {
 func TestJoinGatewayYesToLocalAI(t *testing.T) {
 	host := newFakeOS(false, "darwin")
 	code := codeFor(t, join.RoleGateway, "https://enroll.example.org", false)
+	// Confirm the authority, then claim this gateway code belongs on the Local AI.
 	d := testDeps(host, "y\ny\n")
-	if err := joinCmd([]string{code}, d); err != nil {
-		t.Fatal(err)
+	err := joinCmd([]string{code}, d)
+	if err == nil || !strings.Contains(err.Error(), "local-ai") {
+		t.Fatalf("%v", err)
 	}
-	if !strings.Contains(d.out(), "role: local-ai") || strings.Contains(d.out(), "10.251.73.10/32") {
-		t.Fatalf("stdout:\n%s", d.out())
+	if len(host.files) != 0 {
+		t.Fatalf("mismatch wrote %v", host.files)
 	}
 }
 
