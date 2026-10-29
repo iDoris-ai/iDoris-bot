@@ -647,31 +647,89 @@ EOF
     fi
     docker cp "$dest/headscale/db.sqlite" "$hsid:/var/lib/headscale/db.sqlite"
     docker cp "$dest/headscale/noise_private.key" "$hsid:/var/lib/headscale/noise_private.key"
-    docker cp "$dest/headscale/derp_server_private.key" "$hsid:/var/lib/headscale/derp_server_private.key"
+    if [[ -f "$dest/headscale/derp_server_private.key" && ! -L "$dest/headscale/derp_server_private.key" ]]; then
+      [[ -s "$dest/headscale/derp_server_private.key" ]] || die "backup DERP key is empty"
+      docker cp "$dest/headscale/derp_server_private.key" "$hsid:/var/lib/headscale/derp_server_private.key"
+    else
+      echo "restore: backup has no DERP key (embedded DERP was off); leaving it unset" >&2
+    fi
     if [[ -f "$dest/headscale/db.sqlite-wal" ]]; then
       docker cp "$dest/headscale/db.sqlite-wal" "$hsid:/var/lib/headscale/db.sqlite-wal"
     fi
     if [[ -f "$dest/headscale/db.sqlite-shm" ]]; then
       docker cp "$dest/headscale/db.sqlite-shm" "$hsid:/var/lib/headscale/db.sqlite-shm"
     fi
+    chown_volume_to_image "$hsid" /var/lib/headscale
     if [[ -d "$dest/headplane" ]]; then
       docker cp "$dest/headplane/." "$hpid:/var/lib/headplane/"
+      chown_volume_to_image "$hpid" /var/lib/headplane
     fi
-    docker compose start headscale headplane enroll >/dev/null
-    echo "restored from $dest and started the stack"
+    if ! snapshot_has "$snap" headscale; then
+      printf 'headscale\n' >> "$snap"
+    fi
+    if ! snapshot_has "$snap" enroll; then
+      printf 'enroll\n' >> "$snap"
+    fi
+    if [[ "$mode" == "tailnet-admin" ]]; then
+      snapshot_has "$snap" headplane-tailnet || printf 'headplane-tailnet\n' >> "$snap"
+      snapshot_has "$snap" vpn-sidecar || printf 'vpn-sidecar\n' >> "$snap"
+    elif ! snapshot_has "$snap" headplane; then
+      printf 'headplane\n' >> "$snap"
+    fi
+    restore_running_services "$snap" "$mode"
+    rm -f "$snap"
+    echo "restored from $dest (admin mode $mode; the other Headplane stays stopped)"
     ;;
   up)
-    if [[ "${1:-}" == "--tailnet-admin" ]]; then
-      [[ -n "${VPN_SERVER_ENROLL_TOKEN:-}" ]] || die "export VPN_SERVER_ENROLL_TOKEN (the vpn-server enrollment token) first"
-      # One writer of the Headplane sqlite. The published UI and the tailnet UI do not run together.
-      docker compose stop headplane >/dev/null 2>&1 || true
-      docker compose --profile tailnet-admin up -d --wait --wait-timeout 180 vpn-sidecar headplane-tailnet headscale enroll
-      echo "tailnet-admin profile is up. Headplane listens on the vpn-server tailnet address port 3000."
-      echo "The published Headplane container is stopped. 'ctl.sh up' (without the flag) brings it back and stops the profile."
-    else
-      docker compose --profile tailnet-admin stop vpn-sidecar headplane-tailnet >/dev/null 2>&1 || true
-      docker compose up -d --wait --wait-timeout 180
+    mode="$(read_admin_mode)"
+    instance=""
+    access=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --tailnet-admin)
+          mode="tailnet-admin"
+          shift
+          ;;
+        --published)
+          mode="published"
+          shift
+          ;;
+        --instance)
+          [[ $# -ge 2 ]] || die "--instance needs a value"
+          instance="$2"
+          shift 2
+          ;;
+        --headplane-access)
+          [[ $# -ge 2 ]] || die "--headplane-access needs a value"
+          access="$2"
+          shift 2
+          ;;
+        *)
+          die "unknown argument: $1"
+          ;;
+      esac
+    done
+    if [[ -n "$instance" ]]; then
+      assign_instance "$instance"
     fi
+    if [[ "$mode" == "tailnet-admin" && -n "$access" && "$access" != "tailnet" ]]; then
+      die "--tailnet-admin cannot be combined with --headplane-access $access"
+    fi
+    if [[ "$mode" == "tailnet-admin" ]]; then
+      access="${access:-tailnet}"
+    elif [[ -z "$access" && -f "$here/.env" ]]; then
+      access="$(sed -n 's/^HEADPLANE_ACCESS=//p' "$here/.env" | head -n1 | tr -d '[:space:]')"
+      if [[ "$access" == "tailnet" ]]; then
+        access="tunnel"
+      fi
+    fi
+    apply_headplane_access "${access:-tunnel}"
+    mode="$(read_admin_mode)"
+    if [[ "$mode" == "tailnet-admin" && -z "${VPN_SERVER_ENROLL_TOKEN:-}" ]]; then
+      die "export VPN_SERVER_ENROLL_TOKEN (the vpn-server enrollment token) first"
+    fi
+    write_admin_mode "$mode"
+    start_stack_for_mode "$mode"
     ;;
   down)
     docker compose --profile tailnet-admin down
@@ -685,16 +743,21 @@ downgrade across minors):
      one you are entering. Do not jump more than one minor.
   2. bash deploy/vpn/ctl.sh backup
   3. Change the image tags in deploy/vpn/compose.yaml (headscale, headplane).
-     Leave idoris-vpn-enroll on this repo's Dockerfile.
+     Leave idoris-vpn-enroll on this repo's Dockerfile. Keep the digest pin.
   4. docker compose pull
-  5. docker compose up -d
+  5. bash deploy/vpn/ctl.sh up
+     This restarts the saved admin mode (.admin-mode). It does not start the
+     published Headplane when the mode is tailnet-admin, and it does not
+     start the tailnet profile when the mode is published.
   6. bash deploy/vpn/ctl.sh health
   7. bash deploy/vpn/ctl.sh policy check
   8. From a member: idoris-vpnd status, then reach the Local AI host.
 
-This command does not pull or recreate anything. Roll back by restoring the
-backup onto the previous image tags; do not restore an older sqlite into a
-newer minor that has already migrated it.
+Do not run plain 'docker compose up -d' on a tailnet-admin host: that starts
+the published Headplane beside the tailnet one. This command does not pull
+or recreate anything. Roll back by restoring the backup onto the previous
+image tags; do not restore an older sqlite into a newer minor that has
+already migrated it.
 EOF
     ;;
   break-glass)
@@ -717,6 +780,155 @@ not Tailscale SSH (that path needs Headscale).
     backup with ctl.sh restore. The noise and DERP private keys must come
     back with the sqlite file or every node must re-enroll.
 EOF
+    ;;
+  token)
+    sub="${1:-}"
+    shift || true
+    case "$sub" in
+      new)
+        entry="" label="" url="" hint=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --entry) entry="${2:-}"; shift 2 ;;
+            --label) label="${2:-}"; shift 2 ;;
+            --enroll-url) url="${2:-}"; shift 2 ;;
+            --hostname-hint) hint="${2:-}"; shift 2 ;;
+            *) die "unknown argument: $1" ;;
+          esac
+        done
+        [[ -n "$entry" && -n "$label" ]] || die "usage: ctl.sh token new --entry NAME --label LABEL [--enroll-url URL]"
+        require_label "$label"
+        [[ -f "$here/enroll/config.json" && ! -L "$here/enroll/config.json" ]] || die "enroll/config.json is missing"
+        if [[ -z "$url" && -f "$here/.env" ]]; then
+          url="$(sed -n 's/^ENROLL_PUBLIC_URL=//p' "$here/.env" | head -n1 | tr -d "\"'" | tr -d '[:space:]')"
+        fi
+        [[ -n "$url" ]] || die "pass --enroll-url or set ENROLL_PUBLIC_URL in .env"
+        [[ "$url" == http://* || "$url" == https://* ]] || die "enroll URL must start with http:// or https://"
+        args=(invite --config /work/config.json --entry "$entry" --enroll-url "$url")
+        if [[ "$url" == http://* ]]; then
+          args+=(--allow-insecure)
+        fi
+        if [[ -n "$hint" ]]; then
+          args+=(--hostname-hint "$hint")
+        fi
+        if [[ -f "$(label_file)" ]]; then
+          python3 -c '
+import json, sys
+doc = json.load(open(sys.argv[1]))
+bucket = doc.get("entries", {}).get(sys.argv[2], {})
+if sys.argv[3] in bucket.values():
+    sys.exit("label %s is already used on %s" % (sys.argv[3], sys.argv[2]))
+' "$(label_file)" "$entry" "$label"
+        fi
+        raw="$(enroll_cli "${args[@]}")" || die "invite failed"
+        # Keep the raw stdout before decoding. It is the only copy of the token.
+        printf '# minted %s\n%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$raw" >> "$here/enroll/minted-tokens.txt"
+        chmod 600 "$here/enroll/minted-tokens.txt"
+        code="$(printf '%s\n' "$raw" | tr -d '\r' | grep -oE 'idoris-join-v1\.[A-Za-z0-9_-]+\.[0-9a-fA-F]+' | head -n1 || true)"
+        [[ -n "$code" ]] || die "invite output had no join code; the raw output is in enroll/minted-tokens.txt"
+        token="$(python3 -c '
+import base64, json, sys
+code = sys.argv[1].strip()
+parts = code.split(".")
+if len(parts) != 3 or parts[0] != "idoris-join-v1":
+    sys.exit("invite did not print a join code")
+raw = base64.urlsafe_b64decode(parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4))
+sys.stdout.write(json.loads(raw)["token"])
+' "$code")"
+        digest="$(python3 -c 'import hashlib,sys; sys.stdout.write(hashlib.sha256(sys.argv[1].encode()).hexdigest())' "$token")"
+        python3 -c '
+import json, sys
+cfg, entry, digest = sys.argv[1:]
+tenants = json.load(open(cfg)).get("tenants", [])
+for t in tenants:
+    if t.get("name") == entry and digest in t.get("token_hashes", []):
+        raise SystemExit(0)
+raise SystemExit("invited hash is not in enroll/config.json")
+' "$here/enroll/config.json" "$entry" "$digest"
+        record_token_label "$entry" "$digest" "$label"
+        reload_enroll
+        echo "entry:  $entry"
+        echo "label:  $label"
+        echo "hash:   $digest"
+        echo "token:  $token"
+        echo "join:   $code"
+        echo "Labels are in enroll/token-labels.json. The enroll CLI has no --label flag."
+        ;;
+      revoke)
+        entry="" label="" prefix=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --entry) entry="${2:-}"; shift 2 ;;
+            --label) label="${2:-}"; shift 2 ;;
+            --hash-prefix) prefix="${2:-}"; shift 2 ;;
+            *) die "unknown argument: $1" ;;
+          esac
+        done
+        [[ -n "$entry" ]] || die "usage: ctl.sh token revoke --entry NAME (--label LABEL | --hash-prefix HEX)"
+        if [[ -n "$label" ]]; then
+          require_label "$label"
+          prefix="$(hash_for_label "$entry" "$label")"
+        fi
+        require_hash_prefix "$prefix"
+        echo "revoking $entry ${prefix:0:8}..."
+        if ! revoked="$(enroll_cli revoke --config /work/config.json --entry "$entry" --hash-prefix "$prefix" 2>&1)"; then
+          printf '%s\n' "$revoked" >&2
+          if [[ "$revoked" == *"last token hash"* ]]; then
+            die "refusing to remove the last token for $entry; run ctl.sh token new first, then revoke this one"
+          fi
+          die "revoke failed; the node was not changed"
+        fi
+        printf '%s\n' "$revoked"
+        removed="$(printf '%s\n' "$revoked" | awk '{print $3}' | head -n1)"
+        if [[ "$removed" =~ ^[0-9a-fA-F]{64}$ ]]; then
+          forget_token_hash "$entry" "$removed"
+        fi
+        reload_enroll
+        ;;
+      *)
+        die "usage: ctl.sh token new|revoke"
+        ;;
+    esac
+    ;;
+  offboard)
+    entry="" prefix="" node=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --entry) entry="${2:-}"; shift 2 ;;
+        --hash-prefix) prefix="${2:-}"; shift 2 ;;
+        --node-id) node="${2:-}"; shift 2 ;;
+        *) die "unknown argument: $1" ;;
+      esac
+    done
+    [[ -n "$entry" && -n "$prefix" ]] || die "usage: ctl.sh offboard --entry NAME --hash-prefix HEX [--node-id N]"
+    require_hash_prefix "$prefix"
+    if [[ -n "$node" ]]; then
+      node="$(require_id "$node")"
+    fi
+    echo "step 1: revoke $entry hash prefix ${prefix:0:8} (stop here if this fails)"
+    if ! revoked="$(enroll_cli revoke --config /work/config.json --entry "$entry" --hash-prefix "$prefix" 2>&1)"; then
+      printf '%s\n' "$revoked" >&2
+      if [[ "$revoked" == *"last token hash"* ]]; then
+        die "refusing to remove the last token for $entry; the node was not expired or deleted"
+      fi
+      die "revoke failed; the node was not expired or deleted"
+    fi
+    printf '%s\n' "$revoked"
+    removed="$(printf '%s\n' "$revoked" | awk '{print $3}' | head -n1)"
+    if [[ "$removed" =~ ^[0-9a-fA-F]{64}$ ]]; then
+      forget_token_hash "$entry" "$removed"
+    fi
+    echo "step 2: reload enroll"
+    reload_enroll
+    if [[ -n "$node" ]]; then
+      echo "step 3: expire node $node"
+      hs nodes expire --identifier "$node"
+      echo "step 4: delete node $node"
+      hs --force nodes delete --identifier "$node"
+    else
+      echo "step 3: no --node-id, so no node was expired or deleted"
+    fi
+    echo "offboarded entry $entry"
     ;;
   *)
     usage >&2
