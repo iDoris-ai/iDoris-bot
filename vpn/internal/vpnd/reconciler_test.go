@@ -569,6 +569,7 @@ func TestIdentityMismatchReenrollsOnSameControlURL(t *testing.T) {
 	}
 	be.state = ipn.Running
 	be.prefs.ControlURL = ours
+	be.self = &ipnstate.PeerStatus{ID: "node-member"}
 	snap, err = r.Step(context.Background())
 	if err != nil || snap.Phase != PhaseConnected || keys.n != 1 {
 		t.Fatalf("after re-enroll: %+v keys=%d err=%v", snap, keys.n, err)
@@ -607,7 +608,7 @@ func TestSameControlDifferentTenantReenrolls(t *testing.T) {
 	tags := views.SliceOf([]string{"tag:other-local-ai"})
 	be.state = ipn.Running
 	be.prefs.ControlURL = ours
-	be.self = &ipnstate.PeerStatus{Tags: &tags}
+	be.self = &ipnstate.PeerStatus{ID: "node-other", Tags: &tags}
 	snap, err := r.Step(context.Background())
 	if err != nil || snap.Phase != PhaseConnected || st.Get().Tenant != "other" {
 		t.Fatalf("snap %+v binding %+v err=%v", snap, st.Get(), err)
@@ -679,7 +680,7 @@ func TestEnrollDownResumesSavedIdentityWithoutMinting(t *testing.T) {
 		o.State = st
 		o.Role = "member"
 		o.EnrollUnreachable = true
-		o.Identity = Identity{Known: false}
+		o.Identity = Identity{TokenFingerprint: "fp", Known: false}
 	})
 	snap, err := r.Step(context.Background())
 	if err != nil || snap.Phase != PhaseConnected || keys.n != 0 || snap.EnrollReachable {
