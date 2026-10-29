@@ -28,7 +28,7 @@ docker compose version >/dev/null 2>&1 || die "docker compose v2 is required"
 command -v python3 >/dev/null || die "python3 is required"
 command -v rsync >/dev/null || die "rsync is required"
 
-PROJ="idoris-vpn-ctl-$(python3 -c 'import random; print(random.randint(100000, 999999))')"
+PROJ="idoris-vpn-r2d-$(python3 -c 'import random; print(random.randint(100000, 999999))')"
 export COMPOSE_PROJECT_NAME="$PROJ"
 ENROLL_UID="$(id -u)"
 ENROLL_GID="$(id -g)"
@@ -67,6 +67,24 @@ copy_tree() {
 
 redact() { sed -E 's/hskey-[A-Za-z0-9_.:+/=-]+/[redacted]/g; s/idv1_[0-9a-f]+/[redacted]/g'; }
 
+assert_bind() {
+  local ip="$1" got id spec
+  got="$(docker compose port headplane 3000 | tr -d '\r' | head -n 1)"
+  [[ "$got" == "${ip}:${HEADPLANE_PORT}" ]] || die "compose port is ${got}, want ${ip}:${HEADPLANE_PORT}"
+  id="$(docker compose ps -q headplane)"
+  [[ -n "$id" ]] || die "headplane container is missing"
+  spec="$(docker inspect -f '{{json (index .HostConfig.PortBindings "3000/tcp")}}' "$id")"
+  python3 -c 'import json,sys
+ip, port, raw = sys.argv[1:]
+entries = json.loads(raw) or []
+if not entries:
+    raise SystemExit("headplane has no 3000/tcp binding")
+host, host_port = entries[0].get("HostIp"), entries[0].get("HostPort")
+if host != ip or host_port != port:
+    raise SystemExit("inspect binding %s:%s, want %s:%s" % (host, host_port, ip, port))
+' "$ip" "$HEADPLANE_PORT" "$spec"
+}
+
 cleanup() {
   local ec=$?
   if [[ "$ec" -ne 0 ]]; then
@@ -87,10 +105,144 @@ cleanup() {
   if [[ -d "$dst" ]]; then
     docker compose --project-directory "$dst" --project-name "$PROJ" --profile tailnet-admin down -v >/dev/null 2>&1 || true
   fi
+  # Leave the copy before deleting it. A deleted working directory makes the
+  # fingerprint check fail to start.
+  cd "$repo"
   rm -rf "$src" "$dst" "$bundle_root"
+  if [[ -n "${fp:-}" && -f "$fp" ]]; then
+    if ! python3 - "$origin" "$fp" <<'PY'
+import hashlib, os, sys
+origin, fp = sys.argv[1:]
+want = {}
+for line in open(fp):
+    parts = line.rstrip("\n").split(" ", 2)
+    if len(parts) >= 2:
+        want[parts[1]] = line.rstrip("\n")
+rels = [
+    ".admin-mode", ".env", "compose.yaml",
+    "enroll/config.json", "enroll/headscale.apikey", "enroll/minted-tokens.txt",
+    "headplane/cookie_secret", "headplane/config.yaml",
+    "headscale/managed.json", "headscale/config.yaml", "headscale/policy.hujson",
+]
+for rel in rels:
+    path = os.path.join(origin, rel)
+    if os.path.islink(path):
+        got = "link %s" % rel
+    elif os.path.isfile(path):
+        digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
+        got = "file %s %s %o" % (rel, digest, os.stat(path).st_mode & 0o777)
+    elif os.path.exists(path):
+        got = "other %s" % rel
+    else:
+        got = "absent %s" % rel
+    if want.get(rel) != got:
+        sys.stderr.write("source checkout changed: %s\n  was %s\n  now %s\n" % (rel, want.get(rel), got))
+        raise SystemExit(1)
+PY
+    then
+      echo "drill: source checkout was modified" >&2
+      ec=1
+    fi
+    rm -f "$fp"
+  fi
   exit "$ec"
 }
+fp="$(mktemp "${TMPDIR:-/tmp}/idoris-drill-fp.XXXXXX")"
+python3 - "$origin" "$fp" <<'PY'
+import hashlib, os, sys
+origin, dest = sys.argv[1:]
+rels = [
+    ".admin-mode", ".env", "compose.yaml",
+    "enroll/config.json", "enroll/headscale.apikey", "enroll/minted-tokens.txt",
+    "headplane/cookie_secret", "headplane/config.yaml",
+    "headscale/managed.json", "headscale/config.yaml", "headscale/policy.hujson",
+]
+lines = []
+for rel in rels:
+    path = os.path.join(origin, rel)
+    if os.path.islink(path):
+        lines.append("link %s" % rel)
+    elif os.path.isfile(path):
+        digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
+        lines.append("file %s %s %o" % (rel, digest, os.stat(path).st_mode & 0o777))
+    elif os.path.exists(path):
+        lines.append("other %s" % rel)
+    else:
+        lines.append("absent %s" % rel)
+open(dest, "w").write("\n".join(lines) + "\n")
+PY
 trap cleanup EXIT
+
+echo "drill: enrollment ownership from a root container"
+docker run --rm -i --user 0 \
+  -v "$origin/ops-lib.sh:/opt/ops-lib.sh:ro" \
+  alpine:3.23@sha256:ff7f0c727dd796aa36787bfcd9a64bf35a6ce72a73451b3359fde849b6703d63 \
+  sh -c 'apk add --no-cache bash python3 >/dev/null </dev/null && bash -s' <<'EOS'
+set -euo pipefail
+die() { echo "ctl: $*" >&2; exit 1; }
+here=/work
+mkdir -p /work/enroll/nested
+printf 'secret-bytes\n' > /work/enroll/nested/config.json
+chmod 600 /work/enroll/nested/config.json
+# shellcheck source=/dev/null
+source /opt/ops-lib.sh
+addgroup -g 65532 -S enroll
+adduser -S -D -H -u 65532 -G enroll enroll
+# 65534 is Alpine's nobody. Pick an unused id for the second owner.
+addgroup -g 65531 -S other
+adduser -S -D -H -u 65531 -G other other
+chown_enroll_runtime 65532 65532
+python3 - <<'PY'
+import os, stat, sys
+def walk(path):
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode):
+        sys.exit("symlink %s" % path)
+    if st.st_uid != 65532 or st.st_gid != 65532:
+        sys.exit("owner %s:%s on %s" % (st.st_uid, st.st_gid, path))
+    mode = st.st_mode & 0o777
+    if stat.S_ISDIR(st.st_mode):
+        if mode != 0o700:
+            sys.exit("dir mode %o %s" % (mode, path))
+        for name in os.listdir(path):
+            walk(os.path.join(path, name))
+    elif stat.S_ISREG(st.st_mode):
+        if mode != 0o600:
+            sys.exit("file mode %o %s" % (mode, path))
+    else:
+        sys.exit("special %s" % path)
+walk("/work/enroll")
+PY
+# Alpine's adduser -S sets the shell to nologin, and `su user -c` is not
+# busybox's option order. Force bash and keep a failed read visible under set -e.
+set +e
+got="$(su -s /bin/bash -c 'cat /work/enroll/nested/config.json' enroll 2>&1)"
+got_ec=$?
+set -e
+[[ "$got_ec" -eq 0 && "$got" == "secret-bytes" ]] || { echo "65532 could not read the secret (ec=$got_ec): $got" >&2; exit 1; }
+chown_enroll_runtime 65531 65531
+set +e
+got="$(su -s /bin/bash -c 'cat /work/enroll/nested/config.json' other 2>&1)"
+got_ec=$?
+set -e
+[[ "$got_ec" -eq 0 && "$got" == "secret-bytes" ]] || { echo "65531 could not read the secret (ec=$got_ec): $got" >&2; exit 1; }
+cat > /tmp/mismatch.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+die() { echo "ctl: $*" >&2; exit 1; }
+here=/work
+source /opt/ops-lib.sh
+chown_enroll_runtime 65531 65531
+EOF
+chmod 644 /tmp/mismatch.sh
+set +e
+mis="$(su -s /bin/bash -c 'bash /tmp/mismatch.sh' enroll 2>&1)"
+mis_ec=$?
+set -e
+[[ "$mis_ec" -ne 0 ]] || { echo "non-root uid mismatch was accepted" >&2; exit 1; }
+printf '%s\n' "$mis" | grep -q 're-run restore as root' || { echo "mismatch text: $mis" >&2; exit 1; }
+echo "ownership ok"
+EOS
 
 rm -rf "$src" "$dst" "$bundle_root"
 mkdir -p "$bundle_root"
@@ -340,6 +492,36 @@ set -e
 grep -q "symlink" <<<"$link_out" || die "symlink destination was not refused: ${link_out}"
 docker compose ps --status running -q headscale | grep -q . || die "symlink refusal stopped headscale"
 
+echo "drill: default backup parent is created mode 0700"
+mkdir -p "$bundle_root/link-target"
+ln -s "$bundle_root/link-target" "$src/backups"
+set +e
+sym_out="$(bash "$src/ctl.sh" backup 2>&1)"
+sym_ec=$?
+set -e
+[[ "$sym_ec" -ne 0 ]] || die "accepted a symlink backup parent"
+grep -q "symlink" <<<"$sym_out" || die "symlink parent was not refused: ${sym_out}"
+[[ -z "$(ls -A "$bundle_root/link-target")" ]] || die "backup wrote through a symlink parent"
+docker compose ps --status running -q headscale | grep -q . || die "symlink parent stopped headscale"
+rm "$src/backups"
+bash "$src/ctl.sh" backup
+python3 - "$src/backups" <<'PY'
+import os, sys
+parent = sys.argv[1]
+if os.path.islink(parent) or not os.path.isdir(parent):
+    raise SystemExit("backups parent is not a real directory")
+if (os.stat(parent).st_mode & 0o777) != 0o700:
+    raise SystemExit("backups parent mode %o" % (os.stat(parent).st_mode & 0o777))
+kids = [name for name in os.listdir(parent) if os.path.isdir(os.path.join(parent, name))]
+if len(kids) != 1:
+    raise SystemExit("expected one default backup, got %s" % kids)
+child = os.path.join(parent, kids[0])
+if os.path.islink(child) or (os.stat(child).st_mode & 0o777) != 0o700:
+    raise SystemExit("default backup directory is not mode 0700")
+print("default backup parent ok")
+PY
+docker compose ps --status running -q headscale | grep -q . || die "default backup left headscale stopped"
+
 echo "drill: backup, destroy, restore into an empty tree"
 bash "$src/ctl.sh" backup "$bundle"
 python3 - "$bundle" <<'PY'
@@ -392,6 +574,93 @@ if os.path.lexists(sidecar):
 print("bundle layout ok")
 PY
 
+echo "drill: shell HEADPLANE_BIND does not override tunnel"
+HEADPLANE_BIND=0.0.0.0 bash "$src/ctl.sh" up --headplane-access tunnel
+assert_bind 127.0.0.1
+grep -q '^mode=published$' "$src/.admin-mode" || die "tunnel did not record published mode"
+
+echo "drill: lan publishes 0.0.0.0 and restore puts the bundle bind back"
+HEADPLANE_BIND=0.0.0.0 bash "$src/ctl.sh" up --headplane-access lan
+assert_bind 0.0.0.0
+grep -q '^mode=published$' "$src/.admin-mode" || die "lan did not record published mode"
+set +e
+bind_out="$(bash "$src/ctl.sh" restore "$bundle" --force 2>&1)"
+bind_ec=$?
+set -e
+if [[ "$bind_ec" -ne 0 ]]; then
+  printf '%s\n' "$bind_out" | redact >&2
+  die "restore of the original bind failed"
+fi
+assert_bind 127.0.0.1
+grep -q '^HEADPLANE_BIND=127.0.0.1$' "$src/.env" || die "restored .env did not put HEADPLANE_BIND back"
+nodes_have drill-member || die "bind restore lost drill-member"
+
+headscale_started() {
+  docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q headscale)"
+}
+started="$(headscale_started)"
+config_hash() {
+  python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$src/enroll/config.json"
+}
+config_before="$(config_hash)"
+
+refuse_before_stop() {
+  local path="$1" needle="$2" name="$3" out ec now
+  set +e
+  out="$(bash "$src/ctl.sh" restore "$path" --force 2>&1)"
+  ec=$?
+  set -e
+  [[ "$ec" -ne 0 ]] || die "$name was accepted"
+  grep -q "$needle" <<<"$out" || die "$name was not refused ($needle): ${out}"
+  now="$(headscale_started)"
+  [[ "$now" == "$started" ]] || die "$name stopped headscale ($started -> $now)"
+  [[ "$(config_hash)" == "$config_before" ]] || die "$name changed enroll/config.json"
+  docker compose ps --status running -q headscale | grep -q . || die "$name left headscale stopped"
+}
+
+echo "drill: symlink, image override and empty DERP fail before stop"
+rm -rf "$bundle_root/evil-link" "$bundle_root/evil-label" "$bundle_root/evil-image" "$bundle_root/empty-derp"
+cp -a "$bundle" "$bundle_root/evil-link"
+ln -s /etc/passwd "$bundle_root/evil-link/state/via-link"
+refuse_before_stop "$bundle_root/evil-link" "symlink" "symlink in the bundle"
+cp -a "$bundle" "$bundle_root/evil-label"
+ln -s /etc/passwd "$bundle_root/evil-label/state/enroll/token-labels.json"
+refuse_before_stop "$bundle_root/evil-label" "symlink" "symlink named token-labels.json"
+cp -a "$bundle" "$bundle_root/evil-image"
+printf '\nENROLL_IMAGE=evil:latest\n' >> "$bundle_root/evil-image/state/dotenv"
+refuse_before_stop "$bundle_root/evil-image" "image override" "ENROLL_IMAGE"
+cp -a "$bundle" "$bundle_root/empty-derp"
+: > "$bundle_root/empty-derp/headscale/derp_server_private.key"
+refuse_before_stop "$bundle_root/empty-derp" "DERP key is empty" "empty DERP key"
+
+echo "drill: a garbage database rolls back to the running node"
+rm -rf "$bundle_root/garbage"
+cp -a "$bundle" "$bundle_root/garbage"
+printf 'not-a-sqlite-database\n' > "$bundle_root/garbage/headscale/db.sqlite"
+set +e
+gar_out="$(bash "$src/ctl.sh" restore "$bundle_root/garbage" --force 2>&1)"
+gar_ec=$?
+set -e
+if [[ "$gar_ec" -eq 0 ]]; then
+  die "garbage database was accepted"
+fi
+grep -q 'rolling back' <<<"$gar_out" || {
+  printf '%s\n' "$gar_out" | redact >&2
+  die "garbage restore did not roll back"
+}
+ready=0
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+  if docker compose exec -T headscale headscale health >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
+  sleep 2
+done
+[[ "$ready" == 1 ]] || die "headscale did not return after rollback"
+nodes_have drill-member || die "rollback lost drill-member"
+docker compose ps --status running -q headscale | grep -q . || die "rollback left headscale stopped"
+[[ "$(config_hash)" == "$config_before" ]] || die "rollback left enroll/config.json changed"
+
 docker rm -f "${PROJ}-member" >/dev/null
 docker compose --profile tailnet-admin down -v
 if docker volume ls --format '{{.Name}}' | grep -q "^${PROJ}_"; then
@@ -403,8 +672,21 @@ cd "$repo"
 rm -rf "$src"
 
 echo "drill: restoring into a clean copy"
+printf '\n# bundle-only marker\n' >> "$bundle/state/compose.yaml"
+origin_compose="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$origin/compose.yaml")"
 copy_tree "$origin" "$dst"
-bash "$dst/ctl.sh" restore "$bundle" --force
+set +e
+restore_out="$(bash "$dst/ctl.sh" restore "$bundle" --force 2>&1)"
+restore_ec=$?
+set -e
+if [[ "$restore_ec" -ne 0 ]]; then
+  printf '%s\n' "$restore_out" | redact >&2
+  die "clean restore failed"
+fi
+grep -q 'restore: bundle compose.yaml differs from this checkout; keeping the checkout file' <<<"$restore_out" \
+  || die "restore replaced or stayed silent about compose.yaml"
+dst_compose="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$dst/compose.yaml")"
+[[ "$dst_compose" == "$origin_compose" ]] || die "checkout compose.yaml was replaced from the bundle"
 
 # The restored config carries the lab server_url. Confirm the token hash
 # survived, then enroll a second node on the rebuilt stack.
