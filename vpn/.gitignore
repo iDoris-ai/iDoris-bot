@@ -3,3 +3,4 @@ bin/
 integration/.pki/
 integration/.pki-embedded/
 integration/.pki-wiz/
+integration/.pki-hardA/
