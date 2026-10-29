@@ -543,8 +543,39 @@ func (e *wizEnv) waitRoutes(t *testing.T, host string, budget time.Duration, con
 	panic("stub")
 }
 func (e *wizEnv) nodeHasTag(t *testing.T, host, tag string) bool {
-	panic("stub")
+	t.Helper()
+	out := e.must(t, 15*time.Second, "exec", "-T", "headscale", "headscale", "nodes", "list", "-o", "json")
+	raw := lanExtractJSON(out)
+	var nodes []struct {
+		GivenName string   `json:"givenName"`
+		Name      string   `json:"name"`
+		Tags      []string `json:"tags"`
+	}
+	if err := json.Unmarshal(raw, &nodes); err != nil {
+		var wrap struct {
+			Nodes []struct {
+				GivenName string   `json:"givenName"`
+				Name      string   `json:"name"`
+				Tags      []string `json:"tags"`
+			} `json:"nodes"`
+		}
+		if err2 := json.Unmarshal(raw, &wrap); err2 != nil {
+			t.Logf("nodes list: %v / %v", err, err2)
+			return false
+		}
+		nodes = wrap.Nodes
+	}
+	for _, n := range nodes {
+		if n.GivenName != host && !strings.HasPrefix(n.Name, host+".") && n.Name != host {
+			continue
+		}
+		if gwHas(n.Tags, tag) {
+			return true
+		}
+	}
+	return false
 }
+
 func (e *wizEnv) approve(t *testing.T, host, numericID, cidr string) {
 	t.Helper()
 	e.approveCalls++
