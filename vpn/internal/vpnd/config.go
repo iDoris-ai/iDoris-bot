@@ -31,9 +31,13 @@ type Config struct {
 	AuthKey     string `json:"auth_key,omitempty"`
 	AuthKeyFile string `json:"auth_key_file,omitempty"`
 
-	Hostname      string   `json:"hostname,omitempty"`
-	AcceptRoutes  bool     `json:"accept_routes,omitempty"`
-	AcceptDNS     *bool    `json:"accept_dns,omitempty"`
+	Hostname     string `json:"hostname,omitempty"`
+	AcceptRoutes bool   `json:"accept_routes,omitempty"`
+	AcceptDNS    *bool  `json:"accept_dns,omitempty"`
+	// AdvertiseTags is the tag the operator expects on this node. The daemon
+	// does not send it at login: Headscale v0.29.6 rejects a pre-auth-key
+	// registration that also requests tags. Put the same tag in the
+	// enrollment entry's acl_tags; that key is what tags the node.
 	AdvertiseTags []string `json:"advertise_tags,omitempty"`
 	// Takeover, when true, allows system mode to switch a tailscaled that is
 	// logged into some other control server. The default (nil or false) is to
