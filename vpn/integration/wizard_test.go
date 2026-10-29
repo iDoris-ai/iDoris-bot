@@ -462,8 +462,36 @@ func (e *wizEnv) join(t *testing.T, host, code, device string) string {
 }
 
 func (e *wizEnv) assertJoinPlan(t *testing.T, out string, nets wizNets, route string, auto bool) {
-	panic("stub")
+	t.Helper()
+	var candidates, recommended int
+	var rec string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "candidate:") {
+			candidates++
+		}
+		if strings.HasPrefix(line, "candidate: recommended ") {
+			recommended++
+			rec = line
+		}
+	}
+	if candidates < 1 || recommended != 1 || !strings.Contains(rec, nets.officeCIDR) || !strings.Contains(rec, "gateway "+nets.officeGW) {
+		t.Fatalf("detection candidates=%d recommended=%q\n%s", candidates, rec, out)
+	}
+	if !strings.Contains(out, "routes: "+route) || strings.Contains(out, "routes: "+nets.officeCIDR) {
+		t.Fatalf("route selection:\n%s", out)
+	}
+	want := "auto-approve: no"
+	if auto {
+		want = "auto-approve: yes"
+	}
+	if !strings.Contains(out, want) || !strings.Contains(out, "ip-forward: enabled") || !strings.Contains(out, "role: gateway") {
+		t.Fatalf("plan summary missing %s:\n%s", want, out)
+	}
+	if strings.Contains(out, "discover failed") {
+		t.Fatalf("discover failed, so approval is a guess:\n%s", out)
+	}
 }
+
 func (e *wizEnv) assertWrittenConfig(t *testing.T, host, route, office string, auto bool) {
 	t.Helper()
 	raw := e.must(t, 10*time.Second, "exec", "-T", host, "cat", "/root/.idoris/vpn.json")
