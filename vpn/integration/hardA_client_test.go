@@ -284,6 +284,77 @@ func hardASelected(list []hardAProfile) string {
 	return ""
 }
 
+// TestHardAAwaitTailscaled is case (b): role local-ai with auto mode must not
+// start an embedded node when the system tailscaled socket is missing.
+func TestHardAAwaitTailscaled(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker not installed")
+	}
+	buildLinuxBin(t, "../cmd/idoris-vpnd", filepath.Join("..", "bin", "idoris-vpnd-linux"))
+	bin, err := filepath.Abs(filepath.Join("..", "bin", "idoris-vpnd-linux"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := fmt.Sprintf("idoris-vpn-harda-wait-%d", os.Getpid())
+	rm := func() {
+		_ = exec.Command("docker", "rm", "-f", name).Run()
+	}
+	rm()
+	t.Cleanup(func() {
+		if t.Failed() {
+			out, _ := exec.Command("docker", "logs", "--tail", "80", name).CombinedOutput()
+			t.Logf("wait container logs:\n%s", out)
+		}
+		rm()
+	})
+
+	run := exec.Command("docker", "run", "-d", "--name", name,
+		"-v", bin+":/opt/idoris-vpnd:ro",
+		"--entrypoint", "/opt/idoris-vpnd",
+		"tailscale/tailscale:v1.104.2",
+		"run",
+		"--role", "local-ai",
+		"--mode", "auto",
+		"--auth-key", "hardA-unused-key",
+		"--control-url", "https://headscale.example",
+		"--tailscale-socket", "/tmp/missing.sock",
+		"--listen", "tcp:127.0.0.1:7845",
+		"--state-dir", "/tmp/hardA-embedded",
+		"--state-file", "/tmp/hardA-state.json",
+		"--interval", "2s",
+		"--log-level", "info",
+	)
+	if out, err := run.CombinedOutput(); err != nil {
+		t.Fatalf("docker run: %v\n%s", err, out)
+	}
+
+	var body map[string]any
+	waitFor(t, "waiting-for-tailscaled", 45*time.Second, func() (bool, string) {
+		out, err := exec.Command("docker", "exec", name, "wget", "-qO-", "http://127.0.0.1:7845/v1/status").CombinedOutput()
+		if err != nil {
+			return false, strings.TrimSpace(string(out) + " " + err.Error())
+		}
+		if err := json.Unmarshal(out, &body); err != nil {
+			return false, err.Error()
+		}
+		return body["phase"] == "waiting-for-tailscaled" && body["role"] == "local-ai" && body["mode"] == "system",
+			fmt.Sprintf("phase=%v role=%v mode=%v err=%v", body["phase"], body["role"], body["mode"], body["last_error"])
+	})
+	last, _ := body["last_error"].(string)
+	if !strings.Contains(last, "official tailscaled") {
+		t.Fatalf("last_error %q does not tell the operator to install tailscaled", last)
+	}
+	found, err := exec.Command("docker", "exec", name, "sh", "-c",
+		`find /tmp /root /home /var/lib -name tailscaled.state -o -name registration-complete 2>/dev/null || true`).CombinedOutput()
+	if err != nil {
+		t.Fatalf("find embedded state: %v\n%s", err, found)
+	}
+	if strings.TrimSpace(string(found)) != "" {
+		t.Fatalf("local-ai started an embedded node while tailscaled was down:\n%s", found)
+	}
+	t.Logf("local-ai waiting: phase=%v mode=%v role=%v err=%s", body["phase"], body["mode"], body["role"], last)
+}
+
 // TestHardAClientCore covers the docker cases that need a real Headscale:
 //
 //	(a) system mode, takeover off, foreign login active, saved iDoris profile
