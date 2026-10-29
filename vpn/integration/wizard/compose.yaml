@@ -1,0 +1,122 @@
+# Wizard lab. The project name and subnets are injected by wizard_test.go
+# (`docker compose -p idoris-vpn-wizard-<random>`). Do not set a top-level name.
+#
+# headscale, both gateways, and the echo devices share the office bridge so the
+# gateway's default route is the LAN that contains the echo. The member sits on
+# a different bridge and drops the office prefix except via tailscale0.
+services:
+  headscale:
+    image: headscale/headscale:v0.29.6
+    command: serve
+    volumes:
+      - ../headscale-lan/config.yaml:/etc/headscale/config.yaml:ro
+      - ../.pki-wiz:/etc/headscale/runtime:ro
+    ports:
+      - "127.0.0.1::443"
+    networks:
+      - office
+      - home
+    healthcheck:
+      test: ["CMD", "headscale", "health"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+      start_period: 2s
+
+  wiz-member:
+    image: tailscale/tailscale:v1.104.2
+    hostname: wiz-member
+    entrypoint: ["/bin/sh", "/lan/node.sh"]
+    init: true
+    depends_on:
+      headscale:
+        condition: service_healthy
+    cap_add: [NET_ADMIN, NET_RAW]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    environment:
+      SSL_CERT_FILE: /etc/lan-pki/ca.pem
+      LAN_SINK_EXCEPT_TUN: ${WIZ_OFFICE_CIDR:?}
+    volumes: &ts
+      - ../headscale-lan/node.sh:/lan/node.sh:ro
+      - ../.pki-wiz/ca.pem:/etc/lan-pki/ca.pem:ro
+    networks: [home]
+
+  wiz-gw:
+    image: tailscale/tailscale:v1.104.2
+    hostname: wiz-gw
+    entrypoint: ["/bin/sh", "/lan/node.sh"]
+    init: true
+    depends_on:
+      headscale:
+        condition: service_healthy
+    cap_add: [NET_ADMIN, NET_RAW]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    environment:
+      SSL_CERT_FILE: /etc/lan-pki/ca.pem
+      LAN_FORWARD: "1"
+      HOME: /root
+    volumes:
+      - ../headscale-lan/node.sh:/lan/node.sh:ro
+      - ../.pki-wiz/ca.pem:/etc/lan-pki/ca.pem:ro
+      - ${WIZ_VPND:?}:/opt/idoris-vpnd:ro
+    networks: [office]
+
+  wiz-gw-wait:
+    image: tailscale/tailscale:v1.104.2
+    hostname: wiz-gw-wait
+    entrypoint: ["/bin/sh", "/lan/node.sh"]
+    init: true
+    depends_on:
+      headscale:
+        condition: service_healthy
+    cap_add: [NET_ADMIN, NET_RAW]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    environment:
+      SSL_CERT_FILE: /etc/lan-pki/ca.pem
+      LAN_FORWARD: "1"
+      HOME: /root
+    volumes:
+      - ../headscale-lan/node.sh:/lan/node.sh:ro
+      - ../.pki-wiz/ca.pem:/etc/lan-pki/ca.pem:ro
+      - ${WIZ_VPND:?}:/opt/idoris-vpnd:ro
+    networks: [office]
+
+  wiz-echo:
+    image: tailscale/tailscale:v1.104.2
+    hostname: wiz-echo
+    entrypoint: ["/bin/sh", "/lan/echo.sh"]
+    init: true
+    volumes:
+      - ../headscale-lan/echo.sh:/lan/echo.sh:ro
+    networks:
+      office:
+        ipv4_address: ${WIZ_ECHO:?}
+
+  wiz-echo-b:
+    image: tailscale/tailscale:v1.104.2
+    hostname: wiz-echo-b
+    entrypoint: ["/bin/sh", "/lan/echo.sh"]
+    init: true
+    volumes:
+      - ../headscale-lan/echo.sh:/lan/echo.sh:ro
+    networks:
+      office:
+        ipv4_address: ${WIZ_ECHO_B:?}
+
+networks:
+  office:
+    driver: bridge
+    enable_ipv6: false
+    ipam:
+      config:
+        - subnet: ${WIZ_OFFICE_CIDR:?}
+          gateway: ${WIZ_OFFICE_GW:?}
+  home:
+    driver: bridge
+    enable_ipv6: false
+    ipam:
+      config:
+        - subnet: ${WIZ_HOME_CIDR:?}
+          gateway: ${WIZ_HOME_GW:?}
