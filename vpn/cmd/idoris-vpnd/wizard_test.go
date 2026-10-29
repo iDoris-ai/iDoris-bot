@@ -226,6 +226,8 @@ type fakeOS struct {
 	root     bool
 	goos     string
 	forwards int
+	mkdirs   int
+	installs int
 }
 
 func newFakeOS(root bool, goos string) *fakeOS {
@@ -243,7 +245,10 @@ func (m *fakeOS) WriteFile(path string, data []byte, mode os.FileMode) error {
 	m.modes[path] = mode
 	return nil
 }
-func (m *fakeOS) MkdirAll(string, os.FileMode) error { return nil }
+func (m *fakeOS) MkdirAll(string, os.FileMode) error {
+	m.mkdirs++
+	return nil
+}
 func (m *fakeOS) Stat(path string) (os.FileInfo, error) {
 	if _, ok := m.files[path]; !ok {
 		return nil, os.ErrNotExist
@@ -270,7 +275,10 @@ func (m *fakeOS) EnableIPForward(path, content string) error {
 	m.forwards++
 	return m.WriteFile(path, []byte(content), 0o644)
 }
-func (m *fakeOS) InstallService(string) error { return nil }
+func (m *fakeOS) InstallService(string) error {
+	m.installs++
+	return nil
+}
 
 type fakeInfo struct{ name string }
 
@@ -520,5 +528,62 @@ func TestR3W2JoinDistinctConfigsAndReplace(t *testing.T) {
 	}
 	if !bytes.Contains(host.files["/home/acme/orgA/vpn.json"], []byte("https://c.example")) {
 		t.Fatalf("apply --replace: %s", host.files["/home/acme/orgA/vpn.json"])
+	}
+}
+
+// TestR4WRootApplyForwardsOnly checks that a root `gateway apply` enables
+// forwarding and does not rewrite the files the unprivileged user owns.
+func TestR4WRootApplyForwardsOnly(t *testing.T) {
+	const (
+		planPath = "/home/acme/.idoris/gateway-plan.json"
+		cfgPath  = "/home/acme/.idoris/vpn.json"
+		tokPath  = "/home/acme/.idoris/enroll.token"
+	)
+	planBody := []byte(`{"role":"gateway","routes":["10.1.2.0/24"],"mode":"auto","enroll_url":"https://enroll.example","token_file":"` + tokPath + `","config_path":"` + cfgPath + `"}` + "\n")
+	host := newFakeOS(true, "linux")
+	host.files[planPath] = append([]byte(nil), planBody...)
+	const userConfig = "{\"hostname\":\"office-gw\"}\n"
+	host.files[cfgPath] = []byte(userConfig)
+	host.files[tokPath] = []byte("idv1_userownedtokenuserownedtokenu\n")
+	prev := readPlanHandoff
+	readPlanHandoff = func(string) (gateway.PlanHandoff, error) {
+		return gateway.PlanHandoff{Regular: true, Mode: 0o600, UID: 1000, Root: true, SudoUID: "1000"}, nil
+	}
+	t.Cleanup(func() { readPlanHandoff = prev })
+	d := testDeps(host, "")
+	if err := gatewayCmd([]string{"apply", "--plan", planPath}, d); err != nil {
+		t.Fatal(err)
+	}
+	if host.forwards != 1 || host.mkdirs != 0 || host.installs != 0 {
+		t.Fatalf("forwards=%d mkdirs=%d installs=%d", host.forwards, host.mkdirs, host.installs)
+	}
+	if string(host.files[cfgPath]) != userConfig || string(host.files[tokPath]) != "idv1_userownedtokenuserownedtokenu\n" {
+		t.Fatalf("root apply rewrote user files\nconfig %s\ntoken %s", host.files[cfgPath], host.files[tokPath])
+	}
+	if !bytes.Equal(host.files[planPath], planBody) {
+		t.Fatal("root apply rewrote the plan")
+	}
+	if !strings.Contains(d.out(), "ip-forward: enabled") {
+		t.Fatalf("stdout:\n%s", d.out())
+	}
+	// A rejected handoff never enables forwarding.
+	for _, tc := range []struct {
+		name string
+		h    gateway.PlanHandoff
+		want string
+	}{
+		{"foreign", gateway.PlanHandoff{Regular: true, Mode: 0o600, UID: 1001, Root: true, SudoUID: "1000"}, "uid 1001"},
+		{"symlink", gateway.PlanHandoff{Symlink: true, Mode: 0o600, UID: 1000, Root: true, SudoUID: "1000"}, "symlink"},
+		{"mode", gateway.PlanHandoff{Regular: true, Mode: 0o666, UID: 1000, Root: true, SudoUID: "1000"}, "0600"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			host.forwards = 0
+			readPlanHandoff = func(string) (gateway.PlanHandoff, error) { return tc.h, nil }
+			d := testDeps(host, "")
+			err := gatewayCmd([]string{"apply", "--plan", planPath}, d)
+			if err == nil || !strings.Contains(err.Error(), tc.want) || host.forwards != 0 {
+				t.Fatalf("err=%v forwards=%d", err, host.forwards)
+			}
+		})
 	}
 }
