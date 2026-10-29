@@ -5,6 +5,8 @@ import (
 	"errors"
 	"log/slog"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -401,6 +403,92 @@ func TestForeignStatesBlockedBeforeProfileMutation(t *testing.T) {
 				t.Fatalf("current profile %q calls %v", be.current.ID, be.calls)
 			}
 		})
+	}
+}
+
+func TestIdentityMismatchReenrollsOnSameControlURL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vpnd-state.json")
+	st, err := OpenState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetIdentity(ours, "acme", "admin", "old"); err != nil {
+		t.Fatal(err)
+	}
+	be := &fakeBackend{state: ipn.Running, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true, CorpDNS: true}}
+	keys := &countingKeys{}
+	r := newR(t, be, keys, func(o *Options) {
+		o.State = st
+		o.Role = "member"
+		o.Identity = Identity{Tenant: "acme", Role: "member", TokenFingerprint: "new", Known: true}
+	})
+	snap, err := r.Step(context.Background())
+	if err != nil || snap.Phase == PhaseConnected || keys.n != 1 {
+		t.Fatalf("admin binding with a member token must re-enroll: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+	if st.Get().Role != "admin" {
+		t.Fatalf("binding rewritten before login completed: %+v", st.Get())
+	}
+	be.state = ipn.Running
+	be.prefs.ControlURL = ours
+	snap, err = r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseConnected || keys.n != 1 {
+		t.Fatalf("after re-enroll: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+	got := st.Get()
+	if got.Tenant != "acme" || got.Role != "member" || got.TokenFingerprint != "new" {
+		t.Fatalf("binding %+v", got)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "idv1_") {
+		t.Fatalf("token leaked into %s", path)
+	}
+}
+
+func TestSameControlDifferentTenantReenrolls(t *testing.T) {
+	st, err := OpenState(filepath.Join(t.TempDir(), "vpnd-state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetIdentity(ours, "acme", "local-ai", "fp"); err != nil {
+		t.Fatal(err)
+	}
+	be := &fakeBackend{state: ipn.Running, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true, CorpDNS: true}}
+	keys := &countingKeys{}
+	r := newR(t, be, keys, func(o *Options) {
+		o.State = st
+		o.Role = "local-ai"
+		o.Identity = Identity{Tenant: "other", Role: "local-ai", TokenFingerprint: "fp2", Known: true}
+	})
+	if _, err := r.Step(context.Background()); err != nil || keys.n != 1 {
+		t.Fatalf("keys=%d err=%v", keys.n, err)
+	}
+	tags := views.SliceOf([]string{"tag:other-local-ai"})
+	be.state = ipn.Running
+	be.prefs.ControlURL = ours
+	be.self = &ipnstate.PeerStatus{Tags: &tags}
+	snap, err := r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseConnected || st.Get().Tenant != "other" {
+		t.Fatalf("snap %+v binding %+v err=%v", snap, st.Get(), err)
+	}
+}
+
+func TestTaggedRoleWithoutTagsIsNotConnected(t *testing.T) {
+	be := &fakeBackend{state: ipn.Running, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true, CorpDNS: true}}
+	keys := &countingKeys{}
+	r := newR(t, be, keys, func(o *Options) { o.Role = "local-ai" })
+	snap, err := r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseMissingTags || keys.n != 0 || len(snap.Warnings) == 0 {
+		t.Fatalf("untagged local-ai must not look connected: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+	tags := views.SliceOf([]string{"tag:acme-local-ai"})
+	be.self = &ipnstate.PeerStatus{Tags: &tags}
+	snap, err = r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseConnected || keys.n != 0 {
+		t.Fatalf("tagged: %+v keys=%d err=%v", snap, keys.n, err)
 	}
 }
 
