@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"runtime"
@@ -28,6 +27,14 @@ const (
 )
 
 func installSystemService(configPath string) error {
+	abs, err := filepath.Abs(configPath)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(abs); err != nil { //nolint:gosec // G703: operator-chosen config path, made absolute
+		return fmt.Errorf("config: %w", err)
+	}
+	configPath = abs
 	switch runtime.GOOS {
 	case "linux":
 		return installSystemdSystem(configPath)
@@ -116,7 +123,7 @@ func systemdManagedDirs(paths []string) (state, runtime []string) {
 		if name, ok := strings.CutPrefix(p, "/var/lib/"); ok && systemdDirToken(name) && name != "idoris" {
 			state = append(state, name)
 		}
-		if name, ok := strings.CutPrefix(p, "/run/"); ok && systemdDirToken(name) && name != "idoris" {
+		if name, ok := strings.CutPrefix(p, "/run/"); ok && systemdDirToken(name) && name != "idoris" && name != "user" {
 			runtime = append(runtime, name)
 		}
 	}
@@ -147,6 +154,7 @@ func systemReadWritePaths(cfgJSON []byte) ([]string, error) {
 	var probe struct {
 		Listen       string `json:"listen"`
 		StateDir     string `json:"state_dir"`
+		StateFile    string `json:"state_file"`
 		SOCKS5Listen string `json:"socks5_listen"`
 		Forwards     []struct {
 			Listen string `json:"listen"`
@@ -169,17 +177,29 @@ func systemReadWritePaths(cfgJSON []byte) ([]string, error) {
 		if p == "/" {
 			return errors.New("config: refusing ReadWritePaths=/")
 		}
+		// Never claim /run, /var/run, or /run/user. A nested path under
+		// /run/user collapses to /run/user, which is the same shared directory.
+		if err := rejectSharedRuntime(p); err != nil {
+			return err
+		}
 		// A path under /run disappears on reboot. List only /run/<name>, which
 		// RuntimeDirectory recreates. The parent is writable, so the daemon
 		// can create anything nested below it. Listing the nested path would
 		// make systemd fail the namespace once /run is empty again.
 		// Nested and exact runtime paths both collapse to /run/<name>.
 		if top, _ := runtimeDir(p); top != "" {
-			return appendReadWrite(&paths, "/run/"+top)
+			collapsed := "/run/" + top
+			if err := rejectSharedRuntime(collapsed); err != nil {
+				return err
+			}
+			return appendReadWrite(&paths, collapsed)
 		}
 		return appendReadWrite(&paths, p)
 	}
 	if err := add(probe.StateDir); err != nil {
+		return nil, err
+	}
+	if err := addStateFile(&paths, probe.StateFile); err != nil {
 		return nil, err
 	}
 	addUnix := func(listen string) error {
@@ -191,7 +211,11 @@ func systemReadWritePaths(cfgJSON []byte) ([]string, error) {
 		if err := rejectUnsafePath(sock); err != nil {
 			return err
 		}
-		return add(path.Dir(sock))
+		dir := path.Dir(path.Clean(sock))
+		if err := rejectSharedRuntime(dir); err != nil {
+			return err
+		}
+		return add(dir)
 	}
 	if err := addUnix(probe.Listen); err != nil {
 		return nil, err
@@ -207,6 +231,36 @@ func systemReadWritePaths(cfgJSON []byte) ([]string, error) {
 	return paths, nil
 }
 
+// addStateFile lists the parent of state_file so an atomic rename has a
+// writable directory. Paths under /run still collapse to /run/<name>. A
+// shared runtime directory is rejected instead of being chmod'd.
+func addStateFile(paths *[]string, p string) error {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return nil
+	}
+	if err := rejectUnsafePath(p); err != nil {
+		return err
+	}
+	if !path.IsAbs(p) {
+		return nil
+	}
+	parent := path.Clean(path.Dir(path.Clean(p)))
+	if parent == "/" {
+		return errors.New("config: refusing state_file in /")
+	}
+	if err := rejectSharedRuntime(parent); err != nil {
+		return fmt.Errorf("config: state_file parent %s is a shared runtime directory. Put state_file under /var/lib/idoris", parent)
+	}
+	if top, _ := runtimeDir(parent); top != "" {
+		if top == "user" {
+			return fmt.Errorf("config: state_file parent %s is a shared runtime directory. Put state_file under /var/lib/idoris", parent)
+		}
+		return appendReadWrite(paths, "/run/"+top)
+	}
+	return appendReadWrite(paths, parent)
+}
+
 func appendReadWrite(paths *[]string, p string) error {
 	for _, have := range *paths {
 		if have == p {
@@ -214,6 +268,20 @@ func appendReadWrite(paths *[]string, p string) error {
 		}
 	}
 	*paths = append(*paths, p)
+	return nil
+}
+
+// rejectSharedRuntime refuses an ancestor the service does not own. The
+// installer must not chmod it or list it as RuntimeDirectory.
+func rejectSharedRuntime(p string) error {
+	p = path.Clean(p)
+	switch p {
+	case "/run", "/var/run", "/run/user", "/var/run/user":
+		return fmt.Errorf("config: %s is a shared runtime directory (/run, /var/run, or /run/user). The system service will not change it. Listen on unix:/run/idoris/ instead", p)
+	}
+	if strings.HasPrefix(p, "/run/user/") || strings.HasPrefix(p, "/var/run/user/") {
+		return fmt.Errorf("config: %s is under the shared directory /run/user. The system service will not change it. Listen on unix:/run/idoris/ instead", p)
+	}
 	return nil
 }
 
@@ -246,6 +314,9 @@ func provisionSystemPaths(root string, cfgJSON []byte) error {
 		return err
 	}
 	for _, p := range paths {
+		if err := rejectSharedRuntime(p); err != nil {
+			return err
+		}
 		dest := p
 		if root != "" {
 			dest = filepath.Join(root, strings.TrimPrefix(p, "/"))
@@ -308,10 +379,17 @@ func installSystemdSystem(configPath string) error {
 		return err
 	}
 	exeDir, exe := systemExecutable(runtime.GOOS, os.Getenv("ProgramFiles"))
+	if err := validateExecutableAncestors(exe); err != nil {
+		return err
+	}
 	if err := copyProtectedExecutable(src, exeDir, exe); err != nil {
 		return err
 	}
 	cfg, err := os.ReadFile(configPath) //nolint:gosec // operator-chosen config copied into /etc
+	if err != nil {
+		return err
+	}
+	cfg, err = stageSystemSecrets(cfg, systemStateDir)
 	if err != nil {
 		return err
 	}
@@ -332,11 +410,9 @@ func installSystemdSystem(configPath string) error {
 		return err
 	}
 	// Best effort: a user unit and this system unit must not both be running.
-	_, _ = exec.Command("systemctl", "--user", "disable", "--now", systemUnitName).CombinedOutput()
-	for _, a := range [][]string{{"daemon-reload"}, {"enable", "--now", systemUnitName}} {
-		if out, err := exec.Command("systemctl", a...).CombinedOutput(); err != nil {
-			return fmt.Errorf("systemctl %s: %w: %s", strings.Join(a, " "), err, strings.TrimSpace(string(out)))
-		}
+	_, _ = runServiceCommand("systemctl", "--user", "disable", "--now", systemUnitName)
+	if err := activateSystemService("linux", systemServiceActive("linux")); err != nil {
+		return err
 	}
 	fmt.Println("installed and started", systemUnitName, "from", systemUnitPath)
 	fmt.Println("config:", systemConfigPath)
@@ -353,14 +429,14 @@ func uninstallSystemdSystem() error {
 		return err
 	}
 	if _, err := os.Stat(systemUnitPath); err == nil {
-		if out, err := exec.Command("systemctl", "disable", "--now", systemUnitName).CombinedOutput(); err != nil {
+		if out, err := runServiceCommand("systemctl", "disable", "--now", systemUnitName); err != nil {
 			return fmt.Errorf("systemctl disable --now: %w: %s", err, strings.TrimSpace(string(out)))
 		}
 	}
 	if err := os.Remove(systemUnitPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
+	if out, err := runServiceCommand("systemctl", "daemon-reload"); err != nil {
 		return fmt.Errorf("systemctl daemon-reload: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	fmt.Println("removed", systemUnitPath)
@@ -385,10 +461,17 @@ func installLaunchDaemon(configPath string) error {
 		return err
 	}
 	exeDir, exe := systemExecutable(runtime.GOOS, os.Getenv("ProgramFiles"))
+	if err := validateExecutableAncestors(exe); err != nil {
+		return err
+	}
 	if err := copyProtectedExecutable(src, exeDir, exe); err != nil {
 		return err
 	}
 	cfg, err := os.ReadFile(configPath) //nolint:gosec // operator-chosen config copied into /etc
+	if err != nil {
+		return err
+	}
+	cfg, err = stageSystemSecrets(cfg, systemStateDir)
 	if err != nil {
 		return err
 	}
@@ -404,10 +487,9 @@ func installLaunchDaemon(configPath string) error {
 	if err := os.WriteFile(systemLaunchdPath, []byte(plist), 0o600); err != nil { //nolint:gosec // G703: fixed LaunchDaemon path under /Library/LaunchDaemons
 		return err
 	}
-	_ = exec.Command("launchctl", "bootout", fmt.Sprintf("gui/%d/%s", os.Getuid(), launchdLabel)).Run()
-	_ = exec.Command("launchctl", "bootout", "system/"+launchdLabel).Run()
-	if out, err := exec.Command("launchctl", "bootstrap", "system", systemLaunchdPath).CombinedOutput(); err != nil {
-		return fmt.Errorf("launchctl bootstrap system: %w: %s", err, strings.TrimSpace(string(out)))
+	_, _ = runServiceCommand("launchctl", "bootout", fmt.Sprintf("gui/%d/%s", os.Getuid(), launchdLabel))
+	if err := activateSystemService("darwin", systemServiceActive("darwin")); err != nil {
+		return err
 	}
 	fmt.Println("installed and started", launchdLabel, "from", systemLaunchdPath)
 	fmt.Println("config:", systemConfigPath)
@@ -422,7 +504,7 @@ func uninstallLaunchDaemon() error {
 	if err := requireRoot(); err != nil {
 		return err
 	}
-	_ = exec.Command("launchctl", "bootout", "system/"+launchdLabel).Run()
+	_, _ = runServiceCommand("launchctl", "bootout", "system/"+launchdLabel)
 	if err := os.Remove(systemLaunchdPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -478,29 +560,16 @@ func installWindowsTask(configPath string) error {
 	if err := copyProtectedExecutable(src, exeDir, exe); err != nil {
 		return err
 	}
-	cfg, err := os.ReadFile(configPath) //nolint:gosec // operator-chosen config copied into ProgramData
-	if err != nil {
+	active := systemServiceActive("windows")
+	// Protect the destination directory before any secret byte is written.
+	// A later failure removes that partial installation.
+	if err := arrangeWindowsInstall(realWindowsInstallOps(exe), exeDir, exe, configPath); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(windowsConfigDir, 0o750); err != nil {
-		return err
-	}
-	body, creds, err := stageWindowsConfig(cfg, windowsConfigDir)
-	if err != nil {
-		return err
-	}
-	if err := writeRootFile(windowsConfigDir, windowsConfigPath, body, 0o600); err != nil {
-		return err
-	}
-	// Unix modes do not set a DACL. icacls removes inheritance and grants
-	// only SYSTEM and Administrators on the directory, the config, copied
-	// credential files, and the protected executable.
-	if err := protectWindowsInstall(windowsConfigDir, windowsConfigPath, exeDir, exe, creds); err != nil {
-		return err
-	}
-	args := renderSchtasksCreate(exe, windowsConfigPath)
-	if out, err := exec.Command("schtasks", args...).CombinedOutput(); err != nil {
-		return fmt.Errorf("schtasks: %w: %s", err, strings.TrimSpace(string(out)))
+	if active {
+		if err := activateSystemService("windows", true); err != nil {
+			return err
+		}
 	}
 	fmt.Println("installed scheduled task", windowsTaskName)
 	fmt.Println("config:", windowsConfigPath)
@@ -512,7 +581,7 @@ func uninstallWindowsTask() error {
 		return errors.New("scheduled tasks are only removed on Windows")
 	}
 	args := renderSchtasksDelete()
-	if out, err := exec.Command("schtasks", args...).CombinedOutput(); err != nil {
+	if out, err := runServiceCommand("schtasks", args...); err != nil {
 		return fmt.Errorf("schtasks: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	fmt.Println("removed scheduled task", windowsTaskName)
@@ -522,6 +591,227 @@ func uninstallWindowsTask() error {
 	}
 	fmt.Println("removed", exe)
 	fmt.Println("left", windowsConfigPath, "in place")
+	return nil
+}
+
+func systemServiceActive(goos string) bool {
+	switch goos {
+	case "linux":
+		out, err := runServiceCommand("systemctl", "is-active", systemUnitName)
+		return err == nil && strings.TrimSpace(string(out)) == "active"
+	case "darwin":
+		_, err := runServiceCommand("launchctl", "print", "system/"+launchdLabel)
+		return err == nil
+	case "windows":
+		_, err := runServiceCommand("schtasks", "/Query", "/TN", windowsTaskName)
+		return err == nil
+	default:
+		return false
+	}
+}
+
+// activateSystemService restarts a unit that is already running so a
+// reinstall picks up the new config. A first install enables or bootstraps
+// it. already is the result of systemServiceActive before this call.
+func activateSystemService(goos string, already bool) error {
+	switch goos {
+	case "linux":
+		if out, err := runServiceCommand("systemctl", "daemon-reload"); err != nil {
+			return fmt.Errorf("systemctl daemon-reload: %w: %s", err, strings.TrimSpace(string(out)))
+		}
+		if already {
+			out, err := runServiceCommand("systemctl", "restart", systemUnitName)
+			if err != nil {
+				return fmt.Errorf("systemctl restart: %w: %s", err, strings.TrimSpace(string(out)))
+			}
+			return nil
+		}
+		out, err := runServiceCommand("systemctl", "enable", "--now", systemUnitName)
+		if err != nil {
+			return fmt.Errorf("systemctl enable --now: %w: %s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	case "darwin":
+		target := "system/" + launchdLabel
+		if already {
+			_, _ = runServiceCommand("launchctl", "bootout", target)
+			if out, err := runServiceCommand("launchctl", "bootstrap", "system", systemLaunchdPath); err != nil {
+				return fmt.Errorf("launchctl bootstrap system: %w: %s", err, strings.TrimSpace(string(out)))
+			}
+			out, err := runServiceCommand("launchctl", "kickstart", "-k", target)
+			if err != nil {
+				return fmt.Errorf("launchctl kickstart: %w: %s", err, strings.TrimSpace(string(out)))
+			}
+			return nil
+		}
+		out, err := runServiceCommand("launchctl", "bootstrap", "system", systemLaunchdPath)
+		if err != nil {
+			return fmt.Errorf("launchctl bootstrap system: %w: %s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	case "windows":
+		if !already {
+			return nil
+		}
+		if out, err := runServiceCommand("schtasks", "/End", "/TN", windowsTaskName); err != nil {
+			return fmt.Errorf("schtasks /End: %w: %s", err, strings.TrimSpace(string(out)))
+		}
+		out, err := runServiceCommand("schtasks", "/Run", "/TN", windowsTaskName)
+		if err != nil {
+			return fmt.Errorf("schtasks /Run: %w: %s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	default:
+		return fmt.Errorf("service activation is not supported on %s", goos)
+	}
+}
+
+// stageSystemSecrets copies credential files into destDir as root-owned
+// 0600 files and rewrites the installed config to those paths.
+func stageSystemSecrets(cfg []byte, destDir string) ([]byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(cfg))
+	dec.UseNumber()
+	var probe map[string]any
+	if err := dec.Decode(&probe); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	if dec.More() {
+		return nil, errors.New("config: trailing data")
+	}
+	items := []struct{ key, name string }{
+		{"enroll_token_file", "enroll_token"},
+		{"auth_key_file", "auth_key"},
+		{"socks5_auth_file", "socks5.auth"},
+	}
+	var written []string
+	rollback := func() {
+		for _, f := range written {
+			_ = os.Remove(f)
+		}
+	}
+	changed := false
+	for _, it := range items {
+		raw, ok := probe[it.key]
+		if !ok || raw == nil {
+			continue
+		}
+		src, ok := raw.(string)
+		if !ok {
+			rollback()
+			return nil, fmt.Errorf("config: %s is not a string", it.key)
+		}
+		src = strings.TrimSpace(src)
+		if src == "" {
+			continue
+		}
+		if err := acceptInstallSecret(src); err != nil {
+			rollback()
+			return nil, fmt.Errorf("%s: %w", it.key, err)
+		}
+		if err := os.MkdirAll(destDir, 0o750); err != nil {
+			rollback()
+			return nil, err
+		}
+		dest := filepath.Join(destDir, it.name)
+		if err := copyCredentialFile(src, dest); err != nil {
+			rollback()
+			return nil, fmt.Errorf("%s: %w", it.key, err)
+		}
+		if err := chownSystemRoot(dest); err != nil {
+			rollback()
+			return nil, err
+		}
+		probe[it.key] = dest
+		written = append(written, dest)
+		changed = true
+	}
+	if !changed {
+		return append([]byte(nil), cfg...), nil
+	}
+	body, err := json.MarshalIndent(probe, "", "  ")
+	if err != nil {
+		rollback()
+		return nil, err
+	}
+	return append(body, '\n'), nil
+}
+
+// winInstallOps is the Windows install sequence with the secret write
+// replaceable in tests. protectDir runs before stage.
+type winInstallOps struct {
+	mkdir       func(dir string) error
+	protectDir  func(dir string) error
+	readConfig  func(path string) ([]byte, error)
+	stage       func(cfg []byte, destDir string) ([]byte, []string, error)
+	writeConfig func(dir, path string, data []byte) error
+	protectRest func(config, exeDir, exe string, creds []string) error
+	createTask  func(exe string) error
+	remove      func(dir string) error
+}
+
+func realWindowsInstallOps(exe string) winInstallOps {
+	return winInstallOps{
+		mkdir: func(dir string) error { return os.MkdirAll(dir, 0o750) }, //nolint:gosec // G703: fixed ProgramData directory
+		protectDir: func(dir string) error {
+			return protectWindowsInstall(dir, "", "", "", nil)
+		},
+		readConfig: func(path string) ([]byte, error) {
+			return os.ReadFile(path) //nolint:gosec // operator-chosen config copied into ProgramData
+		},
+		stage: stageWindowsConfig,
+		writeConfig: func(dir, path string, data []byte) error {
+			return writeRootFile(dir, path, data, 0o600)
+		},
+		protectRest: func(config, exeDir, exePath string, creds []string) error {
+			return protectWindowsInstall("", config, exeDir, exePath, creds)
+		},
+		createTask: func(exePath string) error {
+			args := renderSchtasksCreate(exePath, windowsConfigPath)
+			out, err := runServiceCommand("schtasks", args...)
+			if err != nil {
+				return fmt.Errorf("schtasks: %w: %s", err, strings.TrimSpace(string(out)))
+			}
+			return nil
+		},
+		remove: func(dir string) error { return os.RemoveAll(dir) }, //nolint:gosec // G703: fixed ProgramData directory
+	}
+}
+
+// arrangeWindowsInstall protects the destination, then writes secrets.
+// Any failure removes the partial installation.
+func arrangeWindowsInstall(ops winInstallOps, exeDir, exe, configPath string) error {
+	cleanup := func() {
+		_ = ops.remove(windowsConfigDir)
+	}
+	if err := ops.mkdir(windowsConfigDir); err != nil {
+		return err
+	}
+	if err := ops.protectDir(windowsConfigDir); err != nil {
+		cleanup()
+		return err
+	}
+	cfg, err := ops.readConfig(configPath)
+	if err != nil {
+		cleanup()
+		return err
+	}
+	body, creds, err := ops.stage(cfg, windowsConfigDir)
+	if err != nil {
+		cleanup()
+		return err
+	}
+	if err := ops.writeConfig(windowsConfigDir, windowsConfigPath, body); err != nil {
+		cleanup()
+		return err
+	}
+	if err := ops.protectRest(windowsConfigPath, exeDir, exe, creds); err != nil {
+		cleanup()
+		return err
+	}
+	if err := ops.createTask(exe); err != nil {
+		cleanup()
+		return err
+	}
 	return nil
 }
 
