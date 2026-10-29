@@ -58,7 +58,7 @@ func TestInviteRoundTripKeepsInodeModeAndBak(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := configInode(t, path)
-	code, err := Invite(path, "acme", "office-gw", "https://enroll.example.org", false)
+	code, err := Invite(path, "acme", "office-gw", "https://enroll.example.org", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestInviteThroughSymlinkSharesLock(t *testing.T) {
 	t.Cleanup(func() { afterTruncate = nil })
 	inviteErr := make(chan error, 1)
 	go func() {
-		_, err := Invite(link, "acme", "", "https://enroll.example.org", false)
+		_, err := Invite(link, "acme", "", "https://enroll.example.org", "", false)
 		inviteErr <- err
 	}()
 	<-started
@@ -156,7 +156,7 @@ func TestInviteThroughSymlinkSharesLock(t *testing.T) {
 	}
 	second := make(chan error, 1)
 	go func() {
-		_, err := Invite(path, "acme", "", "https://enroll.example.org", false)
+		_, err := Invite(path, "acme", "", "https://enroll.example.org", "", false)
 		second <- err
 	}()
 	readDone := make(chan error, 1)
@@ -300,7 +300,7 @@ func TestTwentyInvitesKeepEveryHash(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			if _, err := Invite(path, "acme", "", "https://enroll.example.org", false); err != nil {
+			if _, err := Invite(path, "acme", "", "https://enroll.example.org", "", false); err != nil {
 				mu.Lock()
 				if first == nil {
 					first = err
@@ -340,7 +340,7 @@ func TestConcurrentRevokeDoesNotResurrect(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				<-start
-				if _, err := Invite(path, "acme", "", "https://enroll.example.org", false); err != nil {
+				if _, err := Invite(path, "acme", "", "https://enroll.example.org", "", false); err != nil {
 					errCh <- err
 				}
 			}()
