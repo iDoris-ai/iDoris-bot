@@ -410,6 +410,10 @@ func (d *deps) setupCmd(args []string) error {
 	}, paths, token, cfg.EnrollURL, insecure, *noService, *yes, *replace)
 }
 
+// readPlanHandoff stats the plan file the unprivileged wizard wrote.
+// Tests replace it. The real function does not follow a symlink.
+var readPlanHandoff = gateway.ReadPlanHandoff
+
 func (d *deps) applyCmd(args []string) error {
 	fs := flag.NewFlagSet("gateway apply", flag.ContinueOnError)
 	fs.SetOutput(d.stderr)
@@ -421,6 +425,12 @@ func (d *deps) applyCmd(args []string) error {
 	}
 	if *planPath == "" {
 		return errors.New("gateway apply: --plan is required")
+	}
+	// Root only enables forwarding. The user's config, token and plan were
+	// written before sudo, and this process must not rewrite them or demand
+	// that the user's directory be root-owned.
+	if d.host.IsRoot() {
+		return d.applyPrivileged(*planPath)
 	}
 	raw, err := d.host.ReadFile(*planPath)
 	if err != nil {
@@ -444,6 +454,47 @@ func (d *deps) applyCmd(args []string) error {
 	})
 	if err != nil {
 		return err
+	}
+	d.printResult(res)
+	return nil
+}
+
+// applyPrivileged is `sudo idoris-vpnd gateway apply`. It checks the plan file
+// the unprivileged wizard wrote, then enables forwarding when the plan needs
+// it. It does not install the service or write under the user's directory.
+func (d *deps) applyPrivileged(planPath string) error {
+	h, err := readPlanHandoff(planPath)
+	if err != nil {
+		return err
+	}
+	if err := gateway.CheckPlanHandoff(h); err != nil {
+		return err
+	}
+	raw, err := d.host.ReadFile(planPath)
+	if err != nil {
+		return err
+	}
+	plan, err := gateway.LoadPlan(bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	if plan.TokenFile != "" {
+		if b, err := d.host.ReadFile(plan.TokenFile); err == nil {
+			token := strings.TrimSpace(string(b))
+			if token != "" && bytes.Contains(raw, []byte(token)) {
+				return errors.New("gateway apply: refusing a plan file that contains the enrollment token")
+			}
+		}
+	}
+	res := gateway.ApplyResult{ConfigPath: plan.ConfigPath, PlanPath: planPath, TokenFile: plan.TokenFile}
+	if gateway.PlanEnablesForward(plan) {
+		if d.host.GOOS() != "linux" {
+			return errors.New("gateway: refusing to enable forwarding on a non-Linux host")
+		}
+		if err := d.host.EnableIPForward(gateway.IPForwardConf, gateway.IPForwardBody); err != nil {
+			return err
+		}
+		res.IPForwardApplied = true
 	}
 	d.printResult(res)
 	return nil
