@@ -73,7 +73,7 @@ func sidFromWhoami(out string) string {
 // ApplyOwnerDACL runs /reset, /inheritance:r, /grant:r, then reads the ACL
 // back. It stops at the first failure, so a denied /inheritance:r does not
 // continue to /grant.
-func ApplyOwnerDACL(path string, directory bool, sid string, run CommandRunner) error {
+func ApplyOwnerDACL(path string, directory bool, sid string, run CommandRunner, read ACLReader) error {
 	if !validSID(sid) {
 		return fmt.Errorf("fsutil: owner SID %q is not usable", sid)
 	}
@@ -86,120 +86,123 @@ func ApplyOwnerDACL(path string, directory bool, sid string, run CommandRunner) 
 			return fmt.Errorf("fsutil: %s: %w: %s", strings.Join(argv, " "), err, strings.TrimSpace(string(out)))
 		}
 	}
-	out, err := run("icacls", path)
+	if read == nil {
+		return errors.New("fsutil: ACL reader is not set")
+	}
+	view, err := read.ReadACL(path)
 	if err != nil {
-		return fmt.Errorf("fsutil: icacls %s: %w: %s", path, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("fsutil: read DACL %s: %w", path, err)
 	}
-	return VerifyWindowsACL(string(out), sid)
+	if err := VerifyOwnerDACL(view, []string{sid}); err != nil {
+		return fmt.Errorf("fsutil: %s: %w", path, err)
+	}
+	return nil
 }
 
-// VerifyWindowsACL accepts icacls query output when every ACE is the owner
-// SID, SYSTEM, or Administrators, and the result is still private to that
-// set. Users, Everyone, and Authenticated Users are rejected. The owner SID
-// must be present, unless the ACL is exactly SYSTEM and Administrators.
-func VerifyWindowsACL(out, ownerSID string) error {
-	if !validSID(ownerSID) {
-		return fmt.Errorf("fsutil: owner SID %q is not usable", ownerSID)
-	}
-	sawOwner := false
-	sawSystem := false
-	sawAdmin := false
-	aces := 0
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimRight(line, "\r")
-		i := strings.Index(line, ":(")
-		if i < 0 {
-			// icacls also prints "SID:F" without parentheses.
-			i = strings.Index(line, ":F")
-			if i < 0 {
-				i = strings.Index(line, ":R")
-			}
-		}
-		if i < 0 {
-			continue
-		}
-		principal := principalOfACE(line[:i])
-		if principal == "" {
-			continue
-		}
-		aces++
-		switch aceClass(principal, ownerSID) {
-		case "owner":
-			sawOwner = true
-		case "system":
-			sawSystem = true
-		case "administrators":
-			sawAdmin = true
-		default:
-			return fmt.Errorf("fsutil: directory ACL allows %s", principal)
-		}
-	}
-	if aces == 0 {
-		return errors.New("fsutil: directory ACL is empty")
-	}
-	if sawOwner || (sawSystem && sawAdmin) {
-		return nil
-	}
-	return errors.New("fsutil: directory ACL does not grant the owner")
+// SIDLocalSystem is NT AUTHORITY\SYSTEM. SIDAdministrators is
+// BUILTIN\Administrators. Callers compare these strings; account names are
+// not part of the check.
+const (
+	SIDLocalSystem    = "S-1-5-18"
+	SIDAdministrators = "S-1-5-32-544"
+)
+
+// ACE is one DACL entry. SID is the trustee. Inherited is the INHERITED_ACE
+// flag (the entry came from a parent), which is distinct from an inherit-down
+// flag such as OBJECT_INHERIT. Deny is an access-denied entry. Unrecognized
+// is an ACE type whose SID is not at the standard offset.
+type ACE struct {
+	SID          string
+	Inherited    bool
+	Deny         bool
+	Unrecognized bool
 }
 
-func principalOfACE(left string) string {
-	left = strings.TrimSpace(left)
-	known := []string{
-		`NT AUTHORITY\Authenticated Users`,
-		`NT AUTHORITY\SYSTEM`,
-		`BUILTIN\Administrators`,
-		`BUILTIN\Users`,
-		`*S-1-5-32-544`,
-		`*S-1-5-32-545`,
-		`*S-1-5-18`,
-		`*S-1-5-11`,
-		`*S-1-1-0`,
-		`S-1-5-32-544`,
-		`S-1-5-32-545`,
-		`S-1-5-18`,
-		`S-1-5-11`,
-		`S-1-1-0`,
-		`Administrators`,
-		`Everyone`,
-		`SYSTEM`,
-		`Users`,
-	}
-	upper := strings.ToUpper(left)
-	best := ""
-	for _, c := range known {
-		if strings.HasSuffix(upper, strings.ToUpper(c)) && len(c) > len(best) {
-			best = c
-		}
-	}
-	if best != "" {
-		return best
-	}
-	fields := strings.Fields(left)
-	if len(fields) == 0 {
-		return left
-	}
-	return fields[len(fields)-1]
+// ACLView is the owner and the DACL of one object, both as SIDs. A resolved
+// or localised account name is not stored and cannot affect the comparison.
+type ACLView struct {
+	OwnerSID string
+	ACEs     []ACE
 }
 
-func aceClass(principal, ownerSID string) string {
-	p := strings.TrimPrefix(principal, "*")
-	switch strings.ToUpper(p) {
-	case `NT AUTHORITY\SYSTEM`, `SYSTEM`, `S-1-5-18`:
-		return "system"
-	case `BUILTIN\ADMINISTRATORS`, `ADMINISTRATORS`, `S-1-5-32-544`:
-		return "administrators"
+// ACLReader reads a DACL as SIDs. The Windows implementation uses
+// GetNamedSecurityInfo and GetAce. Tests pass a fake.
+type ACLReader interface {
+	ReadACL(path string) (ACLView, error)
+}
+
+// windowsDACLReader is the production reader. The Windows file sets it.
+var windowsDACLReader ACLReader
+
+// ReadACL reads path with the production Windows reader.
+func ReadACL(path string) (ACLView, error) {
+	if windowsDACLReader == nil {
+		return ACLView{}, errors.New("fsutil: Windows ACL reader is not available")
 	}
-	if strings.EqualFold(p, ownerSID) || strings.EqualFold(principal, "*"+ownerSID) {
-		return "owner"
+	return windowsDACLReader.ReadACL(path)
+}
+
+// VerifyOwnerDACL accepts view when every ACE is an explicit allow for a SID
+// in allowed, every allowed SID is present, and the owner is SYSTEM or one of
+// the granted SIDs. allowed is the set the writer granted: the current user,
+// plus SYSTEM and Administrators only when that writer grants them.
+//
+// A process running as SYSTEM grants only S-1-5-18. That owner is accepted
+// without an Administrators ACE. An owner of S-1-5-32-544 is also accepted:
+// Windows assigns the Administrators group as the owner of an object created
+// by an elevated administrator, and the DACL is still required to be exactly
+// allowed. Any other owner, an inherited ACE, a deny ACE, or a SID outside
+// allowed is rejected. Display names are not an input.
+func VerifyOwnerDACL(view ACLView, allowed []string) error {
+	if len(allowed) == 0 {
+		return errors.New("fsutil: allowed SID set is empty")
 	}
-	return ""
+	seen := make(map[string]bool, len(allowed))
+	for _, sid := range allowed {
+		if !validSID(sid) {
+			return fmt.Errorf("fsutil: allowed SID %q is not usable", sid)
+		}
+		seen[sid] = false
+	}
+	if !validSID(view.OwnerSID) {
+		return fmt.Errorf("fsutil: owner SID %q is not usable", view.OwnerSID)
+	}
+	if view.OwnerSID != SIDLocalSystem && view.OwnerSID != SIDAdministrators {
+		if _, ok := seen[view.OwnerSID]; !ok {
+			return fmt.Errorf("fsutil: owner %s is not in the granted set", view.OwnerSID)
+		}
+	}
+	if len(view.ACEs) == 0 {
+		return errors.New("fsutil: DACL is empty")
+	}
+	for _, ace := range view.ACEs {
+		switch {
+		case ace.Unrecognized:
+			return errors.New("fsutil: DACL has an unrecognized ACE")
+		case !validSID(ace.SID):
+			return fmt.Errorf("fsutil: ACE SID %q is not usable", ace.SID)
+		case ace.Inherited:
+			return fmt.Errorf("fsutil: inherited ACE for %s", ace.SID)
+		case ace.Deny:
+			return fmt.Errorf("fsutil: deny ACE for %s", ace.SID)
+		}
+		if _, ok := seen[ace.SID]; !ok {
+			return fmt.Errorf("fsutil: DACL allows %s", ace.SID)
+		}
+		seen[ace.SID] = true
+	}
+	for sid, ok := range seen {
+		if !ok {
+			return fmt.Errorf("fsutil: DACL is missing %s", sid)
+		}
+	}
+	return nil
 }
 
 // ProtectPrivateDir sets a restrictive DACL on a directory this call created.
 // An existing directory is only queried: a loose ACL is an error, and this
 // function does not rewrite somebody else's directory.
-func ProtectPrivateDir(dir string, created bool, sid string, run CommandRunner) error {
+func ProtectPrivateDir(dir string, created bool, sid string, run CommandRunner, read ACLReader) error {
 	if !validSID(sid) {
 		return fmt.Errorf("fsutil: owner SID %q is not usable", sid)
 	}
@@ -207,23 +210,26 @@ func ProtectPrivateDir(dir string, created bool, sid string, run CommandRunner) 
 		return errors.New("fsutil: ACL runner is not set")
 	}
 	if !created {
-		out, err := run("icacls", dir)
-		if err != nil {
-			return fmt.Errorf("fsutil: icacls %s: %w: %s", dir, err, strings.TrimSpace(string(out)))
+		if read == nil {
+			return errors.New("fsutil: ACL reader is not set")
 		}
-		if err := VerifyWindowsACL(string(out), sid); err != nil {
+		view, err := read.ReadACL(dir)
+		if err != nil {
+			return fmt.Errorf("fsutil: read DACL %s: %w", dir, err)
+		}
+		if err := VerifyOwnerDACL(view, []string{sid}); err != nil {
 			return fmt.Errorf("fsutil: %s: %w", dir, err)
 		}
 		return nil
 	}
-	return ApplyOwnerDACL(dir, true, sid, run)
+	return ApplyOwnerDACL(dir, true, sid, run, read)
 }
 
 // WriteSecretAfterDACL applies the file DACL and only then calls write.
 // write is not called when icacls fails, so a secret byte is never stored
 // under the inherited ACL.
-func WriteSecretAfterDACL(path string, data []byte, sid string, run CommandRunner, write func(path string, data []byte) error) error {
-	if err := ApplyOwnerDACL(path, false, sid, run); err != nil {
+func WriteSecretAfterDACL(path string, data []byte, sid string, run CommandRunner, read ACLReader, write func(path string, data []byte) error) error {
+	if err := ApplyOwnerDACL(path, false, sid, run, read); err != nil {
 		return err
 	}
 	if write == nil {

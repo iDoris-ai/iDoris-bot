@@ -25,7 +25,7 @@ func protectSecretBeforeWrite(path string) error {
 	if err != nil {
 		return err
 	}
-	return ApplyOwnerDACL(path, false, sid, defaultCommandRunner)
+	return ApplyOwnerDACL(path, false, sid, defaultCommandRunner, windowsDACLReader)
 }
 
 func protectPrivateDir(dir string, created bool) error {
@@ -33,5 +33,5 @@ func protectPrivateDir(dir string, created bool) error {
 	if err != nil {
 		return err
 	}
-	return ProtectPrivateDir(dir, created, sid, defaultCommandRunner)
+	return ProtectPrivateDir(dir, created, sid, defaultCommandRunner, windowsDACLReader)
 }
