@@ -71,7 +71,59 @@ func testServer(t *testing.T, idle time.Duration) (*Server, *http.Client, *appli
 	if err != nil {
 		t.Fatal(err)
 	}
-	return srv, &http.Client{Jar: jar, Timeout: 2 * time.Second}, got
+	return srv, &http.Client{
+		Jar:       jar,
+		Timeout:   2 * time.Second,
+		Transport: r3w1DenySetCookie{base: http.DefaultTransport, t: t},
+	}, got
+}
+
+// r3w1DenySetCookie fails the test if any response tries to set a cookie.
+type r3w1DenySetCookie struct {
+	base http.RoundTripper
+	t    *testing.T
+}
+
+func (d r3w1DenySetCookie) RoundTrip(req *http.Request) (*http.Response, error) {
+	res, err := d.base.RoundTrip(req)
+	if err != nil {
+		return res, err
+	}
+	if v := res.Header.Values("Set-Cookie"); len(v) != 0 {
+		d.t.Errorf("Set-Cookie from %s %s: %v", req.Method, req.URL.Path, v)
+	}
+	return res, nil
+}
+
+func r3w1Bootstrap(t *testing.T, srv *Server, client *http.Client) (capability, csrf string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, srv.url()+"/api/bootstrap", strings.NewReader(`{"k":"`+srv.secret+`"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://"+srv.bound)
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	res, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	raw, _ := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("bootstrap %d %s", res.StatusCode, raw)
+	}
+	var out struct {
+		Capability string `json:"capability"`
+		CSRF       string `json:"csrf"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("bootstrap json %s", raw)
+	}
+	if out.Capability == "" || out.CSRF == "" || out.Capability == srv.secret {
+		t.Fatalf("bootstrap body %s", raw)
+	}
+	return out.Capability, out.CSRF
 }
 
 func (s *Server) url() string { return "http://" + s.bound }
@@ -80,17 +132,17 @@ func TestPageRequiresHostSecretAndCSRF(t *testing.T) {
 	srv, client, _ := testServer(t, time.Minute)
 	base := srv.url()
 
-	res, err := client.Get(base + "/")
+	res, err := client.Get(base + "/api/status")
 	if err != nil {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(res.Body)
 	_ = res.Body.Close()
 	if res.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("no secret: %d %s", res.StatusCode, body)
+		t.Fatalf("no capability: %d %s", res.StatusCode, body)
 	}
 
-	req, _ := http.NewRequest(http.MethodGet, base+"/?k="+srv.secret, nil)
+	req, _ := http.NewRequest(http.MethodGet, base+"/", nil)
 	req.Host = "evil.example"
 	res, err = client.Do(req)
 	if err != nil {
@@ -117,17 +169,20 @@ func TestPageRequiresHostSecretAndCSRF(t *testing.T) {
 		t.Fatal(res.Header.Get("Referrer-Policy"))
 	}
 	html := string(page)
-	for _, want := range []string{"这台机器就是 Local AI 吗？", "识别网络", "使用建议", "启用", "csrf-token", srv.csrf} {
+	for _, want := range []string{"这台机器就是 Local AI 吗？", "识别网络", "使用建议", "启用"} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("page missing %q", want)
 		}
 	}
-	if strings.Contains(html, "http://") || strings.Contains(html, "https://") || strings.Contains(html, srv.secret) {
-		t.Fatal("page has an external URL or the secret")
+	if strings.Contains(html, "http://") || strings.Contains(html, "https://") || strings.Contains(html, srv.secret) || strings.Contains(html, srv.csrf) || strings.Contains(html, "csrf-token") {
+		t.Fatal("page has an external URL or a secret")
 	}
-	cookie := res.Header.Get("Set-Cookie")
-	if !strings.Contains(cookie, "idoris_ui=") || !strings.Contains(cookie, "HttpOnly") || !strings.Contains(cookie, "SameSite=Strict") {
-		t.Fatalf("cookie %q", cookie)
+	if res.Header.Get("Set-Cookie") != "" {
+		t.Fatalf("cookie %q", res.Header.Get("Set-Cookie"))
+	}
+	cap, csrf := r3w1Bootstrap(t, srv, client)
+	if csrf != srv.csrf {
+		t.Fatalf("csrf %q", csrf)
 	}
 
 	res, err = client.Get(base + "/app.js")
@@ -165,6 +220,7 @@ func TestPageRequiresHostSecretAndCSRF(t *testing.T) {
 		if csrf != "" {
 			req.Header.Set("X-CSRF-Token", csrf)
 		}
+		req.Header.Set(SessionHeader, cap)
 		res, err := client.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -209,12 +265,7 @@ func TestPageRequiresHostSecretAndCSRF(t *testing.T) {
 func TestJoinPlanAndApplyHideTheToken(t *testing.T) {
 	srv, client, got := testServer(t, time.Minute)
 	base := srv.url()
-	res, err := client.Get(base + "/?k=" + srv.secret)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _ = io.ReadAll(res.Body)
-	_ = res.Body.Close()
+	cap, _ := r3w1Bootstrap(t, srv, client)
 
 	code, err := join.Encode(join.Payload{
 		V: 1, EnrollURL: "https://enroll.example.org", Token: uiToken, Role: join.RoleGateway, Tenant: "acme", HostnameHint: "office-gw",
@@ -233,6 +284,7 @@ func TestJoinPlanAndApplyHideTheToken(t *testing.T) {
 		req.Header.Set("Origin", "http://"+srv.bound)
 		req.Header.Set("Sec-Fetch-Site", "same-origin")
 		req.Header.Set("X-CSRF-Token", srv.csrf)
+		req.Header.Set(SessionHeader, cap)
 		res, err := client.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -265,7 +317,8 @@ func TestJoinPlanAndApplyHideTheToken(t *testing.T) {
 		t.Fatalf("apply saw %+v routes %v", got.opt.Token == uiToken, got.plan.Routes)
 	}
 	req, _ := http.NewRequest(http.MethodGet, base+"/api/status", nil)
-	res, err = client.Do(req)
+	req.Header.Set(SessionHeader, cap)
+	res, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,29 +328,33 @@ func TestJoinPlanAndApplyHideTheToken(t *testing.T) {
 		t.Fatalf("status %d %s", res.StatusCode, b)
 	}
 
-	// Header secret works without the cookie.
-	bare := &http.Client{Timeout: 2 * time.Second}
-	req, _ = http.NewRequest(http.MethodGet, base+"/app.js", nil)
-	req.Header.Set(secretHeader, srv.secret)
+	// The session header works with no cookie jar.
+	bare := &http.Client{Timeout: 2 * time.Second, Transport: r3w1DenySetCookie{base: http.DefaultTransport, t: t}}
+	req, _ = http.NewRequest(http.MethodGet, base+"/api/status", nil)
+	req.Header.Set(SessionHeader, cap)
 	res, err = bare.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		t.Fatalf("header secret %d", res.StatusCode)
+		t.Fatalf("header capability %d", res.StatusCode)
+	}
+	req, _ = http.NewRequest(http.MethodGet, base+"/api/status?k="+srv.secret, nil)
+	res, err = bare.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = res.Body.Close()
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("query secret still authorizes: %d", res.StatusCode)
 	}
 }
 
 func TestLocalAIPlanHasNoRoute(t *testing.T) {
 	srv, client, _ := testServer(t, time.Minute)
 	base := srv.url()
-	res, err := client.Get(base + "/?k=" + srv.secret)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _ = io.ReadAll(res.Body)
-	_ = res.Body.Close()
+	cap, _ := r3w1Bootstrap(t, srv, client)
 	code, err := join.Encode(join.Payload{
 		V: 1, EnrollURL: "https://enroll.example.org", Token: uiToken, Role: join.RoleMember, Tenant: "acme",
 	}, join.Options{})
@@ -309,7 +366,8 @@ func TestLocalAIPlanHasNoRoute(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "http://"+srv.bound)
 	req.Header.Set("X-CSRF-Token", srv.csrf)
-	res, err = client.Do(req)
+	req.Header.Set(SessionHeader, cap)
+	res, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,6 +378,7 @@ func TestLocalAIPlanHasNoRoute(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "http://"+srv.bound)
 	req.Header.Set("X-CSRF-Token", srv.csrf)
+	req.Header.Set(SessionHeader, cap)
 	res, err = client.Do(req)
 	if err != nil {
 		t.Fatal(err)
