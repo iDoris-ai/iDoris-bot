@@ -64,7 +64,7 @@ func TestPlanNarrowRouteAndApproval(t *testing.T) {
 	if p.WillAutoApprove || !p.NeedsAdminApproval {
 		t.Fatalf("expected admin approval: %+v", p)
 	}
-	want := "headscale nodes approve-routes --identifier office-gw --routes 10.251.73.10/32"
+	want := "headscale nodes approve-routes --identifier <ID> --routes 10.251.73.10/32  # <ID> is the numeric id of office-gw from `headscale nodes list`"
 	if p.AdminCommand != want {
 		t.Fatalf("command %q", p.AdminCommand)
 	}
