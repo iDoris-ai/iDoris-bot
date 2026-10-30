@@ -16,11 +16,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/headscale"
+	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/join"
 )
 
 // Tenant is one organisation served by the Headscale instance. It maps to a
@@ -33,6 +35,13 @@ type Tenant struct {
 	TokenHashes []string `json:"token_hashes"`
 	// ACLTags are applied to nodes enrolled with this tenant (optional).
 	ACLTags []string `json:"acl_tags,omitempty"`
+	// Role is the join-code role minted for this entry: member, local-ai,
+	// gateway, or admin. Empty means member when an invite is issued.
+	Role string `json:"role,omitempty"`
+	// LANCIDRs is the list of prefixes the organisation has pre-approved for
+	// subnet routers. It must match autoApprovers.routes on the Headscale
+	// policy. Discover returns it; this service never approves a route itself.
+	LANCIDRs []string `json:"lan_cidrs,omitempty"`
 	// PreAuthTTL bounds the validity of each minted key. Zero means 10 minutes.
 	PreAuthTTL Duration `json:"preauth_ttl,omitempty"`
 	// Ephemeral marks enrolled nodes as ephemeral (removed when offline).
@@ -100,6 +109,18 @@ func (c *Config) Validate() error {
 		if time.Duration(t.PreAuthTTL) > time.Hour {
 			return fmt.Errorf("tenant %q: preauth_ttl must be <= 1h", t.Name)
 		}
+		if t.Role != "" && !join.ValidRole(t.Role) {
+			return fmt.Errorf("tenant %q: role %q is not member, local-ai, gateway, or admin", t.Name, t.Role)
+		}
+		for _, cidr := range t.LANCIDRs {
+			p, err := netip.ParsePrefix(cidr)
+			if err != nil {
+				return fmt.Errorf("tenant %q: lan_cidrs %q: %w", t.Name, cidr, err)
+			}
+			if p.Masked() != p {
+				return fmt.Errorf("tenant %q: lan_cidrs %q has host bits set", t.Name, cidr)
+			}
+		}
 	}
 	return nil
 }
@@ -122,9 +143,13 @@ type Response struct {
 
 // Discovery tells a daemon which control server its tenant uses, without
 // minting a key. Daemons call it at startup when control_url is not pinned.
+// Role and LANCIDRs describe the pre-approved gateway plan. They are empty
+// when the operator has not set them. Discover never mints a key.
 type Discovery struct {
-	ControlURL string `json:"control_url"`
-	Tenant     string `json:"tenant"`
+	ControlURL string   `json:"control_url"`
+	Tenant     string   `json:"tenant"`
+	Role       string   `json:"role,omitempty"`
+	LANCIDRs   []string `json:"lan_cidrs,omitempty"`
 }
 
 // Minter is the subset of the Headscale client the server needs.
@@ -189,11 +214,23 @@ func NewToken() (string, error) {
 	return "idv1_" + hex.EncodeToString(b), nil
 }
 
-// lookup finds the tenant owning token in constant time with respect to which
-// tenant/hash matched. It always walks every hash.
-func (s *Server) lookup(token string) *Tenant {
+// Reload swaps in cfg after Validate. A failed validation leaves the previous
+// config serving. Rate-limit buckets are kept so a reload cannot reset them.
+func (s *Server) Reload(cfg Config) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.cfg = cfg
+	s.mu.Unlock()
+	return nil
+}
+
+// lookupLocked finds the tenant owning token. The caller holds s.mu. It always
+// walks every hash so the match does not leak which entry succeeded.
+func (s *Server) lookupLocked(token string) (Tenant, bool) {
 	want := sha256.Sum256([]byte(token))
-	var found *Tenant
+	found := -1
 	for i := range s.cfg.Tenants {
 		t := &s.cfg.Tenants[i]
 		for _, h := range t.TokenHashes {
@@ -201,12 +238,28 @@ func (s *Server) lookup(token string) *Tenant {
 			if err != nil || len(b) != sha256.Size {
 				continue
 			}
-			if subtle.ConstantTimeCompare(b, want[:]) == 1 && found == nil {
-				found = t
+			if subtle.ConstantTimeCompare(b, want[:]) == 1 && found < 0 {
+				found = i
 			}
 		}
 	}
-	return found
+	if found < 0 {
+		return Tenant{}, false
+	}
+	return cloneTenant(s.cfg.Tenants[found]), true
+}
+
+func cloneTenant(t Tenant) Tenant {
+	t.TokenHashes = append([]string(nil), t.TokenHashes...)
+	t.ACLTags = append([]string(nil), t.ACLTags...)
+	t.LANCIDRs = append([]string(nil), t.LANCIDRs...)
+	return t
+}
+
+func (s *Server) controlURL() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cfg.ControlURL
 }
 
 func (s *Server) allow(t *Tenant) bool {
@@ -242,33 +295,41 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 // authenticate resolves the bearer token to a tenant or writes a 401.
-func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) *Tenant {
+// The returned tenant is a copy, safe to use after a concurrent Reload.
+func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (Tenant, bool) {
 	auth := r.Header.Get("Authorization")
 	const prefix = "Bearer "
 	if !strings.HasPrefix(auth, prefix) || len(auth) <= len(prefix) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing bearer token"})
-		return nil
+		return Tenant{}, false
 	}
-	tenant := s.lookup(strings.TrimSpace(auth[len(prefix):]))
-	if tenant == nil {
+	s.mu.Lock()
+	tenant, ok := s.lookupLocked(strings.TrimSpace(auth[len(prefix):]))
+	s.mu.Unlock()
+	if !ok {
 		s.log.Warn("rejected: unknown token", "path", r.URL.Path, "remote", r.RemoteAddr)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid token"})
-		return nil
+		return Tenant{}, false
 	}
-	return tenant
+	return tenant, true
 }
 
 func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
-	tenant := s.authenticate(w, r)
-	if tenant == nil {
+	tenant, ok := s.authenticate(w, r)
+	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, Discovery{ControlURL: s.cfg.ControlURL, Tenant: tenant.Name})
+	writeJSON(w, http.StatusOK, Discovery{
+		ControlURL: s.controlURL(),
+		Tenant:     tenant.Name,
+		Role:       tenant.Role,
+		LANCIDRs:   tenant.LANCIDRs,
+	})
 }
 
 func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
-	tenant := s.authenticate(w, r)
-	if tenant == nil {
+	tenant, ok := s.authenticate(w, r)
+	if !ok {
 		return
 	}
 	var req Request
@@ -276,7 +337,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
 		return
 	}
-	if !s.allow(tenant) {
+	if !s.allow(&tenant) {
 		s.log.Warn("enroll rate limited", "tenant", tenant.Name, "remote", r.RemoteAddr)
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limited"})
 		return
@@ -302,7 +363,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 	s.log.Info("enrolled", "tenant", tenant.Name, "hostname", req.Hostname, "os", req.OS, "key_id", key.ID, "expires_at", exp.UTC().Format(time.RFC3339))
 	writeJSON(w, http.StatusOK, Response{
-		ControlURL: s.cfg.ControlURL,
+		ControlURL: s.controlURL(),
 		AuthKey:    key.Key,
 		ExpiresAt:  exp.UTC(),
 		Tenant:     tenant.Name,

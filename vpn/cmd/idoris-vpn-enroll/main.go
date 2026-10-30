@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -29,9 +30,15 @@ func usage() {
 Usage:
   idoris-vpn-enroll serve  --config FILE [--listen 127.0.0.1:8787]
   idoris-vpn-enroll token  new                        print a new token and its hash
+  idoris-vpn-enroll invite --config FILE --entry NAME --enroll-url URL [--hostname-hint H] [--allow-insecure]
+  idoris-vpn-enroll revoke --config FILE --entry NAME --hash-prefix HEX
   idoris-vpn-enroll tenant ensure --config FILE --name NAME   create the Headscale user, print its id
   idoris-vpn-enroll check  --config FILE              verify config and Headscale reachability
   idoris-vpn-enroll version
+
+serve reloads the config on SIGHUP. An invalid file keeps the previous config.
+invite prints one join code to stdout and nothing else. The code contains the
+token; it is not written to the config file or the log.
 
 The Headscale API key is read from HEADSCALE_API_KEY or headscale_api_key_file.
 `, version.Version)
@@ -48,6 +55,10 @@ func main() {
 		err = serveCmd(os.Args[2:])
 	case "token":
 		err = tokenCmd(os.Args[2:])
+	case "invite":
+		err = inviteCmd(os.Args[2:], os.Stdout)
+	case "revoke":
+		err = revokeCmd(os.Args[2:], os.Stdout)
 	case "tenant":
 		err = tenantCmd(os.Args[2:])
 	case "check":
@@ -70,7 +81,7 @@ func loadConfig(path string) (*enroll.Config, error) {
 	if path == "" {
 		return nil, errors.New("--config is required")
 	}
-	b, err := os.ReadFile(path)
+	b, err := enroll.ReadFileLocked(path)
 	if err != nil {
 		return nil, err
 	}
@@ -141,6 +152,18 @@ func serveCmd(args []string) error {
 	hsrv := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	hup := make(chan os.Signal, 1)
+	notifyReload(hup)
+	defer signal.Stop(hup)
+	go func() {
+		for range hup {
+			if err := reloadFromDisk(srv, *configPath); err != nil {
+				log.Error("config reload rejected; keeping the previous config", "err", err)
+				continue
+			}
+			log.Info("config reloaded")
+		}
+	}()
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -152,6 +175,56 @@ func serveCmd(args []string) error {
 		return err
 	}
 	return nil
+}
+
+// reloadFromDisk reads the file again, reapplies environment overrides, and
+// swaps the server only when the result validates.
+func reloadFromDisk(srv *enroll.Server, path string) error {
+	cfg, err := loadConfig(path)
+	if err != nil {
+		return err
+	}
+	return srv.Reload(*cfg)
+}
+
+func inviteCmd(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("invite", flag.ContinueOnError)
+	configPath := fs.String("config", "", "JSON config")
+	entry := fs.String("entry", "", "tenant entry name")
+	hint := fs.String("hostname-hint", "", "optional hostname stored in the join code")
+	enrollURL := fs.String("enroll-url", "", "enrollment service URL stored in the join code")
+	allow := fs.Bool("allow-insecure", false, "allow an http:// enroll URL (labs only)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *entry == "" || *enrollURL == "" {
+		return errors.New("--entry and --enroll-url are required")
+	}
+	code, err := enroll.Invite(*configPath, *entry, *hint, *enrollURL, *allow)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(stdout, code)
+	return err
+}
+
+func revokeCmd(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("revoke", flag.ContinueOnError)
+	configPath := fs.String("config", "", "JSON config")
+	entry := fs.String("entry", "", "tenant entry name")
+	prefix := fs.String("hash-prefix", "", "hex prefix of the token hash to remove")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *entry == "" || *prefix == "" {
+		return errors.New("--entry and --hash-prefix are required")
+	}
+	removed, err := enroll.Revoke(*configPath, *entry, *prefix)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(stdout, "revoked %s %s\n", *entry, removed)
+	return err
 }
 
 func tokenCmd(args []string) error {
