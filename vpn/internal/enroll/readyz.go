@@ -14,6 +14,14 @@ import (
 // reports a warning. Exactly this far away is not a warning.
 const apiKeyWarnBefore = 30 * 24 * time.Hour
 
+// readyCacheTTL is how long a /readyz result, success or failure, is reused.
+// readyMaxWaiters is how many requests may block on the single in-flight
+// refresh. Further requests do not start another Headscale call.
+const (
+	readyCacheTTL   = 10 * time.Second
+	readyMaxWaiters = 32
+)
+
 // ControlProbe is the expiry of the Headscale API key, when the server said.
 type ControlProbe struct {
 	ExpiresAt time.Time
@@ -57,15 +65,66 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	body, code := s.cachedReady(p)
+	writeJSON(w, code, body)
+}
+
+// cachedReady returns the cached probe when it is younger than readyCacheTTL.
+// A stale or missing result starts one refresh; other callers wait for that
+// refresh instead of calling Headscale again. Past readyMaxWaiters, a caller
+// does not join the queue and does not start a probe.
+func (s *Server) cachedReady(p ControlProber) (readyBody, int) {
+	s.readyMu.Lock()
+	now := s.now()
+	if s.readyHave && now.Before(s.readyExp) {
+		body, code := s.readyBody, s.readyCode
+		s.readyMu.Unlock()
+		return body, code
+	}
+	if s.readyFlight != nil {
+		if s.readyWaiters >= readyMaxWaiters {
+			body, code, have := s.readyBody, s.readyCode, s.readyHave
+			s.readyMu.Unlock()
+			if have {
+				return body, code
+			}
+			return readyBody{Status: "unavailable", Headscale: "unreachable"}, http.StatusServiceUnavailable
+		}
+		ch := s.readyFlight
+		s.readyWaiters++
+		s.readyMu.Unlock()
+		<-ch
+		s.readyMu.Lock()
+		s.readyWaiters--
+		body, code, have := s.readyBody, s.readyCode, s.readyHave
+		s.readyMu.Unlock()
+		if !have {
+			return readyBody{Status: "unavailable", Headscale: "unreachable"}, http.StatusServiceUnavailable
+		}
+		return body, code
+	}
+	ch := make(chan struct{})
+	s.readyFlight = ch
+	s.readyMu.Unlock()
+
+	body, code := s.runReadyProbe(p)
+	s.readyMu.Lock()
+	s.readyBody = body
+	s.readyCode = code
+	s.readyHave = true
+	s.readyExp = s.now().Add(readyCacheTTL)
+	s.readyFlight = nil
+	close(ch)
+	s.readyMu.Unlock()
+	return body, code
+}
+
+func (s *Server) runReadyProbe(p ControlProber) (readyBody, int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	probe, err := p.ProbeControl(ctx)
 	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, readyBody{
-			Status:    "unavailable",
-			Headscale: readyFailure(err),
-		})
-		return
+		return readyBody{Status: "unavailable", Headscale: readyFailure(err)}, http.StatusServiceUnavailable
 	}
 	body := readyBody{Status: "ok", Headscale: "ok"}
 	code := http.StatusOK
@@ -82,7 +141,7 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 			body.Warning = "api key expires in less than 30 days"
 		}
 	}
-	writeJSON(w, code, body)
+	return body, code
 }
 
 // readyFailure is a fixed phrase. Probe errors can carry upstream bodies, and
