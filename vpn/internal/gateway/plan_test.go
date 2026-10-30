@@ -506,7 +506,7 @@ func TestR3W2MemberAndAdminSOCKS(t *testing.T) {
 			t.Fatalf("%s config %s", role, cfg)
 		}
 		text := strings.Join(res.AccessInfo, "\n")
-		if !strings.Contains(text, "127.0.0.1:1080") || !strings.Contains(text, "/home/acme/.idoris/vpn-state/socks5.auth") || !strings.Contains(text, "laptop.idoris.internal") {
+		if !strings.Contains(text, "127.0.0.1:1080") || !strings.Contains(text, "/home/acme/.idoris/vpn-state/socks5.auth") || !strings.Contains(text, "<local-ai-hostname>.idoris.internal") || strings.Contains(text, "laptop.idoris.internal") {
 			t.Fatalf("%s access %q", role, text)
 		}
 		if strings.Contains(text, token) || strings.Contains(text, ":") && strings.Contains(text, "password") {
