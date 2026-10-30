@@ -292,6 +292,9 @@ func (m fakeInfo) IsDir() bool        { return false }
 func (m fakeInfo) Sys() any           { return nil }
 
 func TestR3W2JoinCodeInputsMatchAndWarn(t *testing.T) {
+	t.Setenv("HOME", "/home/acme")
+	t.Setenv("USERPROFILE", `C:\Users\acme`)
+	t.Setenv("STATE_DIRECTORY", "")
 	code := codeFor(t, join.RoleMember, "https://enroll.example.org", false)
 	run := func(t *testing.T, args []string, in string, term bool, hidden string) (string, string) {
 		t.Helper()
