@@ -10,12 +10,17 @@ import (
 )
 
 // withFileLock is the non-unix fallback. A crash can leave the O_EXCL file behind.
+// The wait is 100×5ms, which is shorter than a slow fsync, so this is not the
+// Linux deliverable.
 func withFileLock(path string, fn func() error) error {
-	lockPath := path + ".lock"
+	resolved, err := configPath(path)
+	if err != nil {
+		return err
+	}
+	lockPath := resolved + ".lock"
 	var f *os.File
-	var err error
 	for range 100 {
-		f, err = os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600) //nolint:gosec // lock beside the operator-chosen config
+		f, err = os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600) //nolint:gosec // lock beside the canonical config
 		if err == nil {
 			break
 		}

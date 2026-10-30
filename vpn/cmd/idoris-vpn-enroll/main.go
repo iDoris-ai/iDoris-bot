@@ -81,7 +81,7 @@ func loadConfig(path string) (*enroll.Config, error) {
 	if path == "" {
 		return nil, errors.New("--config is required")
 	}
-	b, err := os.ReadFile(path)
+	b, err := enroll.ReadFileLocked(path)
 	if err != nil {
 		return nil, err
 	}

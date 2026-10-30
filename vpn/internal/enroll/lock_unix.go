@@ -9,9 +9,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// withFileLock serializes readers and writers of the enroll config across processes.
+// withFileLock locks the canonical config path. A symlink and its target share
+// one lock file, and that lock file is the same one writeInPlace truncates under.
 func withFileLock(path string, fn func() error) error {
-	f, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // lock beside the operator-chosen config
+	resolved, err := configPath(path)
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(resolved+".lock", os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // lock beside the canonical config
 	if err != nil {
 		return fmt.Errorf("enroll: lock: %w", err)
 	}

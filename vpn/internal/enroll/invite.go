@@ -6,22 +6,85 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/join"
 )
 
+// failDiskWrite and afterTruncate are test seams. Production leaves both nil.
+// afterTruncate runs after O_TRUNC, while the caller still holds the config lock.
+var (
+	failDiskWrite func() error
+	afterTruncate func()
+)
+
+// configPath is the path with symlinks removed, so a config and an alias share
+// one lock file and one .bak beside the real inode.
+func configPath(path string) (string, error) {
+	if path == "" {
+		return "", errors.New("enroll: config path is empty")
+	}
+	return filepath.EvalSymlinks(path)
+}
+
 // LoadFile reads a config file. It does not apply environment overrides, so a
 // rewrite cannot persist a value that only existed in the process environment.
+// A truncated file is put back from the fsynced .bak when that backup still parses.
 func LoadFile(path string) (*Config, error) {
-	if path == "" {
-		return nil, errors.New("enroll: config path is empty")
-	}
-	b, err := os.ReadFile(path) //nolint:gosec // path is the operator-chosen enroll config
+	b, err := readConfigBytes(path)
 	if err != nil {
 		return nil, err
 	}
 	return parseConfig(b)
+}
+
+// ReadFileLocked reads the config under the same lock Invite and Revoke hold.
+// SIGHUP must use this. os.ReadFile can observe the empty inode between
+// O_TRUNC and the following Write, and a rejected reload would keep a token
+// that a concurrent Revoke already removed.
+func ReadFileLocked(path string) ([]byte, error) {
+	var b []byte
+	err := withFileLock(path, func() error {
+		var err error
+		b, err = readConfigBytes(path)
+		return err
+	})
+	return b, err
+}
+
+func readConfigBytes(path string) ([]byte, error) {
+	resolved, err := configPath(path)
+	if err != nil {
+		return nil, err
+	}
+	b, err := os.ReadFile(resolved) //nolint:gosec // path is the operator-chosen enroll config
+	if err != nil {
+		return nil, err
+	}
+	if decodesConfig(b) {
+		return b, nil
+	}
+	bak, berr := os.ReadFile(resolved + ".bak") //nolint:gosec // backup beside the canonical config
+	if berr != nil {
+		return b, nil
+	}
+	if _, perr := parseConfig(bak); perr != nil {
+		return b, nil
+	}
+	// Restore into the same inode. writeInPlace would copy the broken bytes
+	// over the good backup before writing it back.
+	if rerr := restoreInPlace(resolved, bak); rerr != nil {
+		return nil, rerr
+	}
+	return bak, nil
+}
+
+func decodesConfig(b []byte) bool {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	var cfg Config
+	return dec.Decode(&cfg) == nil
 }
 
 func parseConfig(b []byte) (*Config, error) {
@@ -65,38 +128,73 @@ func saveUnlocked(path string, cfg *Config) error {
 }
 
 // writeInPlace truncates the existing inode. rename would leave a single-file
-// bind mount serving the old file after SIGHUP. path.bak holds the previous bytes.
+// bind mount serving the old file after SIGHUP. The .bak is fsynced before the
+// truncate so a crash mid-write can be restored. It is the previous bytes,
+// including a hash a completed revoke has already removed.
 func writeInPlace(path string, data []byte) error {
-	st, err := os.Stat(path)
+	resolved, err := configPath(path)
 	if err != nil {
 		return err
 	}
-	original, err := os.ReadFile(path) //nolint:gosec // path is the operator-chosen enroll config
+	st, err := os.Stat(resolved) //nolint:gosec // path is the operator-chosen enroll config
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(path+".bak", original, st.Mode().Perm()); err != nil { //nolint:gosec // backup beside the operator-chosen config
-		return err
-	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0) //nolint:gosec // rewrite the same inode, including through a symlink
+	original, err := os.ReadFile(resolved) //nolint:gosec // path is the operator-chosen enroll config
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		_ = restoreInPlace(path, original)
+	if err := writeBak(resolved+".bak", original, st.Mode().Perm()); err != nil {
 		return err
 	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = restoreInPlace(path, original)
+	f, err := os.OpenFile(resolved, os.O_WRONLY|os.O_TRUNC, 0) //nolint:gosec // rewrite the same inode, including through a symlink
+	if err != nil {
 		return err
 	}
-	if err := f.Chmod(st.Mode().Perm()); err != nil {
-		_ = f.Close()
+	if afterTruncate != nil {
+		afterTruncate()
+	}
+	var werr error
+	if failDiskWrite != nil {
+		werr = failDiskWrite()
+	}
+	if werr == nil {
+		_, werr = f.Write(data)
+	}
+	if werr == nil {
+		werr = f.Sync()
+	}
+	cerr := f.Close()
+	if werr != nil {
+		_ = restoreInPlace(resolved, original)
+		return werr
+	}
+	if cerr != nil {
+		_ = restoreInPlace(resolved, original)
+		return cerr
+	}
+	return nil
+}
+
+func writeBak(path string, data []byte, mode os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode) //nolint:gosec // backup beside the canonical config
+	if err != nil {
 		return err
 	}
-	return f.Close()
+	_, werr := f.Write(data)
+	if werr == nil {
+		// Mode on OpenFile applies only when the file is created. An existing
+		// .bak would otherwise keep a looser mode forever.
+		werr = f.Chmod(mode)
+	}
+	if werr == nil {
+		werr = f.Sync()
+	}
+	cerr := f.Close()
+	if werr != nil {
+		return werr
+	}
+	return cerr
 }
 
 func restoreInPlace(path string, data []byte) error {
@@ -105,6 +203,9 @@ func restoreInPlace(path string, data []byte) error {
 		return err
 	}
 	_, werr := f.Write(data)
+	if werr == nil {
+		werr = f.Sync()
+	}
 	cerr := f.Close()
 	if werr != nil {
 		return werr
