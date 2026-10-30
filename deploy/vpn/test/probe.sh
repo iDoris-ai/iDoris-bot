@@ -731,6 +731,30 @@ else
   echo "  ok   globex-member denied Headplane on ${vip}:3000"
 fi
 
+echo "probe: COMPOSE_PROFILES cannot run both Headplanes"
+COMPOSE_PROFILES=tailnet-admin bash "$root/ctl.sh" up --published --headplane-access tunnel
+pub_running="$(dc ps --status running -q headplane || true)"
+tail_running="$(dc --profile tailnet-admin ps --status running -q headplane-tailnet || true)"
+if [[ -n "$pub_running" && -z "$tail_running" ]]; then
+  pass=$((pass + 1))
+  echo "  ok   published up with COMPOSE_PROFILES=tailnet-admin left the tailnet Headplane stopped"
+else
+  fail=$((fail + 1))
+  echo "  FAIL published up published='$pub_running' tailnet='$tail_running'" >&2
+fi
+export VPN_SERVER_ENROLL_TOKEN="$vpn_token"
+COMPOSE_PROFILES=tailnet-admin bash "$root/ctl.sh" up --tailnet-admin
+unset VPN_SERVER_ENROLL_TOKEN
+pub_running="$(dc ps --status running -q headplane || true)"
+tail_running="$(dc --profile tailnet-admin ps --status running -q headplane-tailnet || true)"
+if [[ -z "$pub_running" && -n "$tail_running" ]]; then
+  pass=$((pass + 1))
+  echo "  ok   tailnet up stopped the published Headplane"
+else
+  fail=$((fail + 1))
+  echo "  FAIL tailnet up published='$pub_running' tailnet='$tail_running'" >&2
+fi
+
 echo "probe: credential lifecycle"
 # The copy's enroll directory is the file the running container has mounted.
 if ENROLL_DIR="$root/enroll" PROJ="$PROJ" bash "$root/test/credentials.sh"; then
@@ -840,6 +864,26 @@ if [[ -z "$pub_running" ]]; then
 else
   fail=$((fail + 1))
   echo "  FAIL after volume-wipe restore, published headplane is running" >&2
+fi
+
+echo "probe: sidecar identity survives down and up without the enroll token"
+bash "$root/ctl.sh" down
+env -u VPN_SERVER_ENROLL_TOKEN bash "$root/ctl.sh" up
+sidecar_up=0
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  if dc --profile tailnet-admin ps --status running -q vpn-sidecar | grep -q . \
+    && dc --profile tailnet-admin ps --status running -q headplane-tailnet | grep -q .; then
+    sidecar_up=1
+    break
+  fi
+  sleep 3
+done
+if [[ "$sidecar_up" == 1 ]]; then
+  pass=$((pass + 1))
+  echo "  ok   ctl.sh up restarted the sidecar without VPN_SERVER_ENROLL_TOKEN"
+else
+  fail=$((fail + 1))
+  echo "  FAIL ctl.sh up did not restart the sidecar without a token" >&2
 fi
 
 echo "probe: ${pass} passed, ${fail} failed"

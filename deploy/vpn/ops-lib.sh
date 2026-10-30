@@ -80,14 +80,15 @@ enforce_headplane_exclusion() {
 }
 
 # Start headscale+enroll and exactly one Headplane, matching the mode file.
-# Tailnet mode starts the profile only when VPN_SERVER_ENROLL_TOKEN is set.
+# Tailnet mode starts the profile when there is a token or the sidecar
+# volume already holds tailscaled.state.
 start_stack_for_mode() {
   local mode="$1"
   enforce_headplane_exclusion "$mode"
   assert_compose_bindings "$mode"
   if [[ "$mode" == "tailnet-admin" ]]; then
     compose up -d --wait --wait-timeout 180 headscale enroll
-    if [[ -n "${VPN_SERVER_ENROLL_TOKEN:-}" ]]; then
+    if [[ -n "${VPN_SERVER_ENROLL_TOKEN:-}" ]] || sidecar_has_identity; then
       compose --profile tailnet-admin up -d --wait --wait-timeout 180 vpn-sidecar headplane-tailnet
       verify_published_bindings "$mode"
       echo "tailnet-admin profile is up. Published Headplane is stopped."
@@ -97,7 +98,7 @@ start_stack_for_mode() {
     fi
   else
     compose --profile tailnet-admin stop vpn-sidecar headplane-tailnet >/dev/null 2>&1 || true
-    compose up -d --wait --wait-timeout 180
+    compose up -d --wait --wait-timeout 180 headscale enroll headplane
     verify_published_bindings "$mode"
   fi
 }
@@ -238,6 +239,37 @@ PY
   mkdir -p "$parent"
   cp -P "$src" "$dest"
   chmod 600 "$dest"
+}
+
+# Compose volume for this project, by label or by the conventional name.
+# Empty output means the volume does not exist. A down stack keeps the volume.
+_project_volume_name() {
+  local short="$1" project labeled name
+  project="${COMPOSE_PROJECT_LOCK:-}"
+  if [[ -z "$project" ]]; then
+    project="$(current_project_name)"
+  fi
+  labeled="$(docker volume ls -q --filter "label=com.docker.compose.project=${project}" --filter "label=com.docker.compose.volume=${short}" 2>/dev/null | head -n1 || true)"
+  if [[ -n "$labeled" ]]; then
+    printf '%s' "$labeled"
+    return 0
+  fi
+  name="${project}_${short}"
+  if docker volume inspect "$name" >/dev/null 2>&1; then
+    printf '%s' "$name"
+    return 0
+  fi
+  return 1
+}
+
+# The sidecar already has a node key when tailscaled.state is non-empty.
+# ctl.sh up must not demand a new enrollment token in that case.
+sidecar_has_identity() {
+  local vol
+  vol="$(_project_volume_name vpn-sidecar-state 2>/dev/null || true)"
+  [[ -n "$vol" ]] || return 1
+  docker run --rm --network none -v "${vol}:/state:ro" "$ALPINE_VOLUME_IMAGE" \
+    sh -c 'test -s /state/tailscaled.state'
 }
 
 # Named volume mounted at a container path. Bind mounts have an empty Name.
@@ -629,6 +661,10 @@ open(path, "w").writelines(out)
 PY
   write_env_var HEADPLANE_ACCESS "$mode"
   write_env_var HEADPLANE_BIND "$bind"
+  write_env_var HEADPLANE_PORT "$port"
+  if [[ "$mode" == "lan" ]]; then
+    write_env_var HEADPLANE_LAN_HOST "$host_url"
+  fi
   if [[ "$mode" == "proxy" ]]; then
     write_env_var HEADPLANE_BASE_URL "$base"
   fi
@@ -667,10 +703,14 @@ assign_instance() {
   reject_project_collision
 }
 
-# Shell exports beat .env. Every compose invocation below re-applies the
-# keys from this directory's .env (or unsets them) so a stale HEADPLANE_BIND
-# cannot publish a port the mode file just turned off. VPN_SERVER_ENROLL_TOKEN
-# is a process credential and is left alone.
+# Shell exports beat .env for the keys listed below: every compose invocation
+# re-applies those keys from this directory's .env (or unsets them) so a stale
+# HEADPLANE_BIND cannot publish a port the mode file just turned off.
+# COMPOSE_PROFILES, COMPOSE_FILE and COMPOSE_PATH_SEPARATOR are always
+# removed. A profile has to be requested with --profile, or an inherited
+# COMPOSE_PROFILES=tailnet-admin starts the second Headplane. COMPOSE_PROJECT_NAME
+# is set to this deployment. VPN_SERVER_ENROLL_TOKEN is a process credential
+# and is left alone.
 _COMPOSE_FILE_KEYS="HEADPLANE_BIND HEADPLANE_PORT HEADSCALE_PORT ENROLL_PORT DERP_STUN_PORT ENROLL_UID ENROLL_GID HEADPLANE_ACCESS HEADPLANE_LAN_HOST HEADPLANE_BASE_URL HEADPLANE_ALLOW_PUBLIC_ADMIN ENROLL_PUBLIC_URL ENROLL_IMAGE IDORIS_VPN_VERSION VPN_SERVER_LOGIN_SERVER"
 
 dotenv_value() {
@@ -695,6 +735,9 @@ compose() {
   [[ "$project" =~ ^[a-z0-9][a-z0-9_-]{0,50}$ ]] || die "compose project name '$project' is not a safe label"
   local -a unset_args=() set_args=()
   set_args+=("COMPOSE_PROJECT_NAME=${project}")
+  # Always. These are not deployment settings, and a shell export must not
+  # select a second compose file or turn the tailnet-admin profile on.
+  unset_args+=("-u" "COMPOSE_PROFILES" "-u" "COMPOSE_FILE" "-u" "COMPOSE_PATH_SEPARATOR")
   for key in $_COMPOSE_FILE_KEYS; do
     if val="$(dotenv_value "$key")"; then
       set_args+=("${key}=${val}")
@@ -921,6 +964,9 @@ verify_published_bindings() {
       [[ -z "${out//[[:space:]]/}" ]] || die "vpn-sidecar published a host port ($out)"
     fi
     return 0
+  fi
+  if service_running headplane-tailnet; then
+    die "headplane-tailnet is running in published mode"
   fi
   if ! service_running headplane; then
     return 0
