@@ -446,6 +446,9 @@ func prepareKeys(cfg *vpnd.Config, log *slog.Logger) (vpnd.KeySource, string, vp
 				return nil, "", ident, nil, false, err
 			}
 		}
+		// No enroll URL means discovery does not apply. The gate trusts the
+		// running node of this static credential once it is on our control server.
+		ident.Static = true
 		return vpnd.StaticKey(cfg.AuthKey), controlURL, ident, binding, true, nil
 	}
 	ec := &enroll.Client{URL: cfg.EnrollURL, Token: cfg.EnrollToken, AllowInsecure: cfg.EnrollAllowInsecure}
@@ -460,9 +463,13 @@ func prepareKeys(cfg *vpnd.Config, log *slog.Logger) (vpnd.KeySource, string, vp
 			return nil, "", ident, nil, false, fmt.Errorf("%w (discovery: %w)", rerr, derr)
 		}
 		savedBinding := binding.Get()
-		cfg.Role = vpnd.RoleWhileEnrollDown(cfg.Role, savedBinding.Role, vpnd.TokenFingerprint(cfg.EnrollToken), savedBinding.TokenFingerprint)
+		fp := vpnd.TokenFingerprint(cfg.EnrollToken)
+		cfg.Role = vpnd.RoleWhileEnrollDown(cfg.Role, savedBinding.Role, fp, savedBinding.TokenFingerprint)
 		log.Warn("enrollment discovery failed; resuming the saved control URL", "err", derr, "control_url", url, "role", cfg.Role)
-		// The URL was not confirmed this start, so the binding is left as it was.
+		// Known stays false. The fingerprint lets the reconciler tell a
+		// matching saved binding (degraded continuity) from a different token
+		// (access stays closed). The binding itself is left as it was.
+		ident = vpnd.Identity{TokenFingerprint: fp, Known: false}
 		return &enrollKeys{c: ec, cfg: cfg, log: log}, url, ident, binding, !degraded, nil
 	}
 	url, _, rerr := vpnd.ResolveStartupControl(cfg.ControlURL, d.ControlURL, saved, true)
