@@ -124,8 +124,9 @@ func TestR5WSameRoleReplacementDoesNotReportTheOldDaemon(t *testing.T) {
 }
 
 // r5wIdentityDone is the raw string check used by the HTTP test above.
-// The page canonicalises control URLs; TestR6WAppJSCanonicalControlURL
-// drives app.js for that.
+// The page itself canonicalises control URLs and treats
+// identity_unconfirmed as not done; TestR6WAppJSCanonicalControlURL and
+// TestR6WAppJSUnconfirmedIdentityIsNotDone drive app.js for that.
 func r5wIdentityDone(res gateway.ApplyResult, st map[string]any) bool {
 	if res.Role != "" {
 		role, _ := st["role"].(string)
