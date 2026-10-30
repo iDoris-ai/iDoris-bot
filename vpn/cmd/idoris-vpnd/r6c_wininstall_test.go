@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestR6CReplaceProtectsEmptyStageBeforeSecrets drives replaceWindowsTask.
@@ -214,5 +215,103 @@ func TestR6CRetargetDecodesWindowsJSONPaths(t *testing.T) {
 	}
 	if got["auth_key_file"] != filepath.Join(nativeLive, "auth_key") {
 		t.Fatalf("native path %q", got["auth_key_file"])
+	}
+}
+
+// TestR6CWaitIgnoresInstallerPIDWhenNotLiveImage is an upgrade whose
+// installer is not the file the task runs, but tasklist still lists it
+// because the image name matches. The wait must ignore that pid and replace
+// the live executable. schtasks and tasklist are not executed.
+func TestR6CWaitIgnoresInstallerPIDWhenNotLiveImage(t *testing.T) {
+	t.Log("schtasks and tasklist were not executed; the runner is injected. Windows was not run")
+	const installerPID = 4242
+	prevChown := chownSystemRoot
+	prevRun := runServiceCommand
+	prevSleep := windowsSleep
+	prevWait := windowsExitWait
+	prevNow := windowsNow
+	chownSystemRoot = func(string) error { return nil }
+	sleeps := 0
+	now := time.Unix(1_700_000_000, 0)
+	windowsNow = func() time.Time { return now }
+	windowsSleep = func(time.Duration) {
+		sleeps++
+		now = now.Add(time.Minute)
+	}
+	windowsExitWait = 30 * time.Second
+	runServiceCommand = func(name string, args ...string) ([]byte, error) {
+		if name == "tasklist" {
+			return []byte("\"idoris-vpnd.exe\",\"4242\",\"Console\",\"1\",\"1 K\"\r\n"), nil
+		}
+		return []byte("ok\n"), nil
+	}
+	t.Cleanup(func() {
+		chownSystemRoot = prevChown
+		runServiceCommand = prevRun
+		windowsSleep = prevSleep
+		windowsExitWait = prevWait
+		windowsNow = prevNow
+	})
+
+	root := t.TempDir()
+	liveDir := filepath.Join(root, "ProgramData", "idoris")
+	exeDir := filepath.Join(root, "Program Files", "iDoris")
+	if err := os.MkdirAll(liveDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(exeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	liveExe := filepath.Join(exeDir, "idoris-vpnd.exe")
+	if err := os.WriteFile(liveExe, []byte("old-exe"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(liveDir, "vpn.json"), []byte("old-config\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(root, "Downloads", "idoris-vpnd.exe")
+	if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src, []byte("new-exe"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(root, "cfg.json")
+	if err := os.WriteFile(cfgPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	spec := windowsReplaceSpec{
+		SrcExe:     src,
+		LiveExe:    liveExe,
+		ExeDir:     exeDir,
+		ConfigSrc:  cfgPath,
+		LiveDir:    liveDir,
+		LiveConfig: filepath.Join(liveDir, "vpn.json"),
+		StagingDir: filepath.Join(root, "ProgramData", "idoris-install-r6c-wait"),
+		Active:     true,
+		SelfPID:    0,
+		ExcludePID: installerPID,
+	}
+	if err := replaceWindowsTask(spec); err != nil {
+		t.Fatal(err)
+	}
+	if sleeps != 0 {
+		t.Fatalf("wait slept %d times; the installer pid was not excluded", sleeps)
+	}
+	got, err := os.ReadFile(liveExe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "new-exe" {
+		t.Fatalf("live executable %q", got)
+	}
+	entries, err := os.ReadDir(exeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "idoris-vpnd-") {
+			t.Fatalf("versioned copy %s was installed for an installer that is not the live image", e.Name())
+		}
 	}
 }

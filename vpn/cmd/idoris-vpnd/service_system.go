@@ -580,10 +580,11 @@ func installWindowsTask(configPath string) error {
 		StagingDir: staging,
 		Active:     systemServiceActive("windows"),
 	}
+	// tasklist matches the image name. This process is listed whether or not
+	// it is the file the task runs, so the wait always ignores it. SelfPID
+	// is only the signal to leave that mapped file alone.
+	spec.ExcludePID = os.Getpid()
 	if sameInstallExe(src, exe) {
-		// This process is mapped from the installed image. Replacing that
-		// path fails while we are running, so the task is pointed at a
-		// versioned copy instead.
 		spec.SelfPID = os.Getpid()
 	}
 	if err := replaceWindowsTask(spec); err != nil {
