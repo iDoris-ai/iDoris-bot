@@ -6,7 +6,7 @@
 # a different bridge and drops the office prefix except via tailscale0.
 services:
   headscale:
-    image: headscale/headscale:v0.29.6
+    image: headscale/headscale:v0.29.6@sha256:cabe84f0699913dbca9320f0883dca7565dd08df3c5be29edfabbebeff763966 # headscale/headscale:v0.29.6
     command: serve
     volumes:
       - ../headscale-lan/config.yaml:/etc/headscale/config.yaml:ro
@@ -24,7 +24,7 @@ services:
       start_period: 2s
 
   wiz-member:
-    image: tailscale/tailscale:v1.104.2
+    image: tailscale/tailscale:v1.104.2@sha256:b11583ad2e93e4671128538c88cf11f460444a5d7e449311dd1933a400ab849d # tailscale/tailscale:v1.104.2
     hostname: wiz-member
     entrypoint: ["/bin/sh", "/lan/node.sh"]
     init: true
@@ -42,7 +42,7 @@ services:
     networks: [home]
 
   wiz-gw:
-    image: tailscale/tailscale:v1.104.2
+    image: tailscale/tailscale:v1.104.2@sha256:b11583ad2e93e4671128538c88cf11f460444a5d7e449311dd1933a400ab849d # tailscale/tailscale:v1.104.2
     hostname: wiz-gw
     entrypoint: ["/bin/sh", "/lan/node.sh"]
     init: true
@@ -63,7 +63,7 @@ services:
     networks: [office]
 
   wiz-gw-wait:
-    image: tailscale/tailscale:v1.104.2
+    image: tailscale/tailscale:v1.104.2@sha256:b11583ad2e93e4671128538c88cf11f460444a5d7e449311dd1933a400ab849d # tailscale/tailscale:v1.104.2
     hostname: wiz-gw-wait
     entrypoint: ["/bin/sh", "/lan/node.sh"]
     init: true
@@ -84,7 +84,7 @@ services:
     networks: [office]
 
   wiz-echo:
-    image: tailscale/tailscale:v1.104.2
+    image: tailscale/tailscale:v1.104.2@sha256:b11583ad2e93e4671128538c88cf11f460444a5d7e449311dd1933a400ab849d # tailscale/tailscale:v1.104.2
     hostname: wiz-echo
     entrypoint: ["/bin/sh", "/lan/echo.sh"]
     init: true
@@ -95,7 +95,7 @@ services:
         ipv4_address: ${WIZ_ECHO:?}
 
   wiz-echo-b:
-    image: tailscale/tailscale:v1.104.2
+    image: tailscale/tailscale:v1.104.2@sha256:b11583ad2e93e4671128538c88cf11f460444a5d7e449311dd1933a400ab849d # tailscale/tailscale:v1.104.2
     hostname: wiz-echo-b
     entrypoint: ["/bin/sh", "/lan/echo.sh"]
     init: true

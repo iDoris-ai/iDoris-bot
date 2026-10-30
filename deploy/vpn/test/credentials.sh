@@ -242,7 +242,7 @@ docker run -d --name "$cname" \
   -e TS_ACCEPT_DNS=false \
   -e "TS_EXTRA_ARGS=--login-server=http://headscale:8080" \
   --entrypoint /usr/local/bin/containerboot \
-  tailscale/tailscale:v1.104.2 >/dev/null
+  tailscale/tailscale:v1.104.2@sha256:b11583ad2e93e4671128538c88cf11f460444a5d7e449311dd1933a400ab849d >/dev/null
 unset authkey
 
 ready=0
