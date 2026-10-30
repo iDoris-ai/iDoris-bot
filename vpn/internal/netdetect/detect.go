@@ -157,12 +157,15 @@ func candidateFrom(iface, raw string, def *DefaultRoute) (Candidate, bool) {
 		c.Default = true
 		c.Gateway = def.Gateway
 	}
-	for _, home := range commonLAN {
-		if network.Overlaps(home) {
-			c.Warnings = append(c.Warnings, Notice{
-				Code: "common-lan",
-				Text: "Network " + network.String() + " overlaps the common home range " + home.String() + ". Prefer a /32 so a member's own LAN is not shadowed.",
-			})
+	// A host route does not shadow a member's LAN. Skip the overlap warning.
+	if network.Bits() != 32 {
+		for _, home := range commonLAN {
+			if network.Overlaps(home) {
+				c.Warnings = append(c.Warnings, Notice{
+					Code: "common-lan",
+					Text: "Network " + network.String() + " overlaps the common home range " + home.String() + ". Prefer a /32 so a member's own LAN is not shadowed.",
+				})
+			}
 		}
 	}
 	return c, true
@@ -183,7 +186,7 @@ func virtualIface(name string) bool {
 	case "docker0", "lo", "lo0":
 		return true
 	}
-	for _, p := range []string{"tailscale", "utun", "br-", "veth", "virbr", "vmnet", "cni", "flannel"} {
+	for _, p := range []string{"tailscale", "utun", "wg", "tun", "tap", "zt", "ppp", "ipsec", "br-", "veth", "virbr", "vmnet", "cni", "flannel"} {
 		if strings.HasPrefix(n, p) {
 			return true
 		}
