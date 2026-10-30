@@ -19,6 +19,7 @@ func serviceCmd(args []string) error {
 	}
 	fs := flag.NewFlagSet("service", flag.ContinueOnError)
 	configPath := fs.String("config", "", "JSON config file the service should load")
+	system := fs.Bool("system", false, "install a machine service that runs before login (requires root or SYSTEM)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -34,12 +35,32 @@ func serviceCmd(args []string) error {
 		if _, err := os.Stat(abs); err != nil {
 			return fmt.Errorf("config: %w", err)
 		}
-		return installService(abs)
+		if *system {
+			return installSystemService(abs)
+		}
+		if err := installService(abs); err != nil {
+			return err
+		}
+		fmt.Println(userServiceNotice(runtime.GOOS))
+		return nil
 	case "uninstall":
+		if *system {
+			return uninstallSystemService()
+		}
 		return uninstallService()
 	default:
 		return fmt.Errorf("service: unknown action %q", args[0])
 	}
+}
+
+// userServiceNotice tells the operator that a per-user service stays stopped
+// until they log in. Linux additionally needs lingering.
+func userServiceNotice(goos string) string {
+	msg := "a user service does not run before this user logs in"
+	if goos == "linux" {
+		msg += "; enable it with: loginctl enable-linger"
+	}
+	return msg
 }
 
 func selfPath() (string, error) {
@@ -57,12 +78,26 @@ func installService(configPath string) error {
 	}
 	switch runtime.GOOS {
 	case "darwin":
+		if _, err := os.Stat(systemLaunchdPath); err == nil {
+			return errors.New("a system LaunchDaemon is installed; remove it with: idoris-vpnd service uninstall --system")
+		}
 		return installLaunchd(exe, configPath)
 	case "linux":
+		if err := rejectEnabledSystemUnit(); err != nil {
+			return err
+		}
 		return installSystemdUser(exe, configPath)
 	default:
 		return fmt.Errorf("service install is not supported on %s; run `idoris-vpnd run` under your service manager", runtime.GOOS)
 	}
+}
+
+func rejectEnabledSystemUnit() error {
+	out, err := exec.Command("systemctl", "is-enabled", systemUnitName).CombinedOutput()
+	if err == nil && strings.TrimSpace(string(out)) == "enabled" {
+		return errors.New("the system unit is enabled; remove it with: idoris-vpnd service uninstall --system")
+	}
+	return nil
 }
 
 func uninstallService() error {
@@ -107,17 +142,8 @@ func plistEscape(s string) string {
 	return r.Replace(s)
 }
 
-func installLaunchd(exe, configPath string) error {
-	p, err := launchdPlistPath()
-	if err != nil {
-		return err
-	}
-	home, _ := os.UserHomeDir()
-	logDir := filepath.Join(home, "Library", "Logs", "iDoris")
-	if err := os.MkdirAll(logDir, 0o750); err != nil {
-		return err
-	}
-	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+func renderLaunchdPlist(exe, configPath, logDir string) string {
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -137,6 +163,19 @@ func installLaunchd(exe, configPath string) error {
 </dict>
 </plist>
 `, launchdLabel, plistEscape(exe), plistEscape(configPath), plistEscape(logDir), plistEscape(logDir))
+}
+
+func installLaunchd(exe, configPath string) error {
+	p, err := launchdPlistPath()
+	if err != nil {
+		return err
+	}
+	home, _ := os.UserHomeDir()
+	logDir := filepath.Join(home, "Library", "Logs", "iDoris")
+	if err := os.MkdirAll(logDir, 0o750); err != nil {
+		return err
+	}
+	plist := renderLaunchdPlist(exe, configPath, logDir)
 	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
 		return err
 	}
@@ -165,25 +204,29 @@ func systemdUnitPath() (string, error) {
 	return filepath.Join(base, "systemd", "user", "idoris-vpnd.service"), nil
 }
 
-func installSystemdUser(exe, configPath string) error {
-	p, err := systemdUnitPath()
-	if err != nil {
-		return err
-	}
-	unit := fmt.Sprintf(`[Unit]
+func renderSystemdUserUnit(exe, configPath string) string {
+	return fmt.Sprintf(`[Unit]
 Description=iDoris VPN membership daemon (Tailscale client -> iDoris Headscale)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=%s run --config %s
+ExecStart=%s
 Restart=always
 RestartSec=3
 NoNewPrivileges=yes
 
 [Install]
 WantedBy=default.target
-`, exe, configPath)
+`, renderExecStart(exe, configPath))
+}
+
+func installSystemdUser(exe, configPath string) error {
+	p, err := systemdUnitPath()
+	if err != nil {
+		return err
+	}
+	unit := renderSystemdUserUnit(exe, configPath)
 	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
 		return err
 	}
