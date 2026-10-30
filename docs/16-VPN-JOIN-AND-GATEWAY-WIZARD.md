@@ -192,7 +192,7 @@ Error: invalid argument "wiz-gw-wait" for "-i, --identifier" flag: strconv.Parse
 
 容器入口脚本里的 `sysctl -w net.ipv4.ip_forward=1` 在这台 OrbStack 上是 `Read-only file system`。向导仍打印 `ip-forward: enabled`：`/proc` 里已经是 `1` 时，守护进程把这一步当作成功。
 
-2026-10-28 早先一轮 `make integration` 全绿（286s，项目 `idoris-vpn-r3w2-wizard-c11edc`）。那一轮旁路断言里「未知键 `extra_kept` 会留下」和「`--replace` 后 `control_url` 仍是 `https://headscale`」已经不是现在的行为。当前用例期待：种子没有未知键；第一次加入（种子有 `control_url`、没有 `enroll_url`）仍留下 `control_url`；换成 `http://attacker.invalid:9` 时不带 `--replace` 失败且文件不变，带 `--replace` 后配置里没有 `control_url`，stdout 有上面那句删钉警告；令牌文件是 `keep.json.enroll-token` 和 `member.json.enroll-token`。成员码在容器 `HOME=/root` 且没有 `STATE_DIRECTORY` 时，SOCKS 仍是 `127.0.0.1:1080`（端口空闲），凭据路径是 `/root/.idoris/vpn-state/socks5.auth`。2026-10-28 本轮 `make integration` 全绿（`ok .../integration` 334.718s）。向导项目 `idoris-vpn-r3w2-wizard-7aac60`，`TestWizardGatewayJoin` 38.19s PASS，旁路日志是 `EVIDENCE first join kept control_url; --replace dropped it; member SOCKS5 default written`。`TestR4WSudoApplyHonoursUserOwnedPlan` 2.58s PASS，输出含 `R4W_HANDOFF_OK`。
+2026-10-28 早先一轮 `make integration` 全绿（286s，项目 `idoris-vpn-r3w2-wizard-c11edc`）。那一轮旁路断言里「未知键 `extra_kept` 会留下」和「`--replace` 后 `control_url` 仍是 `https://headscale`」已经不是现在的行为。当前用例期待：种子没有未知键；第一次加入（种子有 `control_url`、没有 `enroll_url`）仍留下 `control_url`；换成 `http://attacker.invalid:9` 时不带 `--replace` 失败且文件不变，带 `--replace` 后配置里没有 `control_url`，stdout 有上面那句删钉警告；令牌文件是 `keep.json.enroll-token` 和 `member.json.enroll-token`。成员码在容器 `HOME=/root` 且没有 `STATE_DIRECTORY` 时，SOCKS 仍是 `127.0.0.1:1080`（端口空闲），凭据路径是 `/root/.idoris/vpn-state/socks5.auth`。2026-10-28 本轮 `make integration` 全绿（`ok .../integration` 334.718s）。向导项目 `idoris-vpn-r3w2-wizard-7aac60`，`TestWizardGatewayJoin` 38.19s PASS，旁路日志是 `EVIDENCE first join kept control_url; --replace dropped it; member SOCKS5 default written`。`TestR4WSudoApplyHonoursUserOwnedPlan` 2.58s PASS，输出含 `R4W_HANDOFF_OK`。同一天稍后一轮 `make integration` 也全绿（`ok .../integration` 371.245s）。向导项目 `idoris-vpn-r3w2-wizard-e9423c`，`TestWizardGatewayJoin` 38.84s PASS，旁路日志仍是那句 `EVIDENCE first join kept control_url; --replace dropped it; member SOCKS5 default written`。`TestR4WSudoApplyHonoursUserOwnedPlan` 1.52s PASS，输出含 `R4W_HANDOFF_OK`。`TestR5WWizardMemberSOCKS` 项目 `idoris-vpn-r5w-1a197d40`，16.35s PASS，日志是 `wizard member SOCKS5 ok via 127.0.0.1:1080 credential /var/lib/idoris/vpn-state/socks5.auth`。
 
 ## 9. 本地页面的安全模型
 
@@ -245,7 +245,7 @@ idoris-vpn-enroll list-credentials --config F --entry E
 - 加入码不证明登记主机属于本组织。核对打印出来的 `enrollment-authority`，或传 `--expect-authority`。
 - 换一份配置的登记 URL 要 `--replace`。不带它时，原文件不动。
 - 同一台 Headscale（相同 `control_url`）、相同角色、不同租户时，页面仍会把正在运行的旧守护进程当成完成。本轮没有改守护进程的状态快照；快照没有 `tenant`，也没有 `token_fingerprint`。
-- 成员和管理员的 auto/embedded 配置默认有回环 SOCKS5。网关和 local-ai 没有。本轮没有把这个代理真正连到一台 Local AI 上。
+- 成员和管理员的 auto/embedded 配置默认有回环 SOCKS5。网关和 local-ai 没有。2026-10-28 `TestR5WWizardMemberSOCKS`（compose 项目 `idoris-vpn-r5w-64f1d4e0`，15.60s PASS）把向导的 `SimplePlan` / `Apply` 写出的成员配置跑了起来。登记令牌来自宿主机 `idoris-vpn-enroll invite`，条目是租户 `acme`、角色 member、没有 ACL 标签。计划把 `mode` 写成 `embedded`：这套夹具里的 userspace tailscaled 已经在跑且未登录，auto 会选 system。`listen` 写成 `tcp:127.0.0.1:7845`，因为空的 listen 在设了 `HOME` 时变成 unix socket，状态探针读不到。种子配置留下 `state_dir` `/var/lib/idoris/vpn-state`。容器里 `idoris-vpnd run --config` 到达 `connected`，模式 `embedded`，SOCKS5 为 `listening`。`AccessInfo` 给出 `127.0.0.1:1080` 和凭据文件 `/var/lib/idoris/vpn-state/socks5.auth`。匿名连接被拒绝。用该凭据经 SOCKS5 访问 Local AI 节点 `acme-local-ai:11434` 的回声（1024 字节），输出含 `echoed`。没有在宿主机上另起一条 tailnet。同一用例再跑一次：项目 `idoris-vpn-r5w-5b47384e`，15.64s PASS。全套 `make integration` 里又过一次：项目 `idoris-vpn-r5w-1a197d40`，16.35s PASS。计时见第 8 节。
 - 不是整段落在 RFC1918 里的前缀不会被广告。默认路由必须是 /0。隧道网卡不当办公室网。
 - 客户端不能批准自己的路由。
 - 空的 ControlURL 加上已登录状态（`Running` / `Starting` / `Stopped`）视为别人的 Tailscale SaaS，自动模式不接管。`NeedsMachineAuth` 加空 URL 仍当作全新安装。
@@ -256,7 +256,7 @@ idoris-vpn-enroll list-credentials --config F --entry E
 - 本地页面已不使用 cookie，认证方式见第 9 节；回环地址上的页面也不使用 HTTPS。gateway 与 local-ai 的页面答案必须和码一致。登记服务返回了角色时以它为准，和码不一致就拒绝。成员和管理员不回答网关问题。
 - 更宽的 `autoApprovers` 前缀是否覆盖更窄的 `/32`，本轮没有验证。
 - 没有在图形浏览器里点本地页面。没有在真实 Windows 上执行 `icacls`，也没有在真实 Windows 上打开浏览器。
-- 第 8 节开头那些 `10.211.81.*` 的数字来自项目 `idoris-vpn-wizard-1e19b7`。本轮没有另起同名 compose 项目重跑那一次。本轮全套 `make integration` 是项目 `idoris-vpn-r3w2-wizard-7aac60`。
+- 第 8 节开头那些 `10.211.81.*` 的数字来自项目 `idoris-vpn-wizard-1e19b7`。本轮没有另起同名 compose 项目重跑那一次。2026-10-28 全套 `make integration` 先是项目 `idoris-vpn-r3w2-wizard-7aac60`（334.718s），后来一轮是 `idoris-vpn-r3w2-wizard-e9423c`（371.245s），见第 8 节。
 
 ## 12. 机器服务：`service install --system`
 
