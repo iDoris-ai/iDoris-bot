@@ -69,7 +69,7 @@ tailscaled is logged into <url>; takeover is disabled. Set mode: embedded to run
 
 要切走外网登录，必须显式 `takeover: true`（或 `--takeover`）。
 
-官方 Tailscale GUI 和 `tailscale` CLI 不走控制器锁，锁排除不了它们。协调器在 `Start`、`StartLoginInteractive` 和 `EditPrefs`（路由、SSH 也在这条路径上）之前再读一次当前 prefs。控制面已经不是这一轮决定要改的那一台，就中止，不发出这次修改。`takeover: false` 且读到外网登录时，这一轮停在 `blocked-foreign-tailnet`。这把检查和修改之间的窗口收窄了，没有关上。
+官方 Tailscale GUI 和 `tailscale` CLI 不走控制器锁，锁排除不了它们。协调器在 `Start`、`StartLoginInteractive` 和 `EditPrefs`（路由、SSH 也在这条路径上）之前再读一次当前 prefs。控制面已经不是这一轮决定要改的那一台，就中止，不发出这次修改。`takeover: false` 且读到外网登录时，这一轮停在 `blocked-foreign-tailnet`。`SwitchProfile` 和 `SwitchToEmptyProfile` 的前一刻再读一次 prefs 和 profile status；这时已经是外网登录就同样停住，不发出切换。`takeover: true` 不做这道拒绝。这次再读和 LocalAPI 真正切换之间仍有一段非原子窗口。`TestR4CProfileFlipBeforeSwitchIsBlocked` 用一个在两次读取之间把当前 profile 换成外网的假后端核实了拒绝。
 
 ## 4. 嵌入式节点能做什么、不能做什么
 
@@ -237,6 +237,8 @@ iOS / Android 同时只允许一个活动 VPN。这次没有在手机上验证�
 
 注册与服务安装这一轮在 `work/vpn-r2-go`（`0abdcb0`）上又跑了门禁。`make test` 退出码 0：`cmd/idoris-vpn-enroll` 1.502s，`cmd/idoris-vpnd` 1.682s，`internal/enroll` 8.027s，`internal/gateway` 2.324s，`internal/headscale` 3.732s，`internal/join` 3.927s，`internal/netdetect` 3.431s，`internal/ui` 2.138s，`internal/vpnd` 3.210s。两次 `golangci-lint`（第二次带 `--build-tags integration`）都是 `0 issues`。`GOOS=windows go build ./...` 与 `GOOS=windows go vet ./...` 退出码 0。`make licenses` 扫完 linux、darwin、windows 的 amd64 与 arm64，输出 `THIRD_PARTY_NOTICES.md is up to date`。`make build-linux` 版本串是 `0abdcb0`。`make integration` 退出码 0，包耗时 276.070s；这一轮给未自带项目名的 compose 调用设置了 `COMPOSE_PROJECT_NAME=idoris-vpn-r2g-7f3c1a`。`TestEmbeddedAutoLeavesForeignTailscale` 47.47s，`TestHardAAwaitTailscaled` 2.92s，`TestHardAClientCore` 53.02s，`TestEnrollConnectAndReauth` 34.79s，`TestLanDirect` 29.08s，`TestLanAwayRelay` 22.97s，`TestGatewaySubnetRoute` 34.13s，`TestWireAccessForwardsAndSOCKS5` 15.70s，`TestWizardGatewayJoin` 35.38s。结束后 `docker ps -a`、`docker network ls`、`docker volume ls` 里没有 `idoris-vpn-*` 容器、网络或卷。上面两轮按子测试拆开的秒数没有在这一轮重记。Windows 上的 `icacls` 没有在这台 macOS 上执行。
 
+身份、锁和机器服务这一轮在 `work/vpn-r4-c` 上跑完门禁，当时 `HEAD` 是 `8bb3134`。`make test` 退出码 0：`cmd/idoris-vpn-enroll` 1.799s，`cmd/idoris-vpnd` 3.518s，`internal/enroll` 10.396s，`internal/fsutil` 4.589s，`internal/gateway` 2.266s，`internal/headscale` 5.659s，`internal/join` 1.493s，`internal/netdetect` 2.581s，`internal/ui` 4.805s，`internal/vpnd` 7.896s。`echosrv`、`wireclient`、`internal/version` 没有测试文件。两次 `golangci-lint`（第二次带 `--build-tags integration`）都是 `0 issues`。`GOOS=windows go build ./...` 与 `GOOS=windows go vet ./...` 退出码 0。`make licenses` 扫完 linux、darwin、windows 的 amd64 与 arm64，输出 `THIRD_PARTY_NOTICES.md is up to date`。`make build-linux` 版本串是 `8bb3134`。`make integration` 退出码 0，包耗时 454.957s。`TestEmbeddedAutoLeavesForeignTailscale` 49.29s，`TestHardAAwaitTailscaled` 3.44s，`TestHardAClientCore` 56.15s（`foreign-stays` 16.35s，`unmanaged-prefs` 25.70s，`enroll-down` 5.69s），`TestEnrollConnectAndReauth` 36.79s，`TestLanDirect` 30.28s，`TestLanAwayRelay` 22.88s，`TestGatewaySubnetRoute` 37.17s（`ManualApprove` 10.42s，`AutoApprovers` 5.11s），`TestR3svcSystemdMachineService` 53.49s，`TestR4CEmbeddedStaticAndRoleSwap` 42.97s，`TestR4CRootLockNamespace` 18.45s，`TestR4CServiceRootProofs` 13.66s，`TestWireAccessForwardsAndSOCKS5` 36.87s（日志 `max_connections refusal in 0s` 与 `wire access ok: tcp, unix mode 0600, socks5 auth, cap refusal 0s`），`TestWizardGatewayJoin` 52.93s。本代理的 `idoris-vpn-r4c-*` 与 `idoris-vpn-r3svc-*` 容器在结束时已经清掉。当时还在的 `idoris-vpn-r2d-533526-*` 属于另一条工作，没有动。macOS 的 `launchctl`、Windows 的 `icacls`、`schtasks` 和 `LockFileEx` 没有在对应系统上执行。
+
 ## 11. 身份绑定、环境变量、锁
 
 ### 身份与控制面
@@ -245,15 +247,19 @@ iOS / Android 同时只允许一个活动 VPN。这次没有在手机上验证�
 
 路径：`state_file`，flag `--state-file`，环境变量 `IDORIS_VPN_STATE_FILE`。这三者先于任何缺省。都空时，若 `STATE_DIRECTORY` 已设置，用 `$STATE_DIRECTORY/vpnd-state.json`。systemd 的 `StateDirectory=idoris` 会把这个变量设成 `/var/lib/idoris`；多个目录时值是冒号分隔的列表，取第一段，而且必须是绝对路径。Windows 路径不按冒号切开，因为盘符里就有冒号。`STATE_DIRECTORY` 设了但不是绝对路径，报错，错误文本里有 `STATE_DIRECTORY`，不会悄悄退回主目录。都没设置时，Windows 用 `%AppData%\idoris\vpnd-state.json`，否则 `$XDG_STATE_HOME/idoris/vpnd-state.json`，再否则 `~/.idoris/vpnd-state.json`。`STATE_DIRECTORY` 和 `HOME` 都没有时，错误同样点名 `STATE_DIRECTORY`，而不是只说 `$HOME is not defined`。模式 0600。这与嵌入式节点的 `state_dir` 不是同一个文件。嵌入式目录的顺序相同：显式 `state_dir` / `--state-dir` / `IDORIS_VPN_STATE_DIR`，然后 `$STATE_DIRECTORY/node`，然后 `~/.idoris/vpn-state`。
 
-已绑定的 tenant 或 role 与这次凭证不一致时（换了租户、换了角色、管理员机器拿到成员令牌、成员 profile 拿到 Local AI 令牌），不把现有 profile 报成 `connected`。日志写下绑定值与期望值（不写下令牌），然后向正确身份重新 enroll。这次登录用的是我们自己的 profile，所以允许切换。同一条 control URL、不同的 tenant 或 role，同样重新 enroll。只有指纹变了、tenant 和 role 没变，不重新 enroll，只更新指纹。
+已绑定的 tenant 或 role 与这次凭证不一致时，不把当前节点报成 `connected`。过渡开始时记下当时的节点 ID 和节点公钥（LocalAPI `Self.PublicKey`）。系统模式再记下这次登录返回时所在的 profile。完成条件是 LocalAPI 显示 Running，并且节点公钥或节点 ID 与记下的不同；系统模式还要求当前 profile 就是登录返回时的那个。登录之后 profile 又被换成另一个，这次不认证，用屏幕上的节点重新开始过渡。`StartLoginInteractive` 会换一把节点公钥。真实 Headscale 对同一把机器钥重新认证时保持节点 ID，所以完成与否看这次登录事务，不看节点 ID 有没有被换掉。节点公钥不写进日志。
 
-还没有绑定（升级上来的旧状态文件，或第一次成功登录）时，接受当前 profile 并写下绑定。标签证明不了租户；这一条是升级路径，不是「换了租户还继续用旧节点」。
+产品还没有发布，节点 ID 为空的旧绑定不另做迁移。tenant 和 role 已经对上、节点 ID 和 profile ID 仍空的绑定，在确认时补上这两个 ID，只写一次，不再铸 key。tenant、role、节点、profile 全空的绑定不能把已经在跑的节点静默认证成当前凭证，必须先 enroll 一次。只有指纹变了，tenant、role、节点和 profile 都没变，仍然不重新 enroll，写入时更新指纹。
 
-启动时发现失败：配置若钉了一条与已保存 URL 不同的 control URL，拒绝启动。否则用钉住的 URL，或已保存的 URL，继续跑，**不**为了探活去 enroll。只有节点确实需要登录时才 enroll。状态里 `enroll_reachable` 为 false，`warnings` 说明注册服务不可达、沿用已保存的控制面和节点身份。静态 auth key、没有 enroll URL 时，不算不可达。发现失败期间，已保存的 `local-ai` / `gateway` 角色仍然生效，不会因为发现失败而掉回 embedded。
+没有 `enroll_url` 的静态 auth key 不做发现，身份标成 Static。绑定写成 Static 之后，门信任这把凭证正在跑的节点，只要节点 ID 以及系统模式的 profile ID 不和绑定矛盾。嵌入式的转发和 SOCKS5 因此可以打开。`TestR4CEmbeddedStaticAndRoleSwap` 在真实 Headscale 上先用静态 key 连上一个新的嵌入式节点（新节点先停在 NeedsLogin，静态 key 用了一次），再把凭证换成另一个角色：节点 ID 不变，只铸一把新 key，状态到 `connected`。
 
-以下取代「还没有绑定就接受当前 profile」。绑定在身份确认时写下正在跑的节点：self 的稳定 ID（`tailcfg.StableNodeID`）。系统模式在 LocalAPI 给出非空 profile ID 时一并写入；嵌入式不记 profile。每一轮正在跑的节点或（系统模式）profile 与绑定不一致，身份视为未确认，走和凭证变化同一条重新 enroll。租户、角色、节点、profile 都空的绑定不能把已经在跑的节点静默认证成当前凭证，必须先有一次确认过的 enroll。这一进程刚刚 enroll 成功、第一次看到 Running 的新装机可以写下绑定，不必再铸一把 key。只有指纹变了，tenant、role、节点和 profile 都没变，仍然不重新 enroll，只更新指纹。
+启动时发现失败：配置若钉了一条与已保存 URL 不同的 control URL，拒绝启动。否则继续跑，不因为探活去铸 key。指纹与已保存绑定相同，而且正在跑的节点 ID、系统模式的 profile ID 都不和绑定矛盾，访问保持打开，警告只说明注册服务不可达。指纹不同，或者节点 ID、profile ID 已经矛盾，保存的身份不算确认：访问保持关闭，状态里写明身份未确认，不为此再铸 key。节点本身需要登录时仍走原来的登录路径。
 
-发现失败时，已保存的角色只有在该绑定的令牌指纹与当前凭证指纹相同才采用。指纹缺失或不一致，配置里的角色不动。配置明确是 `local-ai` 或 `gateway` 时，不会被已保存的 `member` 或 `admin` 换下去，因此不会在发现失败时掉进 embedded、把旧成员节点报成 connected。注册服务恢复之后，下一次铸 key 之前先再 discover 一次，刷新身份和角色；discover 仍失败就不铸 key。
+登录路径在铸 key 之前会再 discover 一次。发现出的角色要求系统模式（`local-ai`、`gateway`；`admin` 不要求）而当前后端是嵌入式时，不 enroll，停在错误状态。正文说明要安装官方 tailscaled、改用系统模式，并且不会 enroll。
+
+进行中的过渡（不匹配的节点 ID 和节点公钥、profile、开始时间、登录是否已返回）写在同一状态文件。进程在退避里重启时读回这份记录，把未完成的过渡做完，不因为重启再铸一把 key。落盘失败则内存回到上一份。
+
+能控制本机 tailscaled 的用户可以让 LocalAPI 谎报节点和 profile。守护进程信 LocalAPI。这是明确不做的目标。
 
 登录退避写在同一状态文件：下一次允许铸 key 的时间，以及连续未收敛的次数。请求 key 之前先落盘。写失败就不铸 key，内存也不提前记成已经退避。新进程遵守这个时间。没有存过身份的新节点允许立刻试一次。`SetIdentity` 和 `RememberControl` 只在文件替换成功之后改内存，写失败的下一轮仍是旧绑定。状态目录用 `EnsurePrivateDir`（拒绝符号链接、非属主、group 或 other 可写）。替换用独占临时文件再 rename，不写 `路径.tmp`，预置在旧临时名上的符号链接不会被跟着写出去。
 
@@ -294,7 +300,7 @@ iOS / Android 同时只允许一个活动 VPN。这次没有在手机上验证�
 
 `dial_timeout` 是时长字符串，例如 `10s`。空字符串用 10 秒。解析失败或小于等于 0 拒绝。`max_connections` 小于 0 拒绝，0 用默认 64。`socks5_allow_anonymous` 为 true 时再写 `socks5_auth_file` 是错误。
 
-Unix 上，令牌文件、auth key 文件、状态文件、SOCKS5 凭据文件，以及在 JSON 里直接写了 `enroll_token` 或 `auth_key` 的配置文件，必须是普通文件、属主为当前用户、权限不含 group/other（`chmod 600`）。符号链接拒绝。错误文本里带有 `chmod 600`。只指向 `enroll_token_file`、自身没有 inline 密钥的配置文件可以是 0644。Windows 上同一检查只打警告，不拒绝。`service install`（用户级和 `--system`）在真正安装之前调用 `vpnd.CheckSecretFile`：登记令牌文件、auth key 文件、`socks5_auth_file`，以及含有 inline `enroll_token` 或 `auth_key` 的配置文件。失败就中止，错误里有 `chmod 600`。`--system` 的 root 检查在这之后。Windows 上这一步只警告。
+Unix 上，令牌文件、auth key 文件、状态文件、SOCKS5 凭据文件，以及在 JSON 里直接写了 `enroll_token` 或 `auth_key` 的配置文件，必须是普通文件、属主为当前用户、权限不含 group/other（`chmod 600`）。符号链接拒绝。错误文本里带有 `chmod 600`。只指向 `enroll_token_file`、自身没有 inline 密钥的配置文件可以是 0644。Windows 上同一检查只打警告，不拒绝。用户级 `service install` 在安装前对这几份文件调用 `vpnd.CheckSecretFile`。`--system` 不走这一条：进程是 root 时，属主是调用 sudo 的用户的 0600 文件会被它拒绝。机器服务接受 0600 的普通文件，属主是 root，或者本进程是 root、`SUDO_UID` 已设置、并且 `stat` 的 uid 等于这个值。`SUDO_UID` 在非 root 进程上不放宽检查。接受之后把文件复制到服务状态目录（`enroll_token`、`auth_key`、`socks5.auth`），模式 0600、属主 root，安装进去的配置改指副本。复制中途失败会删掉已经写下的副本。`TestR4CServiceRootProofs` 在 Debian 容器里用 root 跑过：文件 chown 到 uid 1000 后，`SUDO_UID` 未设置或设成别的 uid 就拒绝，设成 1000 则接受，副本属主是 0；非 root 子进程即使带着 `SUDO_UID` 也不接受 root 拥有的文件。Windows 上这道属主检查直接返回，保护靠目录 ACL。`icacls` 没有在这台 Mac 上执行。
 
 2026-10-28。注册令牌和 auth key 各是一整份凭证，inline 和文件二选一。优先级仍是配置文件、然后环境变量、然后 flag。更高一层写了其中一边，就清掉较低层留下的另一边。同一层两边都写（配置文件里两个字段、两个环境变量、或两个 flag）直接报错，错误里有 `both`。空白的环境变量不算设置。flag 只要出现在命令行上就算设置，空字符串也会清掉较低层。`Resolve` 只在 inline 为空时读文件；两边都还在则拒绝。单测对两份凭证各跑了文件、环境变量、flag 三层。
 
@@ -304,9 +310,11 @@ Windows 上 Go 把普通文件的权限报成 0666。SOCKS 凭据的加载不再
 
 改某个后端之前先拿操作系统的排他锁。system：套接字路径的 SHA-256，锁文件放在默认状态文件所在目录；套接字为空时键名是 `default`。embedded：`<state_dir>/controller.lock`。Unix 用 `flock`（`LOCK_EX|LOCK_NB`），进程活着就持有，`Close` 时释放。第二个守护进程立刻失败，错误含有 `another idoris-vpnd`。`local-ai` / `gateway` 在等待 tailscaled 之前就拿 system 锁，所以第二个进程不用等到 tailscaled 起来才失败。`member` 的 `auto` 只锁最终选中的那个后端：选了 embedded 就不会锁系统套接字。Windows 上是尽力创建锁文件，不保证互斥。
 
-2026-10-28 起，system 锁的位置如下。空套接字先换成 `paths.DefaultTailscaledSocket()`，再做 `Clean`；相对路径先 `Abs`；`EvalSymlinks` 解析已经存在的部分，最后一级还不存在就把缺失的尾巴拼回去。Windows 管道（前缀 `\\` 或 `//./pipe/`）不解析符号链接。`STATE_DIRECTORY` 已设置时，锁文件是 `$STATE_DIRECTORY/locks/<sha256>.lock`。否则锁文件在 `os.UserCacheDir()/idoris/locks/<sha256>.lock`。`XDG_STATE_HOME` 不改变锁目录。目录经 `fsutil.EnsurePrivateDir`。文件模式 0600。打开时拒绝符号链接：Unix 用 `O_NOFOLLOW`，Windows 用 `FILE_FLAG_OPEN_REPARSE_POINT` 并检查 reparse 属性。显式写出的默认套接字和留空是同一把锁。embedded 仍是规范路径下的 `controller.lock`，符号链接目录和真实目录共用一把。状态套接字的 flock 在同一个锁目录里，键和控制器锁不同，所以它不是那把控制器锁。
+2026-10-28 起，system 锁的位置如下。空套接字先换成 `paths.DefaultTailscaledSocket()`，再做 `Clean`；相对路径先 `Abs`；`EvalSymlinks` 解析已经存在的部分，最后一级还不存在就把缺失的尾巴拼回去。Windows 管道（前缀 `\\` 或 `//./pipe/`）不解析符号链接。root（euid 0）固定用 `/var/lib/idoris/locks`，不看 `STATE_DIRECTORY`、`HOME` 或 `XDG_*`。非 root 才是：`STATE_DIRECTORY` 已设置则 `$STATE_DIRECTORY/locks/<sha256>.lock`，否则 `os.UserCacheDir()/idoris/locks/<sha256>.lock`。Windows 上提升的令牌或 LOCAL SYSTEM（S-1-5-18）用 `%ProgramData%\idoris\locks`，没有 `ProgramData` 时是 `C:\ProgramData\idoris\locks`。目录经 `fsutil.EnsurePrivateDir`。文件模式 0600。打开时拒绝符号链接：Unix 用 `O_NOFOLLOW`，Windows 用 `FILE_FLAG_OPEN_REPARSE_POINT` 并检查 reparse 属性。显式写出的默认套接字和留空是同一把锁。embedded 仍是规范路径下的 `controller.lock`，符号链接目录和真实目录共用一把。状态套接字的 flock 在同一个锁目录里，键和控制器锁不同，所以它不是那把控制器锁。
 
-本机用重新执行的测试进程核实了两件：两个进程 `XDG_STATE_HOME` 不同、LocalAPI 套接字相同，第二个失败，错误含 `another idoris-vpnd`；一个进程锁空套接字，另一个用显式的默认套接字路径，同样失败。darwin 上 `UserCacheDir` 是 `$HOME/Library/Caches`。`STATE_DIRECTORY` 没设置时，root 和普通用户的缓存目录不同，套接字路径相同也不会把两把锁放进同一个目录。互斥只在解析到同一个目录的进程之间。机器服务和手工再起的 root 进程要互相挡住，两边都得看到同一个 `STATE_DIRECTORY`（systemd 会设，手工起要自己设）。这一点对照 Go 的 `os.UserCacheDir` 核对过。真机 systemd 上的第二实例见 docs/14 第 11 节。
+本机用重新执行的测试进程核实了非 root 的两件：两个进程 `XDG_STATE_HOME` 不同、LocalAPI 套接字相同，第二个失败，错误含 `another idoris-vpnd`；一个进程锁空套接字，另一个用显式的默认套接字路径，同样失败。`TestR4CRootLockNamespace` 在 Debian 容器里以 euid 0 再跑：两个进程的 `STATE_DIRECTORY`、`HOME`、`XDG_*` 不同，第二进程被拒绝，锁在 `/var/lib/idoris/locks`。非 root 的用户守护进程和 root 机器服务仍是不同目录。支持的部署是每个后端恰好一个控制器。一个已经是管理员的 Windows 进程可以改 `ProgramData`，把机器锁目录指到别处。
+
+状态文件在读或写之前先拿一把跨进程锁。锁文件是状态文件规范路径加 `.lock`，持有到进程退出。同一进程里对同一路径再打开一次可以成功。另一个进程失败，错误含 `another idoris-vpnd` 和 `state file backend`。本机重新执行的子进程核实过：父进程写下退避时间，子进程打不开，文件字节不变。systemd 里的第二实例也先撞上这把锁。Windows 用 `LockFileEx`，没有在 Windows 上执行。
 
 Windows 用 `LockFileEx`（`LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY`，`golang.org/x/sys/windows`）。第二个持有者失败，错误同样含 `another idoris-vpnd`。这套代码没有在 Windows 上执行。`GOOS=windows go build` 和 `go vet` 通过。
 
@@ -318,7 +326,11 @@ Windows 用 `LockFileEx`（`LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY`�
 - MagicDNS 只核实了短名 `acme-local-ai`。没有单独打 FQDN。
 - Windows 命名管道上的 LocalAPI、macOS GUI 版与嵌入式节点并存，这次没有再测。
 - iOS / Android 的单 VPN 限制没有在设备上验证。
-- Windows 上的密钥文件检查和控制器锁没有在 Windows 上跑过。Unix 的 `flock` 与 `chmod 600` 拒绝在本机（darwin）单测里通过。Windows 构建能编过。
+- Windows 上的密钥文件检查、控制器锁、`LockFileEx`、`icacls` 和 `schtasks` 没有在 Windows 上跑过。Unix 的 `flock` 与 `chmod 600` 拒绝在本机（darwin）单测里通过。`GOOS=windows go vet` 通过。macOS 的 `launchctl` 没有在这台 Mac 上执行，plist 只有 golden。
+- 非 root 的用户守护进程和 root 机器服务用不同的锁目录。支持的部署是每个后端恰好一个控制器。
+- `SwitchProfile` 之前的再读和 LocalAPI 调用之间仍有窗口。能控制本机 tailscaled 的用户可以谎报节点和 profile。
+- 状态文件锁持有到进程退出。同一进程里第二次打开同一路径可以成功。
+- 失败的 Windows 重装会删掉 `C:\ProgramData\idoris`，包括上一次成功安装留在那里的文件。顺序由注入的安装器核实：先保护目录，再写密钥；缺少 `auth_key_file` 时删掉这一次的部分安装。`icacls` 本身没有执行。
 
 ## 13. 本机转发与 SOCKS5 的访问控制
 
@@ -335,9 +347,11 @@ Windows 用 `LockFileEx`（`LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY`�
 
 系统模式如果还没有连上本组织的控制面，Gate 关闭。状态是 `suspended`（`failed` 和 `closed` 优先，只改写 `listening`）。新连接马上关掉，不会向外拨号。启动时 `accessOptions` 把 `AccessOpen` 接成 Gate。嵌入式模式始终打开。系统模式只在协调器快照的 `current_control_url` 与本进程的控制 URL 被 `SameControlURL` 判成同一台（忽略大小写、末尾斜杠、默认端口；Tailscale SaaS 的同义地址也算），并且 phase 是 `connected` 或 `routes-pending-approval` 时打开。状态里的 `control_url` 永远是本进程想要的地址，不拿来做这比较。其他模式关闭。
 
-以下取代「嵌入式模式始终打开」和「只看协调器快照」。嵌入式和系统模式都要同时满足：身份已确认（不在 identity-mismatch，也不是 enrollment 失败），phase 是 `connected` 或 `routes-pending-approval`，并且 LocalAPI 当前的 control URL 与本进程是同一台。Gate 自己读 prefs 和 status，缓存不超过 1 秒；读失败按关闭。系统模式再对绑定里的节点 ID 和 profile ID，两边都非空且不同则关闭。协调器在 phase、控制面、profile 或身份变化时把所有权加一代。每个已接受的连接记下接受时的代；代变了且门已关闭，这条连接被关掉，包括还没返回的拨号。门仍然开着的代变化（例如 `connected` 到 `routes-pending-approval`）不拆已建立的流。
+以下取代「嵌入式模式始终打开」和「只看协调器快照」。嵌入式和系统模式都要同时满足：身份已确认，phase 是 `connected` 或 `routes-pending-approval`，并且 LocalAPI 当前的 control URL 与本进程是同一台。静态 key 在绑定写成 Static 且节点不矛盾时也算确认。发现失败时只有同一指纹、且节点不矛盾，才保持打开。Gate 自己读 prefs 和 status，缓存不超过 1 秒；读失败按关闭。一次求值记下开始时的所有权代和求值序号。代已经变了，或者有更新的求值已经发表，这次结果不缓存，也不当作允许。`TestR4CStaleOwnershipEvaluationIsDiscarded` 在 `-race` 下核实过。系统模式再对绑定里的节点 ID 和 profile ID，两边都非空且不同则关闭。
 
-已知限制：官方 GUI 和 `tailscale` CLI 仍可能在两次 prefs 读取之间切走 profile，控制器锁排除不了它们。回环上的 TCP 转发让这台机器的每个本地用户都借用本节点身份；要收紧监听，用 `unix:`。
+协调器在 phase、控制面、profile 或身份变化时把所有权加一代。接受连接、拨号和登记流用同一次准入代。代过期就撤掉这条流和还没返回的拨号，即使门已经用另一个身份重新打开。`TestR4CAdmissionGenerationSurvivesReopen` 在 `-race` 下核实过。旧的匿名 SOCKS 入口不再导出。包内测试仍能打开它。守护进程只调用 `StartAccess`，匿名只来自显式的 `socks5_allow_anonymous`。
+
+已知限制：官方 GUI 和 `tailscale` CLI 仍可能在再读和 `SwitchProfile` 之间切走 profile，控制器锁排除不了它们。能控制 tailscaled 的本地用户可以谎报 LocalAPI。回环上的 TCP 转发让这台机器的每个本地用户都借用本节点身份；要收紧监听，用 `unix:`。
 
 `tailscale.com/net/socks5` 的 `Server` 能做用户名密码，但它自己 `Accept`、用固定 5 秒和 `context.Background` 拨号、不限连接数，第一次 `Accept` 失败就退出。所以这里没有用它的 `Serve`，CONNECT 和认证是一层薄实现。
 
