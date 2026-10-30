@@ -46,14 +46,14 @@ func (l *ControllerLock) Release() error {
 }
 
 // LockSystem locks the system tailscaled this daemon will drive.
-// The lock file is named by the canonical LocalAPI socket and lives in
+// The lock file is named by the canonical LocalAPI socket. A root process
+// (and an elevated or SYSTEM Windows process) always uses one machine-wide
+// directory, ignoring STATE_DIRECTORY and HOME. Every other process uses
 // $STATE_DIRECTORY/locks when that variable is set, otherwise
 // os.UserCacheDir()/idoris/locks. XDG_STATE_HOME and an explicit spelling
-// of the default socket do not create a second lock. Two OS users still have
-// two directories when STATE_DIRECTORY is unset: a root system service and a
-// user daemon do not exclude each other. A machine service sets
-// STATE_DIRECTORY, so a second root process started with that same value
-// does.
+// of the default socket do not create a second lock. A non-root user daemon
+// and a root service do not share a directory; supported setups run one
+// controller per backend.
 func LockSystem(socketPath string) (*ControllerLock, error) {
 	path, err := systemLockPath(socketPath)
 	if err != nil {
@@ -84,6 +84,14 @@ func LockEmbedded(stateDir string) (*ControllerLock, error) {
 }
 
 func systemLockDir() (string, error) {
+	if dir, err := machineLockDir(); err != nil {
+		return "", err
+	} else if dir != "" {
+		if err := fsutil.EnsurePrivateDir(dir); err != nil {
+			return "", err
+		}
+		return dir, nil
+	}
 	var dir string
 	if sd, err := serviceStateDir(); err != nil {
 		return "", err
@@ -170,8 +178,7 @@ func isPipePath(path string) bool {
 // statusLockPath is the flock held for the whole life of one status socket.
 // The hash is prefixed so it cannot collide with the controller lock of a
 // LocalAPI socket that happens to use the same path. It lives in the same
-// directory as the controller lock (STATE_DIRECTORY/locks, or the per-user
-// cache) and is not that lock.
+// directory as the controller lock and is not that lock.
 func statusLockPath(addr string) (string, error) {
 	dir, err := systemLockDir()
 	if err != nil {
