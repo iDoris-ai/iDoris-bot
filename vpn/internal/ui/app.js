@@ -173,6 +173,7 @@
     document.getElementById("plan").textContent = "先识别网络，再使用建议。";
   }
 
+  var savedRole = "";
   var confirmBox = document.getElementById("confirm-authority");
   var replaceBox = document.getElementById("replace-existing");
   var enableBtn = document.getElementById("enable");
@@ -204,7 +205,21 @@
     if (localAI === false && !whole && ip) {
       body.device_ips = [ip];
     }
+    if (savedRole === "member" || savedRole === "admin") {
+      body.this_machine_is_local_ai = false;
+      body.whole_subnet = false;
+      body.device_ips = [];
+    }
     return body;
+  }
+
+  function showGatewayQuestions(show) {
+    ["ai-question", "yes-ai", "no-ai", "detect", "device-label", "device", "probe", "whole-label"].forEach(function (id) {
+      var node = document.getElementById(id);
+      if (node) {
+        node.hidden = !show;
+      }
+    });
   }
 
   document.getElementById("save-code").addEventListener("click", function () {
@@ -222,8 +237,23 @@
       clearConfirmation();
       shownAuthority = view.authority || "";
       shownRev = view.join_rev || 0;
+      var previousRole = savedRole;
+      savedRole = view.role || "";
       document.getElementById("authority").textContent = "登记服务器：" + (view.authority || "");
       document.getElementById("code-state").textContent = "已保存。租户 " + view.tenant + "，角色 " + view.role + "。加入码已从输入框清掉。请核对上面的登记服务器。";
+      if (savedRole === "member" || savedRole === "admin") {
+        showGatewayQuestions(false);
+        localAI = false;
+        document.getElementById("role-state").textContent = savedRole === "admin"
+          ? "这台机器以管理员加入，不开通网关，也不通告局域网。"
+          : "这台机器以成员加入，不开通网关，也不通告局域网。";
+      } else {
+        showGatewayQuestions(true);
+        if (previousRole === "member" || previousRole === "admin") {
+          localAI = null;
+          document.getElementById("role-state").textContent = "";
+        }
+      }
     }).catch(showError);
   });
 
@@ -256,6 +286,10 @@
     showError("");
     if (!confirmBox.checked) {
       showError(new Error("先确认：这是我组织的服务器"));
+      return;
+    }
+    if (savedRole === "member" || savedRole === "admin") {
+      post("/api/plan", answers()).then(renderPlan).catch(showError);
       return;
     }
     if (localAI === null) {

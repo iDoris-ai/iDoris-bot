@@ -717,11 +717,14 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// The join code is bound to one role. Refuse before Discover, and leave
-	// the plan cleared: this request was a re-plan that cannot be built.
-	if err := gateway.ValidateRoleChoice(held.Role, body.ThisMachineIsLocalAI); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
+	// A gateway or local-ai code is bound to that role. Refuse before Discover,
+	// and leave the plan cleared: this request was a re-plan that cannot be built.
+	// Member and admin codes do not answer the gateway questions.
+	if held.Role != join.RoleMember && held.Role != join.RoleAdmin {
+		if err := gateway.ValidateRoleChoice(held.Role, body.ThisMachineIsLocalAI); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	discoverWarning := s.discoverInto(r.Context(), held)
 	role, err := gateway.ReconcileRole(held.Role, "", held.DiscoveredRole)
@@ -731,7 +734,9 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	}
 	held.Role = role
 	var plan gateway.Plan
-	if body.ThisMachineIsLocalAI {
+	if held.Role == join.RoleMember || held.Role == join.RoleAdmin {
+		plan, err = gateway.SimplePlan(held.Role, held.Tenant, held.Hostname)
+	} else if body.ThisMachineIsLocalAI {
 		plan, err = gateway.BuildPlan(gateway.Request{
 			ThisMachineIsLocalAI: true, Tenant: held.Tenant, Hostname: held.Hostname,
 		})
