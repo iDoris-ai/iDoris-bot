@@ -24,7 +24,7 @@ func TestR4WSidecarUsesTheWholeFileName(t *testing.T) {
 		t.Fatal("office.json and office.conf share a sidecar")
 	}
 	def := PathsFor(home, "")
-	if def.Token != filepath.Join(home, ".idoris", "enroll.token") || def.Plan != filepath.Join(home, ".idoris", "gateway-plan.json") {
+	if def.Token != filepath.Join(home, ".idoris", "vpn.json.enroll-token") || def.Plan != filepath.Join(home, ".idoris", "gateway-plan.json") {
 		t.Fatalf("default %+v", def)
 	}
 	historical := PathsFor("", filepath.Join(home, ".idoris", "vpn.json"))
