@@ -108,10 +108,16 @@ func DefaultListen() string {
 	return "unix:" + filepath.Join(base, "vpnd.sock")
 }
 
-// Forward is one loopback TCP listener and the tailnet target it dials.
+// Forward is one loopback listener and the tailnet target it dials.
+// Listen is host:port or unix:<absolute path>.
 type Forward struct {
 	Listen string `json:"listen"`
 	Target string `json:"target"`
+	// OwnerOnly, on Linux, drops TCP connections whose peer uid is not the
+	// daemon's uid. On other operating systems a TCP OwnerOnly is a
+	// configuration error: the peer uid cannot be read reliably. A unix:
+	// listener is created mode 0600, so OwnerOnly changes nothing there.
+	OwnerOnly bool `json:"owner_only,omitempty"`
 }
 
 // DefaultStateDir is the embedded node's state directory, under the user's
@@ -352,6 +358,7 @@ func (c *Config) Resolve() error {
 }
 
 func (c *Config) validateForwards() error {
+	var ownerOnly []string
 	for i, f := range c.Forwards {
 		if err := ValidateForwardListen(f.Listen); err != nil {
 			return fmt.Errorf("forwards[%d].listen: %w", i, err)
@@ -359,6 +366,21 @@ func (c *Config) validateForwards() error {
 		if _, _, err := net.SplitHostPort(f.Target); err != nil {
 			return fmt.Errorf("forwards[%d].target %q: %w", i, f.Target, err)
 		}
+		if !f.OwnerOnly {
+			continue
+		}
+		network, address, err := splitListen(f.Listen)
+		if err != nil {
+			return fmt.Errorf("forwards[%d].listen: %w", i, err)
+		}
+		// unix: is already mode 0600. OwnerOnly does not need a peer-uid check.
+		if network != "tcp" {
+			continue
+		}
+		if !ownerOnlySupported {
+			return fmt.Errorf("forwards[%d].owner_only: refusing TCP owner checks on %s because the peer uid cannot be read reliably (Linux reads /proc/net/tcp; this OS does not). Use a unix: listener, which is created mode 0600", i, runtime.GOOS)
+		}
+		ownerOnly = append(ownerOnly, address)
 	}
 	if c.SOCKS5Listen != "" {
 		if err := ValidateForwardListen(c.SOCKS5Listen); err != nil {
@@ -380,6 +402,10 @@ func (c *Config) validateForwards() error {
 			return errors.New("dial_timeout must be > 0")
 		}
 	}
+	// Publish only after the config is valid, so a rejected file does not
+	// arm or clear the listener policy. StartAccess calls listenLocal and
+	// cannot see Forward.OwnerOnly directly.
+	setOwnerOnlyListens(ownerOnly)
 	return nil
 }
 
