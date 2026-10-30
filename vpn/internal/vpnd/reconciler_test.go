@@ -364,6 +364,44 @@ func TestForeignTailnetBlockedWithoutTakeover(t *testing.T) {
 	}
 }
 
+func TestServiceRoleForeignBlockDoesNotSuggestEmbedded(t *testing.T) {
+	be := &fakeBackend{
+		state: ipn.Running,
+		prefs: ipn.Prefs{ControlURL: "https://controlplane.tailscale.com", WantRunning: true},
+	}
+	r := newR(t, be, &countingKeys{}, func(o *Options) {
+		o.Takeover = false
+		o.Role = "local-ai"
+	})
+	snap, err := r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseBlocked || snap.Role != "local-ai" {
+		t.Fatalf("%+v err=%v", snap, err)
+	}
+	if strings.Contains(snap.LastError, "Set mode: embedded") {
+		t.Fatalf("must not suggest embedded: %s", snap.LastError)
+	}
+	if !strings.Contains(snap.LastError, "takeover: true") || !strings.Contains(snap.LastError, "local-ai") {
+		t.Fatalf("message: %s", snap.LastError)
+	}
+	for _, c := range be.calls {
+		if c == "ProfileStatus" || strings.HasPrefix(c, "Switch") || c == "Start" {
+			t.Fatalf("mutated profile: %v", be.calls)
+		}
+	}
+}
+
+func TestServiceRoleUnreachableWaits(t *testing.T) {
+	be := &fakeBackend{statusErr: errors.New("dial unix: no such file")}
+	r := newR(t, be, &countingKeys{}, func(o *Options) { o.Role = "gateway" })
+	snap, err := r.Step(context.Background())
+	if err == nil || snap.Phase != PhaseWaitingTailscaled || len(snap.Warnings) == 0 {
+		t.Fatalf("%+v err=%v", snap, err)
+	}
+	if !strings.Contains(snap.LastError, "gateway") || strings.Contains(snap.LastError, "mode: embedded") {
+		t.Fatalf("message: %s", snap.LastError)
+	}
+}
+
 func TestForeignStatesBlockedBeforeProfileMutation(t *testing.T) {
 	foreign := "https://controlplane.tailscale.com"
 	cases := []struct {
@@ -535,6 +573,61 @@ func TestStoppedIsResumed(t *testing.T) {
 	snap, _ := r.Step(context.Background())
 	if snap.Phase != PhaseStarting || be.calls[0] != "EditPrefs" || !be.prefs.WantRunning {
 		t.Fatalf("resume: %+v calls=%v", snap, be.calls)
+	}
+}
+
+func TestEnrollDownResumesSavedIdentityWithoutMinting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vpnd-state.json")
+	st, err := OpenState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetIdentity(ours, "acme", "member", "fp"); err != nil {
+		t.Fatal(err)
+	}
+	be := &fakeBackend{state: ipn.Running, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true, CorpDNS: true}}
+	keys := &countingKeys{}
+	r := newR(t, be, keys, func(o *Options) {
+		o.State = st
+		o.Role = "member"
+		o.EnrollUnreachable = true
+		o.Identity = Identity{Known: false}
+	})
+	snap, err := r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseConnected || keys.n != 0 || snap.EnrollReachable {
+		t.Fatalf("resume: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+	if len(snap.Warnings) != 1 || snap.Warnings[0] != EnrollUnreachableWarning {
+		t.Fatalf("warnings %+v", snap.Warnings)
+	}
+	if got := st.Get(); got.Tenant != "acme" || got.Role != "member" || got.TokenFingerprint != "fp" {
+		t.Fatalf("binding changed: %+v", got)
+	}
+}
+
+func TestEnrollDownMintsOnlyWhenLoginIsRequired(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vpnd-state.json")
+	st, err := OpenState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetIdentity(ours, "acme", "local-ai", "fp"); err != nil {
+		t.Fatal(err)
+	}
+	be := &fakeBackend{state: ipn.NeedsLogin, prefs: ipn.Prefs{ControlURL: ours}}
+	keys := &countingKeys{}
+	r := newR(t, be, keys, func(o *Options) {
+		o.State = st
+		o.Role = "local-ai"
+		o.EnrollUnreachable = true
+		o.Identity = Identity{Known: false}
+	})
+	snap, err := r.Step(context.Background())
+	if err != nil || snap.Phase != PhaseStarting || keys.n != 1 || !snap.EnrollReachable {
+		t.Fatalf("login required: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+	if got := st.Get(); got.Role != "local-ai" || got.Tenant != "acme" {
+		t.Fatalf("binding rewritten without a confirmed identity: %+v", got)
 	}
 }
 
