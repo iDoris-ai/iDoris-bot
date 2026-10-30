@@ -70,8 +70,9 @@ policy:
 
 dns:
   magic_dns: true
-  # Must differ from the server_url host. Members reach the Local AI host as
-  # e.g. local-ai.acme.idoris.internal
+  # Must differ from the server_url host. MagicDNS is
+  # <hostname>.<base_domain>, for example office-local-ai.idoris.internal.
+  # The organisation name is not part of the DNS name.
   base_domain: idoris.internal
   override_local_dns: false
   nameservers:
