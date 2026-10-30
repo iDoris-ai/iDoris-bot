@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -650,4 +651,117 @@ func remountDirReadOnly(t *testing.T, dir string) bool {
 		return false
 	}
 	return true
+}
+
+// TestReadOnlyEmptyFileDoesNotRestore is the unlocked fallback. An empty live
+// file plus a parsable .bak must stay empty, and the read must fail, so a
+// reload keeps the previous in-memory config instead of writing the backup.
+func TestReadOnlyEmptyFileDoesNotRestore(t *testing.T) {
+	path := writeHashes(t, 0o640, []string{HashToken("seed-token")})
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".bak", original, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Dir(path)
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	probe := filepath.Join(dir, ".probe-lock")
+	pf, perr := os.OpenFile(probe, os.O_CREATE|os.O_RDWR, 0o600)
+	if perr == nil {
+		_ = pf.Close()
+		_ = os.Remove(probe)
+		if err := os.Chmod(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if !mountReadOnlyLock(t, path+".lock") {
+			t.Skip("mode 0555 did not block create, and a read-only lock mount is unavailable")
+		}
+	}
+
+	if _, err := ReadFileLocked(path); err == nil || !strings.Contains(err.Error(), "empty or undecodable") {
+		t.Fatalf("err = %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("fallback wrote %q", got)
+	}
+	bak, err := os.ReadFile(path + ".bak")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(bak, original) {
+		t.Fatal("bak changed")
+	}
+	if _, statErr := os.Stat(path + ".lock"); !os.IsNotExist(statErr) {
+		// A root fixture mounts a read-only file on this path. A mode-0555
+		// directory must not grow a lock file.
+		if perr != nil {
+			t.Fatalf("lock file: %v", statErr)
+		}
+	}
+}
+
+// mountReadOnlyLock bind-mounts a read-only file onto lockPath. The config
+// file beside it stays writable, so a restore would be visible.
+func mountReadOnlyLock(t *testing.T, lockPath string) bool {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	src := filepath.Join(t.TempDir(), "locksrc")
+	if err := os.WriteFile(src, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lockPath, nil, 0o644); err != nil {
+		return false
+	}
+	if exec.Command("mount", "--bind", src, lockPath).Run() != nil {
+		_ = os.Remove(lockPath)
+		return false
+	}
+	t.Cleanup(func() { _ = exec.Command("umount", lockPath).Run() })
+	if exec.Command("mount", "-o", "remount,bind,ro", lockPath).Run() != nil {
+		return false
+	}
+	f, err := os.OpenFile(lockPath, os.O_RDWR, 0o600)
+	if err == nil {
+		_ = f.Close()
+		return false
+	}
+	return true
+}
+
+func TestENOSPCDoesNotUnlockRead(t *testing.T) {
+	wrap := func(err error) error {
+		return fmt.Errorf("enroll: lock: %w", &os.PathError{Op: "open", Path: "enroll.json.lock", Err: err})
+	}
+	if lockOpenDenied(wrap(syscall.ENOSPC)) {
+		t.Fatal("ENOSPC unlocked the read")
+	}
+	if lockOpenDenied(wrap(syscall.EMFILE)) {
+		t.Fatal("EMFILE unlocked the read")
+	}
+	if lockOpenDenied(fmt.Errorf("enroll: lock: %w", syscall.EACCES)) {
+		t.Fatal("errno without PathError unlocked the read")
+	}
+	if lockOpenDenied(errors.New("enroll: lock timeout")) {
+		t.Fatal("timeout unlocked the read")
+	}
+	for _, err := range []error{syscall.EACCES, syscall.EPERM, syscall.EROFS} {
+		if !lockOpenDenied(wrap(err)) {
+			t.Fatalf("%v did not unlock the read", err)
+		}
+	}
 }

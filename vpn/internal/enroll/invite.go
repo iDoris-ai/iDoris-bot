@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 
 	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/join"
 )
@@ -52,23 +54,63 @@ func ReadFileLocked(path string) ([]byte, error) {
 		b, err = readConfigBytes(path)
 		return err
 	})
-	// Opening the lock file failed. The published compose bind is one config
-	// file, so a sibling lock cannot be created there. Return the config bytes
-	// from an unlocked read. Writers still stop when they cannot create it.
-	// A flock failure and the non-unix timeout are a different error.
+	// EACCES, EPERM, and EROFS: the published compose bind is one config file,
+	// so the lock file cannot be created beside it. This read does not write.
+	// ENOSPC, EMFILE, and a held-lock failure stay errors.
 	if err != nil && lockOpenDenied(err) {
-		return readConfigBytes(path)
+		return readConfigUnlocked(path)
 	}
 	return b, err
 }
 
-// lockOpenDenied reports an OpenFile failure of the lock file.
+// readConfigUnlocked reads the canonical file and does not write it.
+// Empty or undecodable bytes are an error. Reload keeps the previous config.
+func readConfigUnlocked(path string) ([]byte, error) {
+	resolved, err := configPath(path)
+	if err != nil {
+		return nil, err
+	}
+	b, err := os.ReadFile(resolved) //nolint:gosec // path is the operator-chosen enroll config
+	if err != nil {
+		return nil, err
+	}
+	if len(b) == 0 || !decodesConfig(b) {
+		return nil, fmt.Errorf("enroll: config empty or undecodable")
+	}
+	return b, nil
+}
+
+// lockOpenDenied reports an open failure from a directory that rejects a new
+// lock file. EACCES, EPERM, and EROFS take the unlocked read.
 func lockOpenDenied(err error) bool {
 	if err == nil || !strings.HasPrefix(err.Error(), "enroll: lock:") {
 		return false
 	}
 	var pe *os.PathError
-	return errors.As(err, &pe)
+	if !errors.As(err, &pe) || pe.Err == nil {
+		return false
+	}
+	if errors.Is(pe.Err, os.ErrPermission) {
+		return true
+	}
+	return isEROFS(pe.Err)
+}
+
+// EROFS is 30 on linux and darwin, 69 on the other BSDs. This file builds on
+// every GOOS, so it compares the number instead of the per-OS symbol.
+func isEROFS(err error) bool {
+	var errno syscall.Errno
+	if !errors.As(err, &errno) {
+		return false
+	}
+	switch runtime.GOOS {
+	case "linux", "darwin", "ios":
+		return errno == 30
+	case "freebsd", "openbsd", "netbsd", "dragonfly":
+		return errno == 69
+	default:
+		return false
+	}
 }
 
 func readConfigBytes(path string) ([]byte, error) {
