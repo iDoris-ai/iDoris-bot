@@ -16,6 +16,11 @@ import (
 
 const launchdLabel = "ai.idoris.vpnd"
 
+// runServiceCommand runs systemctl, launchctl, and schtasks. Tests replace it.
+var runServiceCommand = func(name string, args ...string) ([]byte, error) {
+	return exec.Command(name, args...).CombinedOutput()
+}
+
 func serviceCmd(args []string) error {
 	if len(args) < 1 {
 		return errors.New("service: expected install or uninstall")
@@ -35,16 +40,21 @@ func serviceCmd(args []string) error {
 		if err != nil {
 			return err
 		}
-		if _, err := os.Stat(abs); err != nil {
+		if _, err := os.Stat(abs); err != nil { //nolint:gosec // G703: operator-chosen config path, made absolute
 			return fmt.Errorf("config: %w", err)
 		}
-		// Both the user service and --system stop here. CheckSecretFile warns
-		// and returns nil on Windows; on Unix a failure contains "chmod 600".
+		// A user service requires the operator to own every secret. A machine
+		// service also accepts a 0600 file owned by the user who invoked sudo;
+		// checkSystemInstallSecrets is that check. CheckSecretFile would reject
+		// that file because the process is root.
+		if *system {
+			if err := checkSystemInstallSecrets(abs); err != nil {
+				return err
+			}
+			return installSystemService(abs)
+		}
 		if err := checkInstallSecrets(abs); err != nil {
 			return err
-		}
-		if *system {
-			return installSystemService(abs)
 		}
 		if err := installService(abs); err != nil {
 			return err
@@ -111,6 +121,45 @@ func checkInstallSecrets(configPath string) error {
 	return nil
 }
 
+// checkSystemInstallSecrets is the machine-service check. A 0600 file owned
+// by root, or by the user who invoked sudo, is accepted. The installer then
+// copies it to a root-owned path. A user service keeps CheckSecretFile.
+func checkSystemInstallSecrets(configPath string) error {
+	b, err := os.ReadFile(configPath) //nolint:gosec // operator-chosen config, checked before install
+	if err != nil {
+		return err
+	}
+	var probe struct {
+		EnrollToken     string `json:"enroll_token"`
+		EnrollTokenFile string `json:"enroll_token_file"`
+		AuthKey         string `json:"auth_key"`
+		AuthKeyFile     string `json:"auth_key_file"`
+		SOCKS5AuthFile  string `json:"socks5_auth_file"`
+	}
+	if err := json.Unmarshal(b, &probe); err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	if probe.EnrollToken != "" || probe.AuthKey != "" {
+		if err := acceptInstallSecret(configPath); err != nil {
+			return fmt.Errorf("config holds an inline secret: %w", err)
+		}
+	}
+	files := []struct{ name, path string }{
+		{"enroll_token_file", probe.EnrollTokenFile},
+		{"auth_key_file", probe.AuthKeyFile},
+		{"socks5_auth_file", probe.SOCKS5AuthFile},
+	}
+	for _, f := range files {
+		if strings.TrimSpace(f.path) == "" {
+			continue
+		}
+		if err := acceptInstallSecret(f.path); err != nil {
+			return fmt.Errorf("%s: %w", f.name, err)
+		}
+	}
+	return nil
+}
+
 func selfPath() (string, error) {
 	p, err := os.Executable()
 	if err != nil {
@@ -120,6 +169,14 @@ func selfPath() (string, error) {
 }
 
 func installService(configPath string) error {
+	abs, err := filepath.Abs(configPath)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(abs); err != nil { //nolint:gosec // G703: operator-chosen config path, made absolute
+		return fmt.Errorf("config: %w", err)
+	}
+	configPath = abs
 	exe, err := selfPath()
 	if err != nil {
 		return err
@@ -141,7 +198,7 @@ func installService(configPath string) error {
 }
 
 func rejectEnabledSystemUnit() error {
-	out, err := exec.Command("systemctl", "is-enabled", systemUnitName).CombinedOutput()
+	out, err := runServiceCommand("systemctl", "is-enabled", systemUnitName)
 	if err == nil && strings.TrimSpace(string(out)) == "enabled" {
 		return errors.New("the system unit is enabled; remove it with: idoris-vpnd service uninstall --system")
 	}
