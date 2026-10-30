@@ -27,20 +27,20 @@ func TestR3W1StaleJoinIsNotApplied(t *testing.T) {
 	codeA := r3w1Code(t, "https://a.example", "token-a-aaaaaaaaaaaaaaaaaaaa", "office-a")
 	codeB := r3w1Code(t, "https://b.example", "token-b-bbbbbbbbbbbbbbbbbbbb", "office-b")
 
-	if status, body := r3w1Post(t, client, srv, cap, csrf, "/api/join", map[string]any{"code": codeA}); status != http.StatusOK {
-		t.Fatalf("join A %d %s", status, body)
-	}
 	if status, body := r3w1Post(t, client, srv, cap, csrf, "/api/detect", map[string]any{}); status != http.StatusOK {
 		t.Fatalf("detect %d %s", status, body)
 	}
-	planBody := map[string]any{"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"}, "confirm_authority": true}
+	joinedA := r3w1ReadJoin(t, mustJoin(t, client, srv, cap, csrf, codeA))
+	planBody := joinedA.body(map[string]any{"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"}})
 	if status, body := r3w1Post(t, client, srv, cap, csrf, "/api/plan", planBody); status != http.StatusOK || !bytes.Contains(body, []byte("https://a.example")) {
 		t.Fatalf("plan A %d %s", status, body)
 	}
-	if status, body := r3w1Post(t, client, srv, cap, csrf, "/api/join", map[string]any{"code": codeB}); status != http.StatusOK {
+	status, body := r3w1Post(t, client, srv, cap, csrf, "/api/join", map[string]any{"code": codeB})
+	if status != http.StatusOK {
 		t.Fatalf("join B %d %s", status, body)
 	}
-	status, body := r3w1Post(t, client, srv, cap, csrf, "/api/apply", planBody)
+	joinedB := r3w1ReadJoin(t, body)
+	status, body = r3w1Post(t, client, srv, cap, csrf, "/api/apply", planBody)
 	mu.Lock()
 	seen := append([]applied(nil), calls...)
 	mu.Unlock()
@@ -50,6 +50,12 @@ func TestR3W1StaleJoinIsNotApplied(t *testing.T) {
 		}
 		t.Fatalf("stale apply accepted with no recorded call: %s", body)
 	}
+	if status != http.StatusBadRequest || !bytes.Contains(body, []byte("does not match the displayed enrollment authority")) {
+		t.Fatalf("A's confirmation after saving B %d %s", status, body)
+	}
+	status, body = r3w1Post(t, client, srv, cap, csrf, "/api/apply", joinedB.body(map[string]any{
+		"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"},
+	}))
 	if status != http.StatusConflict || !bytes.Contains(body, []byte("the plan is stale")) {
 		t.Fatalf("stale apply %d %s", status, body)
 	}
@@ -70,16 +76,16 @@ func TestR3W1FailedReplanDropsTheOldPlan(t *testing.T) {
 		return gateway.ApplyResult{}, nil
 	})
 	cap, csrf := r3w1Bootstrap(t, srv, client)
-	r3w1ReadyPlan(t, client, srv, cap, csrf, r3w1Code(t, "https://a.example", "token-a-aaaaaaaaaaaaaaaaaaaa", "office-a"))
-	status, body := r3w1Post(t, client, srv, cap, csrf, "/api/plan", map[string]any{
-		"this_machine_is_local_ai": false, "whole_subnet": true, "device_ips": []string{"10.251.73.10"}, "confirm_authority": true,
-	})
+	joined := r3w1ReadyPlan(t, client, srv, cap, csrf, r3w1Code(t, "https://a.example", "token-a-aaaaaaaaaaaaaaaaaaaa", "office-a"))
+	status, body := r3w1Post(t, client, srv, cap, csrf, "/api/plan", joined.body(map[string]any{
+		"this_machine_is_local_ai": false, "whole_subnet": true, "device_ips": []string{"10.251.73.10"},
+	}))
 	if status != http.StatusBadRequest {
 		t.Fatalf("bad replan %d %s", status, body)
 	}
-	status, body = r3w1Post(t, client, srv, cap, csrf, "/api/apply", map[string]any{
-		"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"}, "confirm_authority": true,
-	})
+	status, body = r3w1Post(t, client, srv, cap, csrf, "/api/apply", joined.body(map[string]any{
+		"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"},
+	}))
 	if status != http.StatusConflict || calls != 0 {
 		t.Fatalf("apply after failed replan %d calls %d %s", status, calls, body)
 	}
@@ -92,21 +98,21 @@ func TestR3W1DetectOrAnswersDropThePlan(t *testing.T) {
 		return gateway.ApplyResult{}, nil
 	})
 	cap, csrf := r3w1Bootstrap(t, srv, client)
-	r3w1ReadyPlan(t, client, srv, cap, csrf, r3w1Code(t, "https://a.example", "token-a-aaaaaaaaaaaaaaaaaaaa", "office-a"))
+	joined := r3w1ReadyPlan(t, client, srv, cap, csrf, r3w1Code(t, "https://a.example", "token-a-aaaaaaaaaaaaaaaaaaaa", "office-a"))
 	if status, body := r3w1Post(t, client, srv, cap, csrf, "/api/detect", map[string]any{}); status != http.StatusOK {
 		t.Fatalf("detect %d %s", status, body)
 	}
-	status, body := r3w1Post(t, client, srv, cap, csrf, "/api/apply", map[string]any{
-		"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"}, "confirm_authority": true,
-	})
+	status, body := r3w1Post(t, client, srv, cap, csrf, "/api/apply", joined.body(map[string]any{
+		"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"},
+	}))
 	if status != http.StatusConflict || calls != 0 {
 		t.Fatalf("apply after detect %d calls %d %s", status, calls, body)
 	}
 
-	r3w1ReadyPlan(t, client, srv, cap, csrf, r3w1Code(t, "https://a.example", "token-a-aaaaaaaaaaaaaaaaaaaa", "office-a"))
-	status, body = r3w1Post(t, client, srv, cap, csrf, "/api/apply", map[string]any{
-		"this_machine_is_local_ai": true, "confirm_authority": true,
-	})
+	joined = r3w1ReadyPlan(t, client, srv, cap, csrf, r3w1Code(t, "https://a.example", "token-a-aaaaaaaaaaaaaaaaaaaa", "office-a"))
+	status, body = r3w1Post(t, client, srv, cap, csrf, "/api/apply", joined.body(map[string]any{
+		"this_machine_is_local_ai": true,
+	}))
 	if status != http.StatusConflict || !bytes.Contains(body, []byte("does not match the answers")) || calls != 0 {
 		t.Fatalf("answer mismatch %d calls %d %s", status, calls, body)
 	}
@@ -125,8 +131,8 @@ func TestR3W1ConcurrentApplyIsRefused(t *testing.T) {
 	})
 	client.Timeout = 5 * time.Second
 	cap, csrf := r3w1Bootstrap(t, srv, client)
-	r3w1ReadyPlan(t, client, srv, cap, csrf, r3w1Code(t, "https://a.example", "token-a-aaaaaaaaaaaaaaaaaaaa", "office-a"))
-	applyBody := map[string]any{"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"}, "confirm_authority": true}
+	joined := r3w1ReadyPlan(t, client, srv, cap, csrf, r3w1Code(t, "https://a.example", "token-a-aaaaaaaaaaaaaaaaaaaa", "office-a"))
+	applyBody := joined.body(map[string]any{"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"}})
 	var firstCode int
 	var firstBody []byte
 	done := make(chan struct{})
@@ -153,20 +159,58 @@ func TestR3W1ConcurrentApplyIsRefused(t *testing.T) {
 	}
 }
 
-func r3w1ReadyPlan(t *testing.T, client *http.Client, srv *Server, cap, csrf, code string) {
+type r4wJoinView struct {
+	Authority string
+	JoinRev   uint64
+}
+
+func (j r4wJoinView) body(extra map[string]any) map[string]any {
+	out := map[string]any{
+		"confirm_authority": true,
+		"authority":         j.Authority,
+		"join_rev":          j.JoinRev,
+	}
+	for k, v := range extra {
+		out[k] = v
+	}
+	return out
+}
+
+func r3w1ReadJoin(t *testing.T, body []byte) r4wJoinView {
 	t.Helper()
-	if status, body := r3w1Post(t, client, srv, cap, csrf, "/api/join", map[string]any{"code": code}); status != http.StatusOK {
+	var v struct {
+		Authority string `json:"authority"`
+		JoinRev   uint64 `json:"join_rev"`
+	}
+	if err := json.Unmarshal(body, &v); err != nil || v.Authority == "" || v.JoinRev == 0 {
+		t.Fatalf("join view %s", body)
+	}
+	return r4wJoinView{Authority: v.Authority, JoinRev: v.JoinRev}
+}
+
+func mustJoin(t *testing.T, client *http.Client, srv *Server, cap, csrf, code string) []byte {
+	t.Helper()
+	status, body := r3w1Post(t, client, srv, cap, csrf, "/api/join", map[string]any{"code": code})
+	if status != http.StatusOK {
 		t.Fatalf("join %d %s", status, body)
 	}
-	if status, body := r3w1Post(t, client, srv, cap, csrf, "/api/detect", map[string]any{}); status != http.StatusOK {
-		t.Fatalf("detect %d %s", status, body)
+	return body
+}
+
+func r3w1ReadyPlan(t *testing.T, client *http.Client, srv *Server, cap, csrf, code string) r4wJoinView {
+	t.Helper()
+	body := mustJoin(t, client, srv, cap, csrf, code)
+	joined := r3w1ReadJoin(t, body)
+	if status, detectBody := r3w1Post(t, client, srv, cap, csrf, "/api/detect", map[string]any{}); status != http.StatusOK {
+		t.Fatalf("detect %d %s", status, detectBody)
 	}
-	status, body := r3w1Post(t, client, srv, cap, csrf, "/api/plan", map[string]any{
-		"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"}, "confirm_authority": true,
-	})
+	status, planBody := r3w1Post(t, client, srv, cap, csrf, "/api/plan", joined.body(map[string]any{
+		"this_machine_is_local_ai": false, "device_ips": []string{"10.251.73.10"},
+	}))
 	if status != http.StatusOK {
-		t.Fatalf("plan %d %s", status, body)
+		t.Fatalf("plan %d %s", status, planBody)
 	}
+	return joined
 }
 
 func r3w1Code(t *testing.T, enrollURL, token, host string) string {
