@@ -140,7 +140,7 @@ sequenceDiagram
 
 | 风险 | 控制 |
 |---|---|
-| Headscale API key 泄露 = 全网管理权 | 服务用 key 只存在于 `idoris-vpn-enroll` 容器挂载的文件里。容器不以 root 运行：操作员不是 root 时用该操作员的 uid/gid；操作员是 root 时改成镜像 USER `65532:65532`，启动前把密钥文件交给这个用户（日志写 refusing to run enroll as root）。只读根文件系统、`cap_drop: ALL`。没有在原生 Linux 上以 root 跑过 `bootstrap.sh`；属主交接在临时 Alpine 容器里看过，见 [14](14-VPN-OPERATIONS.md) 第 2 节。客户端拿到的是**一次性、10 分钟**的 preauthkey。运维登录 Headplane 用各自的 API key，需单独保管与轮换 |
+| Headscale API key 泄露 = 全网管理权 | 服务用 key 只存在于 `idoris-vpn-enroll` 容器挂载的文件里。容器不以 root 运行：操作员不是 root 时用该操作员的 uid/gid；操作员是 root 时改成镜像 USER `65532:65532`，启动前把密钥文件交给这个用户（日志写 refusing to run enroll as root）。只读根文件系统、`cap_drop: ALL`。没有在原生 Linux 上以 root 跑过 `bootstrap.sh`。探针和演练写 `.env` 时用同一条选择。替身 `id` 在 macOS 上看过 root 被改成 65532；整套探针和演练是在 Docker Desktop 上以非 root 用户跑的。属主交接在临时 Alpine 容器里看过，见 [14](14-VPN-OPERATIONS.md) 第 2 节。客户端拿到的是**一次性、10 分钟**的 preauthkey。运维登录 Headplane 用各自的 API key，需单独保管与轮换 |
 | 令牌泄露 | 令牌服务端只存 SHA-256（客户端保存的是**明文**令牌，被盗即可注册）；每台设备/每人单独签发邀请令牌（带标签），可单独撤销；按组织限流（默认 30/min）；每次签发写审计日志（tenant、hostname、令牌标签、来源地址）。Headscale 已经铸出 key、响应还没返回时若配置被换掉，按当前代次再核对一次：凭证已废，或租户、Headscale 用户、tag 变了，就作废这把 key 并返回 401，不把 key 交出去。见第 8 节 |
 | 中间人改写 control_url | 注册 URL 强制 https（`enroll_allow_insecure` 仅限实验室）；客户端若固定了 `control_url`，服务端返回不一致即拒绝 |
 | 守护进程劫持用户私有 tailnet | `takeover` 默认 false；`auto` 发现外部登录时改用独立的嵌入式节点，原登录不动（集成测试断言它全程保持 Running）；只有显式 `takeover: true` 才切换并记录 previous_profile；状态 API 显示 `mode` 与 `mode_reason` |

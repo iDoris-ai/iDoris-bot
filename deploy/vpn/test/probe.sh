@@ -21,6 +21,10 @@ fp="$(mktemp "${TMPDIR:-/tmp}/idoris-probe-fp.XXXXXX")"
 
 die() { echo "probe: $*" >&2; exit 1; }
 
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../ops-lib.sh
+source "$origin/ops-lib.sh"
+
 command -v docker >/dev/null || die "docker not found"
 docker compose version >/dev/null 2>&1 || die "docker compose v2 is required"
 command -v python3 >/dev/null || die "python3 is required"
@@ -72,8 +76,7 @@ lab="$root/test/.lab"
 
 PROJ="idoris-vpn-r2d-$(python3 -c 'import random; print(random.randint(100000, 999999))')"
 export COMPOSE_PROJECT_NAME="$PROJ"
-ENROLL_UID="$(id -u)"
-ENROLL_GID="$(id -g)"
+read -r ENROLL_UID ENROLL_GID < <(select_enroll_runtime probe)
 export ENROLL_UID ENROLL_GID
 LAN_CIDR="10.88.88.0/24"
 LAN_IP="10.88.88.10"
@@ -327,6 +330,7 @@ PY
 unset gw_hash
 
 echo "probe: starting enroll"
+provision_enroll_tree "$ENROLL_UID" "$ENROLL_GID" "$root/enroll"
 dc up -d --wait --wait-timeout 180 enroll
 dc exec -T enroll idoris-vpn-enroll check --config /etc/idoris/enroll.json
 
