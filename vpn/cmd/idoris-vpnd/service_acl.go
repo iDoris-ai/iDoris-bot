@@ -50,6 +50,15 @@ func verifyServiceDACL(view fsutil.ACLView) error {
 	return fsutil.VerifyOwnerDACL(view, []string{fsutil.SIDLocalSystem, fsutil.SIDAdministrators})
 }
 
+// stagedCredentialFiles are the credential paths an install copies into the
+// destination directory. retargetStagedConfig rewrites these keys from the
+// decoded JSON value. A new key here is staged and retargeted together.
+var stagedCredentialFiles = []struct{ key, name string }{
+	{"enroll_token_file", "enroll_token"},
+	{"auth_key_file", "auth_key"},
+	{"socks5_auth_file", "socks5.auth"},
+}
+
 // stageWindowsConfig copies credential files named by the config into destDir
 // and rewrites those paths. The original bytes are kept when nothing is copied.
 // Returned paths are the copies, not the config file itself.
@@ -63,11 +72,6 @@ func stageWindowsConfig(cfg []byte, destDir string) ([]byte, []string, error) {
 	if dec.More() {
 		return nil, nil, errors.New("config: trailing data")
 	}
-	items := []struct{ key, name string }{
-		{"enroll_token_file", "enroll_token"},
-		{"auth_key_file", "auth_key"},
-		{"socks5_auth_file", "socks5.auth"},
-	}
 	var files []string
 	changed := false
 	rollback := func() {
@@ -75,7 +79,7 @@ func stageWindowsConfig(cfg []byte, destDir string) ([]byte, []string, error) {
 			_ = os.Remove(f)
 		}
 	}
-	for _, it := range items {
+	for _, it := range stagedCredentialFiles {
 		raw, ok := probe[it.key]
 		if !ok || raw == nil {
 			continue
