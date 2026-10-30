@@ -221,13 +221,14 @@ func TestGatewaySetupAndApply(t *testing.T) {
 }
 
 type fakeOS struct {
-	files    map[string][]byte
-	modes    map[string]os.FileMode
-	root     bool
-	goos     string
-	forwards int
-	mkdirs   int
-	installs int
+	files     map[string][]byte
+	modes     map[string]os.FileMode
+	root      bool
+	goos      string
+	forwards  int
+	mkdirs    int
+	installs  int
+	installed [][]byte
 }
 
 func newFakeOS(root bool, goos string) *fakeOS {
@@ -275,8 +276,9 @@ func (m *fakeOS) EnableIPForward(path, content string) error {
 	m.forwards++
 	return m.WriteFile(path, []byte(content), 0o644)
 }
-func (m *fakeOS) InstallService(string) error {
+func (m *fakeOS) InstallService(path string) error {
 	m.installs++
+	m.installed = append(m.installed, append([]byte(nil), m.files[path]...))
 	return nil
 }
 
@@ -528,6 +530,33 @@ func TestR3W2JoinDistinctConfigsAndReplace(t *testing.T) {
 	}
 	if !bytes.Contains(host.files["/home/acme/orgA/vpn.json"], []byte("https://c.example")) {
 		t.Fatalf("apply --replace: %s", host.files["/home/acme/orgA/vpn.json"])
+	}
+}
+
+func TestR4WServiceInstallSeesTheNewIdentity(t *testing.T) {
+	code := codeFor(t, join.RoleMember, "https://b.example", false)
+	host := newFakeOS(false, "linux")
+	host.files["/tmp/b.code"] = []byte(code + "\n")
+	host.files["/home/acme/.idoris/vpn.json"] = []byte("{\n  \"enroll_url\": \"https://a.example\",\n  \"enroll_token_file\": \"/home/acme/.idoris/enroll.token\",\n  \"hostname\": \"old\",\n  \"control_url\": \"https://hs-a.example\"\n}\n")
+	host.files["/home/acme/.idoris/enroll.token"] = []byte("idv1_oldoldoldoldoldoldoldoldold\n")
+	d := testDeps(host, "")
+	if err := joinCmd([]string{"--yes", "--replace", "--code-file", "/tmp/b.code"}, d); err != nil {
+		t.Fatal(err)
+	}
+	if host.installs != 1 || len(host.installed) != 1 {
+		t.Fatalf("installs %d", host.installs)
+	}
+	if !bytes.Contains(host.installed[0], []byte("https://b.example")) || bytes.Contains(host.installed[0], []byte("https://a.example")) {
+		t.Fatalf("service saw the old config:\n%s", host.installed[0])
+	}
+	out := d.out()
+	for _, want := range []string{
+		"identity: role=member hostname=office-gw enroll=https://b.example",
+		"service: installed role=member hostname=office-gw enroll=https://b.example",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in\n%s", want, out)
+		}
 	}
 }
 
