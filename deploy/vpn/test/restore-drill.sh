@@ -18,7 +18,10 @@ repo="$(cd "$(dirname "$0")/../../.." && pwd)"
 origin="$repo/deploy/vpn"
 src="$repo/deploy/.drill-src"
 dst="$repo/deploy/.drill-dst"
+other="$repo/deploy/.drill-other"
 bundle_root="$repo/deploy/.drill-backup"
+# Same pin as ops-lib.sh. Used to read a retained volume with no container.
+ALPINE_VOLUME_IMAGE="alpine:3.23@sha256:ff7f0c727dd796aa36787bfcd9a64bf35a6ce72a73451b3359fde849b6703d63"
 bundle="$bundle_root/bundle"
 
 die() { echo "drill: $*" >&2; exit 1; }
@@ -105,10 +108,13 @@ cleanup() {
   if [[ -d "$dst" ]]; then
     docker compose --project-directory "$dst" --project-name "$PROJ" --profile tailnet-admin down -v >/dev/null 2>&1 || true
   fi
+  if [[ -n "${other:-}" && -d "$other" ]]; then
+    docker compose --project-directory "$other" --project-name "$PROJ" --profile tailnet-admin down -v >/dev/null 2>&1 || true
+  fi
   # Leave the copy before deleting it. A deleted working directory makes the
   # fingerprint check fail to start.
   cd "$repo"
-  rm -rf "$src" "$dst" "$bundle_root"
+  rm -rf "$src" "$dst" "${other:-}" "$bundle_root"
   if [[ -n "${fp:-}" && -f "$fp" ]]; then
     if ! python3 - "$origin" "$fp" <<'PY'
 import hashlib, os, sys
@@ -339,7 +345,16 @@ with open(sys.argv[1], "w") as fh:
     json.dump(cfg, fh)
     fh.write("\n")
 PY
-shape_list="$(docker run --rm --network none -v "$bundle_root/shape:/work:ro" --entrypoint idoris-vpn-enroll "$image" list-credentials --config /work/config.json --entry acme)"
+shape_owner="$(python3 - "$bundle_root/shape/config.json" <<'PY'
+import os, sys
+st = os.stat(sys.argv[1])
+print("%d:%d" % (st.st_uid, st.st_gid))
+PY
+)"
+# The fixture is mode 0600. Run as its owner so a Linux host exercises the
+# read path that does not create <config>.lock. Docker Desktop bind mounts
+# may not keep that ownership; the drill still passes the same --user.
+shape_list="$(docker run --rm --network none --user "$shape_owner" -v "$bundle_root/shape:/work:ro" --entrypoint idoris-vpn-enroll "$image" list-credentials --config /work/config.json --entry acme)"
 printf '%s\n' "$shape_list" | python3 -c '
 import sys
 text = sys.stdin.read()
@@ -666,6 +681,118 @@ done
 nodes_have drill-member || die "rollback lost drill-member"
 docker compose ps --status running -q headscale | grep -q . || die "rollback left headscale stopped"
 [[ "$(config_hash)" == "$config_before" ]] || die "rollback left enroll/config.json changed"
+
+volume_db_sum() {
+  docker run --rm --network none -v "$1:/data:ro" "$ALPINE_VOLUME_IMAGE" \
+    sh -c 'if [ -f /data/db.sqlite ]; then sha256sum /data/db.sqlite; else echo missing; fi'
+}
+
+echo "drill: a lan bundle with a bad enroll config rolls back to the tunnel bind"
+rm -rf "$bundle_root/lan-bad"
+cp -a "$bundle" "$bundle_root/lan-bad"
+python3 - "$bundle_root/lan-bad/state/dotenv" <<'PY'
+import os, sys
+path = sys.argv[1]
+lines = open(path).read().splitlines()
+out = []
+saw_bind = saw_access = False
+for line in lines:
+    if line.startswith("HEADPLANE_BIND="):
+        out.append("HEADPLANE_BIND=0.0.0.0")
+        saw_bind = True
+    elif line.startswith("HEADPLANE_ACCESS="):
+        out.append("HEADPLANE_ACCESS=lan")
+        saw_access = True
+    else:
+        out.append(line)
+if not saw_bind:
+    out.append("HEADPLANE_BIND=0.0.0.0")
+if not saw_access:
+    out.append("HEADPLANE_ACCESS=lan")
+open(path, "w").write("\n".join(out) + "\n")
+os.chmod(path, 0o600)
+PY
+printf '%s\n' '{not-json' > "$bundle_root/lan-bad/state/enroll/config.json"
+chmod 600 "$bundle_root/lan-bad/state/enroll/config.json"
+set +e
+lan_out="$(bash "$src/ctl.sh" restore "$bundle_root/lan-bad" --force 2>&1)"
+lan_ec=$?
+set -e
+if [[ "$lan_ec" -eq 0 ]]; then
+  printf '%s\n' "$lan_out" | redact >&2
+  die "lan bundle with a bad enroll config was accepted"
+fi
+hp_id="$(docker compose ps -q headplane || true)"
+if [[ -n "$hp_id" ]]; then
+  assert_bind 127.0.0.1
+else
+  echo "drill: headplane is not published after the failed lan restore"
+fi
+if grep -q 'rollback incomplete' <<<"$lan_out"; then
+  printf '%s\n' "$lan_out" | python3 -c '
+import os, sys
+text = sys.stdin.read()
+found = False
+for line in text.splitlines():
+    if not line.startswith("restore: host="):
+        continue
+    found = True
+    parts = {}
+    for bit in line.split()[1:]:
+        if "=" not in bit:
+            continue
+        key, value = bit.split("=", 1)
+        parts[key] = value
+    for key in ("host", "vol", "snap"):
+        path = parts.get(key, "")
+        if not path or not os.path.exists(path):
+            raise SystemExit("missing snapshot %s (%s)" % (key, path))
+if not found:
+    raise SystemExit("incomplete rollback did not print snapshot paths")
+print("rollback snapshots kept")
+'
+else
+  docker compose exec -T headscale headscale health >/dev/null
+  nodes_have drill-member || die "lan rollback lost drill-member"
+fi
+
+echo "drill: down keeps volumes; another directory cannot restore over them"
+bash "$src/ctl.sh" down
+docker volume inspect "${PROJ}_headscale-data" >/dev/null
+# Checksum after down. A clean Headscale stop checkpoints sqlite, so the
+# bytes from the running container are not the retained volume.
+sum_before="$(volume_db_sum "${PROJ}_headscale-data")"
+[[ "$sum_before" != "missing" ]] || die "no headscale database to protect"
+rm -rf "$other"
+mkdir -p "$other"
+rsync -a --exclude 'test/.lab/' --exclude 'backups/' "$src/" "$other/"
+set +e
+col_out="$(bash "$other/ctl.sh" restore "$bundle" --force 2>&1)"
+col_ec=$?
+set -e
+if [[ "$col_ec" -eq 0 ]]; then
+  printf '%s\n' "$col_out" | redact >&2
+  die "restore from another directory was accepted"
+fi
+grep -q 'has volume' <<<"$col_out" || {
+  printf '%s\n' "$col_out" | redact >&2
+  die "collision was not explained"
+}
+sum_mid="$(volume_db_sum "${PROJ}_headscale-data")"
+[[ "$sum_mid" == "$sum_before" ]] || die "collision restore changed the retained database ($sum_before -> $sum_mid)"
+
+echo "drill: a failed restore leaves the retained volume bytes"
+set +e
+down_out="$(bash "$src/ctl.sh" restore "$bundle_root/garbage" --force 2>&1)"
+down_ec=$?
+set -e
+if [[ "$down_ec" -eq 0 ]]; then
+  printf '%s\n' "$down_out" | redact >&2
+  die "garbage restore while down was accepted"
+fi
+sum_after="$(volume_db_sum "${PROJ}_headscale-data")"
+[[ "$sum_after" == "$sum_before" ]] || die "failed restore replaced retained volume bytes ($sum_before -> $sum_after)"
+docker volume inspect "${PROJ}_headscale-data" >/dev/null
 
 docker rm -f "${PROJ}-member" >/dev/null
 docker compose --profile tailnet-admin down -v
