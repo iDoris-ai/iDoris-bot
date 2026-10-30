@@ -160,6 +160,12 @@ type Snapshot struct {
 	// contacted at startup and the daemon is using a saved control URL.
 	// A static auth key (no enrollment URL) stays true.
 	EnrollReachable bool `json:"enroll_reachable"`
+	// AccessError is set while a configured forward or SOCKS5 listener could
+	// not bind. It contains the address and the OS (or socket) error.
+	// Membership keeps running. The field clears once every listener binds.
+	// An unparseable address, an unsafe path, or a bad credentials file never
+	// reaches here: those stop startup before a socket is opened.
+	AccessError string `json:"access_error,omitempty"`
 }
 
 // Reconciler converges tailscaled onto the configured control server.
