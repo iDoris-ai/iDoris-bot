@@ -16,6 +16,16 @@ import (
 
 const launchdLabel = "ai.idoris.vpnd"
 
+// userServiceAction is what a user-service install did to the process.
+// started is a first install (enable --now, or launchctl bootstrap).
+// restarted is an install over a unit that was already active.
+type userServiceAction string
+
+const (
+	userServiceStarted   userServiceAction = "started"
+	userServiceRestarted userServiceAction = "restarted"
+)
+
 // runServiceCommand runs systemctl, launchctl, and schtasks. Tests replace it.
 var runServiceCommand = func(name string, args ...string) ([]byte, error) {
 	return exec.Command(name, args...).CombinedOutput()
@@ -169,31 +179,40 @@ func selfPath() (string, error) {
 }
 
 func installService(configPath string) error {
+	_, err := installUserService(configPath)
+	return err
+}
+
+// installUserService installs the per-user unit and reports whether it
+// started a new process or restarted one that was already active.
+// installService is the wrapper host.InstallService calls; it drops the
+// action. Wizard text that needs the distinction calls installUserService.
+func installUserService(configPath string) (userServiceAction, error) {
 	abs, err := filepath.Abs(configPath)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if _, err := os.Stat(abs); err != nil { //nolint:gosec // G703: operator-chosen config path, made absolute
-		return fmt.Errorf("config: %w", err)
+		return "", fmt.Errorf("config: %w", err)
 	}
 	configPath = abs
 	exe, err := selfPath()
 	if err != nil {
-		return err
+		return "", err
 	}
 	switch runtime.GOOS {
 	case "darwin":
 		if _, err := os.Stat(systemLaunchdPath); err == nil {
-			return errors.New("a system LaunchDaemon is installed; remove it with: idoris-vpnd service uninstall --system")
+			return "", errors.New("a system LaunchDaemon is installed; remove it with: idoris-vpnd service uninstall --system")
 		}
 		return installLaunchd(exe, configPath)
 	case "linux":
 		if err := rejectEnabledSystemUnit(); err != nil {
-			return err
+			return "", err
 		}
 		return installSystemdUser(exe, configPath)
 	default:
-		return fmt.Errorf("service install is not supported on %s; run `idoris-vpnd run` under your service manager", runtime.GOOS)
+		return "", fmt.Errorf("service install is not supported on %s; run `idoris-vpnd run` under your service manager", runtime.GOOS)
 	}
 }
 
@@ -293,31 +312,59 @@ func renderLaunchdPlistEnv(exe, configPath, logDir string, env [][2]string) stri
 `, launchdLabel, plistEscape(exe), plistEscape(configPath), envXML, plistEscape(logDir), plistEscape(logDir))
 }
 
-func installLaunchd(exe, configPath string) error {
+func installLaunchd(exe, configPath string) (userServiceAction, error) {
 	p, err := launchdPlistPath()
 	if err != nil {
-		return err
+		return "", err
 	}
 	home, _ := os.UserHomeDir()
 	logDir := filepath.Join(home, "Library", "Logs", "iDoris")
 	if err := os.MkdirAll(logDir, 0o750); err != nil {
-		return err
+		return "", err
 	}
 	plist := renderLaunchdPlist(exe, configPath, logDir)
 	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
-		return err
+		return "", err
 	}
 	if err := os.WriteFile(p, []byte(plist), 0o600); err != nil { //nolint:gosec // G703: user LaunchAgent path under the current home, not a request path
-		return err
+		return "", err
 	}
-	target := fmt.Sprintf("gui/%d", os.Getuid())
-	_ = exec.Command("launchctl", "bootout", target+"/"+launchdLabel).Run()
-	if out, err := exec.Command("launchctl", "bootstrap", target, p).CombinedOutput(); err != nil {
-		return fmt.Errorf("launchctl bootstrap: %w: %s", err, strings.TrimSpace(string(out)))
+	uid := os.Getuid()
+	_, err = runServiceCommand("launchctl", "print", fmt.Sprintf("gui/%d/%s", uid, launchdLabel))
+	action, err := activateLaunchdUser(p, uid, err == nil)
+	if err != nil {
+		return "", err
 	}
-	fmt.Println("installed and started", launchdLabel, "from", p)
+	if action == userServiceRestarted {
+		fmt.Println("restarted", launchdLabel, "from", p)
+	} else {
+		fmt.Println("installed and started", launchdLabel, "from", p)
+	}
 	fmt.Println("logs:", filepath.Join(logDir, "vpnd.log"))
-	return nil
+	return action, nil
+}
+
+// activateLaunchdUser bootstraps a LaunchAgent. An already-loaded agent is
+// booted out, bootstrapped, and kickstarted so the new plist replaces the
+// running process. A first install is bootstrap only; RunAtLoad starts it.
+func activateLaunchdUser(plist string, uid int, already bool) (userServiceAction, error) {
+	domain := fmt.Sprintf("gui/%d", uid)
+	target := domain + "/" + launchdLabel
+	if already {
+		if out, err := runServiceCommand("launchctl", "bootout", target); err != nil {
+			return "", fmt.Errorf("launchctl bootout: %w: %s", err, strings.TrimSpace(string(out)))
+		}
+	}
+	if out, err := runServiceCommand("launchctl", "bootstrap", domain, plist); err != nil {
+		return "", fmt.Errorf("launchctl bootstrap: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	if !already {
+		return userServiceStarted, nil
+	}
+	if out, err := runServiceCommand("launchctl", "kickstart", "-k", target); err != nil {
+		return "", fmt.Errorf("launchctl kickstart: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return userServiceRestarted, nil
 }
 
 func systemdUnitPath() (string, error) {
@@ -349,23 +396,49 @@ WantedBy=default.target
 `, renderExecStart(exe, configPath))
 }
 
-func installSystemdUser(exe, configPath string) error {
+func installSystemdUser(exe, configPath string) (userServiceAction, error) {
 	p, err := systemdUnitPath()
 	if err != nil {
-		return err
+		return "", err
 	}
 	unit := renderSystemdUserUnit(exe, configPath)
 	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
-		return err
+		return "", err
 	}
 	if err := os.WriteFile(p, []byte(unit), 0o600); err != nil {
-		return err
+		return "", err
 	}
-	for _, a := range [][]string{{"daemon-reload"}, {"enable", "--now", "idoris-vpnd.service"}} {
-		if out, err := exec.Command("systemctl", append([]string{"--user"}, a...)...).CombinedOutput(); err != nil {
-			return fmt.Errorf("systemctl --user %s: %w: %s", strings.Join(a, " "), err, strings.TrimSpace(string(out)))
+	out, err := runServiceCommand("systemctl", "--user", "is-active", systemUnitName)
+	active := err == nil && strings.TrimSpace(string(out)) == "active"
+	action, err := activateSystemdUser(active)
+	if err != nil {
+		return "", err
+	}
+	if action == userServiceRestarted {
+		fmt.Println("restarted", systemUnitName, "from", p)
+	} else {
+		fmt.Println("installed and started", systemUnitName, "from", p)
+	}
+	return action, nil
+}
+
+// activateSystemdUser reloads the user manager and either restarts an
+// already-active unit or enables it on first install. enable --now does not
+// restart a unit that is already running, so the active path uses restart.
+func activateSystemdUser(already bool) (userServiceAction, error) {
+	if out, err := runServiceCommand("systemctl", "--user", "daemon-reload"); err != nil {
+		return "", fmt.Errorf("systemctl --user daemon-reload: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	if already {
+		out, err := runServiceCommand("systemctl", "--user", "restart", systemUnitName)
+		if err != nil {
+			return "", fmt.Errorf("systemctl --user restart: %w: %s", err, strings.TrimSpace(string(out)))
 		}
+		return userServiceRestarted, nil
 	}
-	fmt.Println("installed and started idoris-vpnd.service from", p)
-	return nil
+	out, err := runServiceCommand("systemctl", "--user", "enable", "--now", systemUnitName)
+	if err != nil {
+		return "", fmt.Errorf("systemctl --user enable --now: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return userServiceStarted, nil
 }
