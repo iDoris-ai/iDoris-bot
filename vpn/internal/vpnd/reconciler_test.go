@@ -29,7 +29,12 @@ type fakeBackend struct {
 	current   ipn.LoginProfile
 	statusErr error
 
-	calls []string
+	calls         []string
+	checkPrefsErr error
+	startErr      error
+	loginErr      error
+	// onCheck runs at the start of CheckPrefs, before the error return.
+	onCheck func()
 	// starts records auth keys passed to Start.
 	starts []string
 	// pendingKey is the auth key handed to Start, consumed by StartLoginInteractive.
@@ -87,7 +92,13 @@ func (f *fakeBackend) EditPrefs(_ context.Context, mp *ipn.MaskedPrefs) (*ipn.Pr
 	p := f.prefs
 	return &p, nil
 }
-func (f *fakeBackend) CheckPrefs(context.Context, *ipn.Prefs) error { f.rec("CheckPrefs"); return nil }
+func (f *fakeBackend) CheckPrefs(context.Context, *ipn.Prefs) error {
+	f.rec("CheckPrefs")
+	if f.onCheck != nil {
+		f.onCheck()
+	}
+	return f.checkPrefsErr
+}
 func (f *fakeBackend) ProfileStatus(context.Context) (ipn.LoginProfile, []ipn.LoginProfile, error) {
 	f.rec("ProfileStatus")
 	return f.current, f.profiles, nil
@@ -113,6 +124,9 @@ func (f *fakeBackend) SwitchToEmptyProfile(context.Context) error {
 }
 func (f *fakeBackend) Start(_ context.Context, o ipn.Options) error {
 	f.rec("Start")
+	if f.startErr != nil {
+		return f.startErr
+	}
 	f.starts = append(f.starts, o.AuthKey)
 	f.prefs = *o.UpdatePrefs
 	f.pendingKey = o.AuthKey
@@ -123,6 +137,9 @@ func (f *fakeBackend) Start(_ context.Context, o ipn.Options) error {
 }
 func (f *fakeBackend) StartLoginInteractive(context.Context) error {
 	f.rec("StartLoginInteractive")
+	if f.loginErr != nil {
+		return f.loginErr
+	}
 	if f.pendingKey != "" {
 		f.state = ipn.Starting
 		f.pendingKey = ""
@@ -305,6 +322,76 @@ func TestLoginGraceResetsOnceRunning(t *testing.T) {
 	}
 }
 
+func TestLocalFailureDoesNotMintTwiceWithinGrace(t *testing.T) {
+	now := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+
+	be := &fakeBackend{state: ipn.NeedsLogin, checkPrefsErr: errors.New("prefs rejected")}
+	keys := &countingKeys{}
+	be.onCheck = func() {
+		if keys.n != 0 {
+			t.Fatalf("CheckPrefs ran after a key was minted: %d", keys.n)
+		}
+	}
+	r := newR(t, be, keys, nil)
+	r.now = func() time.Time { return now }
+	if _, err := r.Step(ctx); err == nil || keys.n != 0 || len(be.starts) != 0 {
+		t.Fatalf("check prefs must fail closed with no key: keys=%d err=%v", keys.n, err)
+	}
+	now = now.Add(5 * time.Second)
+	if _, err := r.Step(ctx); err != nil || keys.n != 0 {
+		t.Fatalf("grace after CheckPrefs must not mint: keys=%d err=%v", keys.n, err)
+	}
+
+	be2 := &fakeBackend{state: ipn.NeedsLogin, startErr: errors.New("local api refused")}
+	keys2 := &countingKeys{}
+	be2.onCheck = func() {
+		if keys2.n != 0 && keys2.n != 1 {
+			t.Fatalf("unexpected mint count at CheckPrefs: %d", keys2.n)
+		}
+	}
+	r2 := newR(t, be2, keys2, nil)
+	r2.now = func() time.Time { return now }
+	if _, err := r2.Step(ctx); err == nil || keys2.n != 1 || len(be2.starts) != 0 {
+		t.Fatalf("start failure still mints once: keys=%d starts=%v err=%v", keys2.n, be2.starts, err)
+	}
+	starts := 0
+	for _, c := range be2.calls {
+		if c == "Start" {
+			starts++
+		}
+	}
+	if starts != 1 {
+		t.Fatalf("calls %v", be2.calls)
+	}
+	now = now.Add(5 * time.Second)
+	if _, err := r2.Step(ctx); err != nil || keys2.n != 1 {
+		t.Fatalf("grace after Start must not mint again: keys=%d err=%v", keys2.n, err)
+	}
+	now = now.Add(20 * time.Second)
+	before := keys2.n
+	be2.onCheck = func() {
+		if keys2.n != before {
+			t.Fatalf("second attempt minted before CheckPrefs: %d", keys2.n)
+		}
+	}
+	if _, err := r2.Step(ctx); err == nil || keys2.n != 2 {
+		t.Fatalf("after grace a new key is allowed: keys=%d err=%v", keys2.n, err)
+	}
+
+	be3 := &fakeBackend{state: ipn.NeedsLogin, loginErr: errors.New("login interactive failed")}
+	keys3 := &countingKeys{}
+	r3 := newR(t, be3, keys3, nil)
+	r3.now = func() time.Time { return now }
+	if _, err := r3.Step(ctx); err == nil || keys3.n != 1 {
+		t.Fatalf("login interactive failure: keys=%d err=%v", keys3.n, err)
+	}
+	now = now.Add(5 * time.Second)
+	if _, err := r3.Step(ctx); err != nil || keys3.n != 1 {
+		t.Fatalf("grace after login interactive must not mint: keys=%d err=%v", keys3.n, err)
+	}
+}
+
 func TestGraceForIsCapped(t *testing.T) {
 	r := newR(t, &fakeBackend{}, StaticKey("k"), nil)
 	for n, want := range map[int]time.Duration{
@@ -422,8 +509,8 @@ func TestForeignStatesBlockedBeforeProfileMutation(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			be := &fakeBackend{
-				state: tc.state,
-				prefs: ipn.Prefs{ControlURL: tc.control, WantRunning: true, RunSSH: true},
+				state:   tc.state,
+				prefs:   ipn.Prefs{ControlURL: tc.control, WantRunning: true, RunSSH: true},
 				current: ipn.LoginProfile{ID: "p-foreign", ControlURL: tc.control},
 				profiles: []ipn.LoginProfile{
 					{ID: "p-foreign", ControlURL: tc.control},
@@ -879,6 +966,69 @@ func TestPersistedNodeKeyWaitsOutBriefNeedsLogin(t *testing.T) {
 	snap, err = r.Step(context.Background())
 	if err != nil || keys.n != 1 || snap.Phase != PhaseStarting {
 		t.Fatalf("NeedsLogin that outlasts the settle window must mint: %+v keys=%d err=%v", snap, keys.n, err)
+	}
+}
+
+func TestInterruptedRegistrationWaitsThenMintsOnce(t *testing.T) {
+	be := &fakeBackend{state: ipn.Starting, prefs: ipn.Prefs{ControlURL: ours, WantRunning: true}}
+	keys := &countingKeys{}
+	var marked int
+	r := newR(t, be, keys, func(o *Options) {
+		o.RecoverUnregistered = true
+		o.MarkRegistered = func() error {
+			marked++
+			return nil
+		}
+	})
+	now := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	r.now = func() time.Time { return now }
+	ctx := context.Background()
+
+	if _, err := r.Step(ctx); err != nil || keys.n != 0 || marked != 0 {
+		t.Fatalf("first look must only start the clock: keys=%d marked=%d err=%v", keys.n, marked, err)
+	}
+	now = now.Add(persistedLoginSettle - time.Second)
+	if _, err := r.Step(ctx); err != nil || keys.n != 0 {
+		t.Fatalf("inside the recover window: keys=%d err=%v", keys.n, err)
+	}
+	now = now.Add(time.Second)
+	if _, err := r.Step(ctx); err != nil || keys.n != 1 {
+		t.Fatalf("after the window one mint: keys=%d err=%v", keys.n, err)
+	}
+	now = now.Add(5 * time.Second)
+	if _, err := r.Step(ctx); err != nil || keys.n != 1 {
+		t.Fatalf("grace holds the second mint: keys=%d err=%v", keys.n, err)
+	}
+
+	be.state = ipn.Running
+	be.prefs.ControlURL = ours
+	be.prefs.CorpDNS = true
+	if snap, err := r.Step(ctx); err != nil || snap.Phase != PhaseConnected || marked != 1 || keys.n != 1 {
+		t.Fatalf("running writes the marker once: %+v marked=%d keys=%d err=%v", snap, marked, keys.n, err)
+	}
+}
+
+func TestExistingIdentityDoesNotMintJustBecauseMarkerIsMissing(t *testing.T) {
+	be := &fakeBackend{
+		state:       ipn.Starting,
+		haveNodeKey: true,
+		prefs:       ipn.Prefs{ControlURL: ours, WantRunning: true},
+	}
+	keys := &countingKeys{}
+	var marked int
+	r := newR(t, be, keys, func(o *Options) {
+		o.RecoverUnregistered = true
+		o.MarkRegistered = func() error {
+			marked++
+			return nil
+		}
+	})
+	snap, err := r.Step(context.Background())
+	if err != nil || keys.n != 0 || marked != 1 || snap.Phase != PhaseStarting {
+		t.Fatalf("have node key must mark and not mint: %+v keys=%d marked=%d err=%v", snap, keys.n, marked, err)
+	}
+	if _, err := r.Step(context.Background()); err != nil || keys.n != 0 || marked != 1 {
+		t.Fatalf("marker is once: keys=%d marked=%d err=%v", keys.n, marked, err)
 	}
 }
 
