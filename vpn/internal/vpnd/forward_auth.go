@@ -15,47 +15,53 @@ import (
 // resolveSOCKSAuth decides how a SOCKS5 listener authenticates.
 // An explicit user/password wins. Otherwise a 0600 file is loaded, or
 // created under StateDir. Anonymous is only the explicit opt-in.
-func resolveSOCKSAuth(opt AccessOptions) (user, pass string, anon bool, err error) {
+// resolveSOCKSAuth returns the credential, whether anonymous access was
+// requested, the auth-file path when one is used, and whether that file was
+// created on this call. created is false when an existing file is loaded.
+func resolveSOCKSAuth(opt AccessOptions) (user, pass string, anon bool, authPath string, created bool, err error) {
 	switch {
 	case opt.SOCKS5User != "" || opt.SOCKS5Password != "":
 		if opt.SOCKS5User == "" || opt.SOCKS5Password == "" {
-			return "", "", false, errors.New("vpnd: SOCKS5 username and password are both required")
+			return "", "", false, "", false, errors.New("vpnd: SOCKS5 username and password are both required")
 		}
-		return opt.SOCKS5User, opt.SOCKS5Password, false, nil
+		return opt.SOCKS5User, opt.SOCKS5Password, false, "", false, nil
 	case opt.SOCKS5AuthFile != "":
-		user, pass, err = loadOrCreateSOCKSAuth(opt.SOCKS5AuthFile, false)
-		return user, pass, false, err
+		user, pass, created, err = loadOrCreateSOCKSAuth(opt.SOCKS5AuthFile, false)
+		return user, pass, false, opt.SOCKS5AuthFile, created, err
 	case opt.StateDir != "":
-		user, pass, err = loadOrCreateSOCKSAuth(filepath.Join(opt.StateDir, "socks5.auth"), true)
-		return user, pass, false, err
+		authPath = filepath.Join(opt.StateDir, "socks5.auth")
+		user, pass, created, err = loadOrCreateSOCKSAuth(authPath, true)
+		return user, pass, false, authPath, created, err
 	case opt.AllowAnonymous:
-		return "", "", true, nil
+		return "", "", true, "", false, nil
 	default:
-		return "", "", false, errors.New("vpnd: SOCKS5 requires socks5_auth_file, a state dir, or socks5_allow_anonymous")
+		return "", "", false, "", false, errors.New("vpnd: SOCKS5 requires socks5_auth_file, a state dir, or socks5_allow_anonymous")
 	}
 }
 
 // loadOrCreateSOCKSAuth reads one "user:password" line. create is set for the
 // state-dir file, which is generated when it is absent. An operator-supplied
 // path is never created, so a typo does not invent a credential.
-func loadOrCreateSOCKSAuth(path string, create bool) (string, string, error) {
+func loadOrCreateSOCKSAuth(path string, create bool) (user, pass string, created bool, err error) {
 	st, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		if !create {
-			return "", "", fmt.Errorf("vpnd: socks5 auth file %q: %w", path, err)
+			return "", "", false, fmt.Errorf("vpnd: socks5 auth file %q: %w", path, err)
 		}
-		return writeSOCKSAuth(path)
+		user, pass, err = writeSOCKSAuth(path)
+		return user, pass, err == nil, err
 	}
 	if err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
 	if st.Mode()&os.ModeSymlink != 0 {
-		return "", "", fmt.Errorf("vpnd: socks5 auth file %q: refusing a symlink", path)
+		return "", "", false, fmt.Errorf("vpnd: socks5 auth file %q: refusing a symlink", path)
 	}
 	if st.Mode().Perm() != 0o600 {
-		return "", "", fmt.Errorf("vpnd: socks5 auth file %q must be mode 0600", path)
+		return "", "", false, fmt.Errorf("vpnd: socks5 auth file %q must be mode 0600", path)
 	}
-	return readSOCKSAuth(path)
+	user, pass, err = readSOCKSAuth(path)
+	return user, pass, false, err
 }
 
 func writeSOCKSAuth(path string) (string, string, error) {
