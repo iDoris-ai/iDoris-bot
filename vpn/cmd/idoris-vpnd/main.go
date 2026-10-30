@@ -36,6 +36,7 @@ Usage:
   idoris-vpnd gateway detect [--json]
   idoris-vpnd gateway setup [--yes] [--device IP] [--whole-subnet] [--no-service]
   idoris-vpnd gateway apply --plan FILE
+  idoris-vpnd ui [--no-open]
   idoris-vpnd service install|uninstall [--config FILE]   manage the user service
   idoris-vpnd version
 
@@ -64,6 +65,8 @@ func main() {
 		err = joinCmd(os.Args[2:], realDeps())
 	case "gateway":
 		err = gatewayCmd(os.Args[2:], realDeps())
+	case "ui":
+		err = uiCmd(os.Args[2:])
 	case "service":
 		err = serviceCmd(os.Args[2:])
 	case "version", "--version", "-v":
