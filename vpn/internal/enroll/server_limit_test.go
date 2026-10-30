@@ -92,7 +92,10 @@ func TestPreAuthLimitRunsBeforeHashScan(t *testing.T) {
 		t.Fatal("first enroll should pass the global bucket")
 	}
 	scans := s.authScans
-	if scans != 1 {
+	// authenticate walks once. The post-body capture walks again so the mint
+	// is bound to the config that is current after the body, not the one from
+	// the first check. A limited request must still not walk at all.
+	if scans != 2 {
 		t.Fatalf("scans %d", scans)
 	}
 	if call() != http.StatusTooManyRequests {
