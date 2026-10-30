@@ -34,22 +34,22 @@ write_admin_mode() {
   mv "$tmp" "$(admin_mode_file)"
 }
 
-# Profile services are invisible to `docker compose ps` unless the profile is enabled.
+# Profile services are invisible to `compose ps` unless the profile is enabled.
 _compose_ps_id() {
   local svc="$1"
   if [[ "$svc" == "vpn-sidecar" || "$svc" == "headplane-tailnet" ]]; then
-    docker compose --profile tailnet-admin ps -aq "$svc" 2>/dev/null || true
+    compose --profile tailnet-admin ps -aq "$svc" 2>/dev/null || true
   else
-    docker compose ps -aq "$svc" 2>/dev/null || true
+    compose ps -aq "$svc" 2>/dev/null || true
   fi
 }
 
 service_running() {
   local svc="$1" id
   if [[ "$svc" == "vpn-sidecar" || "$svc" == "headplane-tailnet" ]]; then
-    id="$(docker compose --profile tailnet-admin ps --status running -q "$svc" 2>/dev/null || true)"
+    id="$(compose --profile tailnet-admin ps --status running -q "$svc" 2>/dev/null || true)"
   else
-    id="$(docker compose ps --status running -q "$svc" 2>/dev/null || true)"
+    id="$(compose ps --status running -q "$svc" 2>/dev/null || true)"
   fi
   [[ -n "$id" ]]
 }
@@ -57,10 +57,10 @@ service_running() {
 # Stop whichever Headplane process is actually running. Never starts one.
 stop_headplane_writers() {
   if service_running headplane; then
-    docker compose stop headplane
+    compose stop headplane
   fi
   if service_running headplane-tailnet; then
-    docker compose --profile tailnet-admin stop headplane-tailnet
+    compose --profile tailnet-admin stop headplane-tailnet
   fi
 }
 
@@ -69,12 +69,12 @@ enforce_headplane_exclusion() {
   local mode="$1"
   if [[ "$mode" == "tailnet-admin" ]]; then
     if service_running headplane || [[ -n "$(_compose_ps_id headplane)" ]]; then
-      docker compose stop headplane >/dev/null 2>&1 || true
+      compose stop headplane >/dev/null 2>&1 || true
     fi
   else
     if service_running vpn-sidecar || service_running headplane-tailnet \
       || [[ -n "$(_compose_ps_id headplane-tailnet)" ]]; then
-      docker compose --profile tailnet-admin stop vpn-sidecar headplane-tailnet >/dev/null 2>&1 || true
+      compose --profile tailnet-admin stop vpn-sidecar headplane-tailnet >/dev/null 2>&1 || true
     fi
   fi
 }
@@ -84,18 +84,21 @@ enforce_headplane_exclusion() {
 start_stack_for_mode() {
   local mode="$1"
   enforce_headplane_exclusion "$mode"
+  assert_compose_bindings "$mode"
   if [[ "$mode" == "tailnet-admin" ]]; then
-    docker compose up -d --wait --wait-timeout 180 headscale enroll
+    compose up -d --wait --wait-timeout 180 headscale enroll
     if [[ -n "${VPN_SERVER_ENROLL_TOKEN:-}" ]]; then
-      docker compose --profile tailnet-admin up -d --wait --wait-timeout 180 vpn-sidecar headplane-tailnet
+      compose --profile tailnet-admin up -d --wait --wait-timeout 180 vpn-sidecar headplane-tailnet
+      verify_published_bindings "$mode"
       echo "tailnet-admin profile is up. Published Headplane is stopped."
     else
       echo "admin mode is tailnet-admin. Published Headplane stays stopped."
       echo "export VPN_SERVER_ENROLL_TOKEN (the vpn-server enrollment token) and run: bash $here/ctl.sh up"
     fi
   else
-    docker compose --profile tailnet-admin stop vpn-sidecar headplane-tailnet >/dev/null 2>&1 || true
-    docker compose up -d --wait --wait-timeout 180
+    compose --profile tailnet-admin stop vpn-sidecar headplane-tailnet >/dev/null 2>&1 || true
+    compose up -d --wait --wait-timeout 180
+    verify_published_bindings "$mode"
   fi
 }
 
@@ -136,10 +139,10 @@ restore_running_services() {
     esac
   done < "$snap"
   if [[ ${#plain[@]} -gt 0 ]]; then
-    docker compose start "${plain[@]}" >/dev/null
+    compose start "${plain[@]}" >/dev/null
   fi
   if [[ ${#profile[@]} -gt 0 ]]; then
-    docker compose --profile tailnet-admin start "${profile[@]}" >/dev/null
+    compose --profile tailnet-admin start "${profile[@]}" >/dev/null
   fi
 }
 
@@ -151,6 +154,7 @@ restore_running_services() {
 # 0700 and then accept it.
 prepare_backup_dest() {
   local dest="$1" ec
+  ensure_managed_backup_parent "$dest" || return $?
   python3 - "$dest" <<'PY'
 import os, sys
 dest = os.path.abspath(sys.argv[1])
@@ -296,36 +300,40 @@ ensure_mode_containers() {
   if [[ -z "$(_compose_ps_id headscale)" ]]; then
     echo "creating stopped containers for admin mode ${mode}..."
     if [[ "$mode" == "tailnet-admin" ]]; then
-      docker compose up -d --no-start headscale enroll
-      docker compose --profile tailnet-admin up -d --no-start vpn-sidecar headplane-tailnet
+      compose up -d --no-start headscale enroll
+      compose --profile tailnet-admin up -d --no-start vpn-sidecar headplane-tailnet
     else
-      docker compose up -d --no-start headscale enroll headplane
+      compose up -d --no-start headscale enroll headplane
     fi
   fi
   if [[ "$mode" == "tailnet-admin" ]]; then
     if [[ -z "$(_compose_ps_id headplane-tailnet)" ]]; then
-      docker compose --profile tailnet-admin up -d --no-start vpn-sidecar headplane-tailnet
+      compose --profile tailnet-admin up -d --no-start vpn-sidecar headplane-tailnet
     fi
   elif [[ -z "$(_compose_ps_id headplane)" ]]; then
-    docker compose up -d --no-start headplane
+    compose up -d --no-start headplane
   fi
   if [[ -z "$(_compose_ps_id enroll)" ]]; then
-    docker compose up -d --no-start enroll
+    compose up -d --no-start enroll
   fi
 }
 
 # Manifest lists image tags, ids and digests only. The compose config JSON
 # also contains env values; it is written to a 0600 temp file and deleted.
 write_backup_manifest() {
-  local dest="$1" mode="$2" version="$3" tmp ec
+  local dest="$1" mode="$2" version="$3" tmp ec project
+  project="${COMPOSE_PROJECT_LOCK:-}"
+  if [[ -z "$project" ]]; then
+    project="$(current_project_name)"
+  fi
   tmp="$(mktemp "$here/.running.XXXXXX")"
   chmod 600 "$tmp"
   ec=0
-  docker compose --profile tailnet-admin config --format json > "$tmp" || ec=$?
+  compose --profile tailnet-admin config --format json > "$tmp" || ec=$?
   if [[ "$ec" -eq 0 ]]; then
-    python3 - "$dest/manifest.json" "$mode" "$version" "$tmp" "$here" <<'PY' || ec=$?
+    python3 - "$dest/manifest.json" "$mode" "$version" "$tmp" "$here" "$project" <<'PY' || ec=$?
 import json, os, subprocess, sys
-out_path, mode, version, cfg_path, here = sys.argv[1:]
+out_path, mode, version, cfg_path, here, project = sys.argv[1:]
 cfg = json.load(open(cfg_path))
 wanted = {
     "state/dotenv": os.path.join(here, ".env"),
@@ -344,14 +352,17 @@ for rel, src in wanted.items():
 images = []
 for name in sorted(cfg.get("services", {})):
     image = cfg["services"][name].get("image") or ""
-    ps = subprocess.run(["docker", "compose", "ps", "-aq", name], capture_output=True, text=True)
+    env = os.environ.copy()
+    env["COMPOSE_PROJECT_NAME"] = project
+    base = ["docker", "compose", "-p", project, "--project-directory", here]
+    ps = subprocess.run(base + ["ps", "-aq", name], capture_output=True, text=True, env=env)
     cid = ""
     if ps.stdout.strip():
         cid = ps.stdout.strip().splitlines()[-1]
     if not cid and name in ("vpn-sidecar", "headplane-tailnet"):
         ps = subprocess.run(
-            ["docker", "compose", "--profile", "tailnet-admin", "ps", "-aq", name],
-            capture_output=True, text=True)
+            base + ["--profile", "tailnet-admin", "ps", "-aq", name],
+            capture_output=True, text=True, env=env)
         if ps.stdout.strip():
             cid = ps.stdout.strip().splitlines()[-1]
     image_id = ""
@@ -480,8 +491,11 @@ sanitize_instance_name() {
 
 # Same project name from another directory shares volumes and container names.
 reject_project_collision() {
-  local want mine json err
-  want="$(current_project_name)"
+  reject_project_named "$(current_project_name)"
+}
+
+reject_project_named() {
+  local want="$1" mine json err
   [[ "$want" =~ ^[a-z0-9][a-z0-9_-]{0,50}$ ]] || die "compose project name '$want' is not a safe label"
   mine="$(cd "$here" && pwd)/compose.yaml"
   if ! json="$(docker compose ls --all --format json 2>/dev/null)"; then
