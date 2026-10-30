@@ -710,6 +710,12 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// The join code is bound to one role. Refuse before Discover, and leave
+	// the plan cleared: this request was a re-plan that cannot be built.
+	if err := gateway.ValidateRoleChoice(held.Role, body.ThisMachineIsLocalAI); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	discoverWarning := s.discoverInto(r.Context(), held)
 	var plan gateway.Plan
 	var err error
@@ -718,7 +724,6 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 			ThisMachineIsLocalAI: true, Tenant: held.Tenant, Hostname: held.Hostname,
 		})
 	} else {
-		// "No" means this machine is the gateway, whatever role the code carried.
 		if rep == nil {
 			writeErr(w, http.StatusBadRequest, "detect the network first")
 			return
@@ -767,6 +772,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		DeviceIPs            []string `json:"device_ips"`
 		WholeSubnet          bool     `json:"whole_subnet"`
 		ConfirmAuthority     bool     `json:"confirm_authority"`
+		ReplaceExisting      bool     `json:"replace_existing"`
 	}
 	if !readJSON(w, r, &body) {
 		return
@@ -827,7 +833,9 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		s.applying = false
 		s.mu.Unlock()
 	}()
-	res, err := s.svc.Apply(plan, gateway.ApplyOptions{Token: token, PlanPath: planPath})
+	res, err := s.svc.Apply(plan, gateway.ApplyOptions{
+		Token: token, PlanPath: planPath, ReplaceExisting: body.ReplaceExisting,
+	})
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -898,12 +906,10 @@ func (s *Server) ensurePaths() (idorisPaths, error) {
 	if err != nil || home == "" {
 		return idorisPaths{}, fmt.Errorf("ui: home directory: %w", err)
 	}
-	base := filepath.Join(home, ".idoris")
-	return idorisPaths{
-		config: filepath.Join(base, "vpn.json"),
-		token:  filepath.Join(base, "enroll.token"),
-		plan:   filepath.Join(base, "gateway-plan.json"),
-	}, nil
+	// Empty config path keeps the historical default names. The UI never picks
+	// another config file; a second organization is an explicit replace.
+	p := gateway.PathsFor(home, "")
+	return idorisPaths{config: p.Config, token: p.Token, plan: p.Plan}, nil
 }
 
 func readJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
