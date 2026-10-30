@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/fsutil"
 	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/gateway"
 )
 
@@ -16,9 +17,17 @@ import (
 type osHost struct{}
 
 func (osHost) WriteFile(path string, data []byte, mode os.FileMode) error {
-	return os.WriteFile(path, data, mode)
+	return fsutil.WriteFileAtomic(path, data, mode)
 }
-func (osHost) MkdirAll(path string, mode os.FileMode) error { return os.MkdirAll(path, mode) }
+func (osHost) MkdirAll(path string, mode os.FileMode) error {
+	// Apply asks for 0700 on the directory that holds the config, the token
+	// and the plan. A directory that is already group- or world-writable is
+	// refused instead of being chmod'd into shape.
+	if mode.Perm()&0o077 == 0 {
+		return fsutil.EnsurePrivateDir(path)
+	}
+	return os.MkdirAll(path, mode)
+}
 func (osHost) Stat(path string) (os.FileInfo, error)        { return os.Stat(path) }
 func (osHost) Chmod(path string, mode os.FileMode) error    { return os.Chmod(path, mode) }
 func (osHost) ReadFile(path string) ([]byte, error)         { return os.ReadFile(path) }
