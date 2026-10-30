@@ -93,6 +93,14 @@ func FormatStatus(st map[string]any) string {
 	if v, _ := st["admin_hint"].(string); v != "" {
 		line("admin_hint", v)
 	}
+	if v, _ := st["role"].(string); v != "" {
+		line("role", v)
+	}
+	if warnings, ok := st["warnings"].([]any); ok {
+		for _, w := range warnings {
+			fmt.Fprintf(&b, "%-13s %v\n", "warning:", w)
+		}
+	}
 	if v, _ := st["last_error"].(string); v != "" {
 		line("last_error", v)
 	}
