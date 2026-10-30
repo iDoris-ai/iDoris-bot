@@ -1,6 +1,6 @@
 # 13 · VPN 客户端模式：与已有 Tailscale 并存，以及办公室网关
 
-**日期：** 2026-10-27（泰国时区）· **状态：** `vpn/` 已实现；`make test`、`make lint`（默认与 `-tags integration`）为零告警；嵌入式 Docker 集成测试与原有 `make integration` 的结果见第 10 节。本文只记录这次在 tailscale.com v1.104.2、Headscale v0.29.6、OrbStack arm64 上核实过的行为。
+**日期：** 2026-10-28（泰国时区）· **状态：** `vpn/` 已实现；`make test`、`make lint`（默认与 `-tags integration`）为零告警；嵌入式 Docker 集成测试与原有 `make integration` 的结果见第 10 节。本文只记录在 tailscale.com v1.104.2、Headscale v0.29.6、OrbStack arm64 上核实过的行为。2026-10-28 的状态查询连接、SOCKS5 字段长度，以及同日的注册与服务安装修正，门禁数字在第 10 节末尾。
 
 [docs/12](12-VPN-HEADSCALE.md) 和 [ADR-0005](adr/0005-vpn-tailscale-client-headscale-control.md) 与本文一致：`takeover` 默认 **false**。显式 `takeover: true` 才会切走系统客户端上已有的外网登录。
 
@@ -189,7 +189,7 @@ Headscale 还必须批准这些路由（生产环境由 ops 的 `autoApprovers` 
 
 `/healthz` 仅当 `phase` 为 `connected` 时返回 200，否则 503，正文是阶段名。
 
-`idoris-vpnd status` 走 `FormatStatus`，上表各项都打印。
+`idoris-vpnd status` 走 `FormatStatus`，上表各项都打印。`idoris-vpnd status` 和本地页面的状态回调都调用 `QueryStatus`。它共用一个关掉 keep-alive 的 HTTP 客户端，每次查询的拨号地址放在请求上下文里，避免连到上一次的套接字。单测对回环上的状态服务打了 30 次，服务端新建的连接和关闭的连接对齐。
 
 ## 9. 平台
 
@@ -222,6 +222,8 @@ iOS / Android 同时只允许一个活动 VPN。这次没有在手机上验证�
 结束后 `docker ps -a`、`docker volume ls`、`docker network ls` 里没有 `idoris-vpn-*` 容器、卷或网络。
 
 接线这一轮在 `work/vpn-wiring` 上又跑了一次门禁，数字如下。`make test` 退出码 0：`cmd/idoris-vpn-enroll` 1.422s，`cmd/idoris-vpnd` 1.691s，`internal/enroll` 3.452s，`internal/gateway` 5.102s，`internal/headscale` 2.635s，`internal/join` 2.113s，`internal/netdetect` 4.477s，`internal/ui` 4.331s，`internal/vpnd` 4.510s。两次 `golangci-lint`（第二次带 `--build-tags integration`）都是 `0 issues`。`make licenses` 扫完 linux、darwin、windows 的 amd64 与 arm64，输出 `THIRD_PARTY_NOTICES.md is up to date`。`make build-linux` 版本串是 `5797c87`（gosec 修正在这次编译之后才提交）。`make integration` 退出码 0，包耗时 275.545s。`TestWireAccessForwardsAndSOCKS5` 16.23s，日志是 `max_connections refusal in 0s` 和 `wire access ok: tcp, unix mode 0600, socks5 auth, cap refusal 0s`。这一项开始编译 `wireclient` 时，gosec 修正已经在磁盘上。同轮其余项：`TestEmbeddedAutoLeavesForeignTailscale` 48.73s，`TestHardAAwaitTailscaled` 3.37s，`TestHardAClientCore` 53.43s（`foreign-stays` 15.94s，`unmanaged-prefs` 25.51s，`enroll-down` 5.22s），`TestEnrollConnectAndReauth` 36.14s，`TestLanDirect` 28.95s，`TestLanAwayRelay` 22.59s，`TestGatewaySubnetRoute` 34.16s，`TestWizardGatewayJoin` 30.89s。结束后 `docker ps -a` 没有 `wire-*` 或 `idoris-vpn-*` 容器。
+
+注册与服务安装这一轮在 `work/vpn-r2-go`（`0abdcb0`）上又跑了门禁。`make test` 退出码 0：`cmd/idoris-vpn-enroll` 1.502s，`cmd/idoris-vpnd` 1.682s，`internal/enroll` 8.027s，`internal/gateway` 2.324s，`internal/headscale` 3.732s，`internal/join` 3.927s，`internal/netdetect` 3.431s，`internal/ui` 2.138s，`internal/vpnd` 3.210s。两次 `golangci-lint`（第二次带 `--build-tags integration`）都是 `0 issues`。`GOOS=windows go build ./...` 与 `GOOS=windows go vet ./...` 退出码 0。`make licenses` 扫完 linux、darwin、windows 的 amd64 与 arm64，输出 `THIRD_PARTY_NOTICES.md is up to date`。`make build-linux` 版本串是 `0abdcb0`。`make integration` 退出码 0，包耗时 276.070s；这一轮给未自带项目名的 compose 调用设置了 `COMPOSE_PROJECT_NAME=idoris-vpn-r2g-7f3c1a`。`TestEmbeddedAutoLeavesForeignTailscale` 47.47s，`TestHardAAwaitTailscaled` 2.92s，`TestHardAClientCore` 53.02s，`TestEnrollConnectAndReauth` 34.79s，`TestLanDirect` 29.08s，`TestLanAwayRelay` 22.97s，`TestGatewaySubnetRoute` 34.13s，`TestWireAccessForwardsAndSOCKS5` 15.70s，`TestWizardGatewayJoin` 35.38s。结束后 `docker ps -a`、`docker network ls`、`docker volume ls` 里没有 `idoris-vpn-*` 容器、网络或卷。上面两轮按子测试拆开的秒数没有在这一轮重记。Windows 上的 `icacls` 没有在这台 macOS 上执行。
 
 ## 11. 身份绑定、环境变量、锁
 
@@ -298,7 +300,7 @@ Unix 上，令牌文件、auth key 文件、状态文件、SOCKS5 凭据文件�
 
 因此两件事要分开做：
 
-- 传输层收紧。优先 `unix:<绝对路径>`，套接字创建后是 `0600`，只有拥有者能连。父目录不能是全员可写。已经有进程在听的套接字不会被清掉；没人听的残留文件会删掉再监听。SOCKS5 默认要用户名和密码（RFC 1929）。凭据放在 `0600` 的 `socks5_auth_file`，文件内容一行 `user:password`，这个路径只读取、不创建。都不给时，在 `<state_dir>/socks5.auth` 生成用户名 `idoris` 和随机密码，模式 0600；重启继续用同一份。创建时 info 日志和 `idoris-vpnd status` 都只出现路径。只有显式 `socks5_allow_anonymous: true` 才不认证，进程会打出警告。它和 `socks5_auth_file` 一起写是配置错误。
+- 传输层收紧。优先 `unix:<绝对路径>`，套接字创建后是 `0600`，只有拥有者能连。父目录不能是全员可写。已经有进程在听的套接字不会被清掉；没人听的残留文件会删掉再监听。SOCKS5 默认要用户名和密码（RFC 1929）。用户名和密码各自必须是 1 到 255 字节（按字节，不按字符），显式配置、`socks5_auth_file` 和生成的文件都在监听打开之前检查。256 字节的密码会让 `StartAccess` 失败，并且不返回监听器。凭据放在 `0600` 的 `socks5_auth_file`，文件内容一行 `user:password`，这个路径只读取、不创建。都不给时，在 `<state_dir>/socks5.auth` 生成用户名 `idoris` 和 64 位十六进制密码，模式 0600；重启继续用同一份。创建时 info 日志和 `idoris-vpnd status` 都只出现路径。只有显式 `socks5_allow_anonymous: true` 才不认证，进程会打出警告。它和 `socks5_auth_file` 一起写是配置错误。
 - 应用自己再认证一次。转到 Local AI 的流量，Local AI 应用必须自己验身份。转发和 SOCKS5 只决定谁能用这条通道，不代替应用的登录。
 
 每个监听单独限制。`max_connections` 默认 64，满了就立刻关掉新连接，不排队。`dial_timeout` 默认 10 秒。客户端在拨号期间断开，拨号的 goroutine 会跟着结束。`Accept` 遇到暂时错误会退避重试；致命错误把该监听的 `state` 写成 `failed`，并把错误放进状态的 `error` 字段。
