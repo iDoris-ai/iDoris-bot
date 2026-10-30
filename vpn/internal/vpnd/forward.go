@@ -47,6 +47,10 @@ type AccessOptions struct {
 	// while the reconciler is not connected to our control URL. The daemon
 	// wires the function; this package only enforces it.
 	Gate func() bool
+	// Owner, when set, is consulted instead of Gate and ties every accepted
+	// connection to an ownership generation. A lost generation cancels dials
+	// and closes streams already in progress.
+	Owner *LiveOwner
 	// SOCKS5User and SOCKS5Password are the RFC 1929 credential. Both empty
 	// means "look at the auth file". Setting only one is an error.
 	SOCKS5User     string
