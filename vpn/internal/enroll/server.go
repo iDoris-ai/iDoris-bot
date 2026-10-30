@@ -121,9 +121,8 @@ func (c *Config) Validate() error {
 		if t.HeadscaleUserID == "" {
 			return fmt.Errorf("tenant %q: headscale_user_id is required", t.Name)
 		}
-		if len(t.TokenHashes) == 0 {
-			return fmt.Errorf("tenant %q: at least one token hash is required", t.Name)
-		}
+		// An empty list is a deliberate lockout from revoke --allow-empty.
+		// A missing token_hashes field is rejected while decoding JSON.
 		for _, h := range t.TokenHashes {
 			if b, err := hex.DecodeString(h); err != nil || len(b) != sha256.Size {
 				return fmt.Errorf("tenant %q: token hash %q is not a hex SHA-256", t.Name, h)
