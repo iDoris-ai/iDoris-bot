@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -72,6 +73,68 @@ func TestSOCKS5RequiresAuthUnlessAnonymous(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = conn.Close()
+}
+
+func TestSOCKS5UsernamePassword(t *testing.T) {
+	echo := startEcho(t)
+	access, err := StartAccess(&net.Dialer{}, nil, "127.0.0.1:0", AccessOptions{SOCKS5User: "alice", SOCKS5Password: "s3cret"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = access.Close() }()
+	addr := access.SOCKS5Status().Listen
+
+	rejected, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rejected.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(rejected, buf); err != nil {
+		t.Fatal(err)
+	}
+	_ = rejected.Close()
+	if buf[0] != 5 || buf[1] != 0xff {
+		t.Fatalf("no-auth greeting %v", buf)
+	}
+
+	bad, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clientSOCKSAuth(bad, "alice", "nope"); err != nil {
+		t.Fatal(err)
+	}
+	status := make([]byte, 2)
+	if _, err := io.ReadFull(bad, status); err != nil {
+		t.Fatal(err)
+	}
+	_ = bad.Close()
+	if status[0] != 1 || status[1] != 1 {
+		t.Fatalf("bad password status %v", status)
+	}
+
+	conn, err := socksConnectAuth(t, addr, echo, "alice", "s3cret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write([]byte("auth-ok")); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "auth-ok" {
+		t.Fatalf("got %q", got)
+	}
 }
 
 func TestSOCKS5AuthFileModeAndStateDirReuse(t *testing.T) {
@@ -411,4 +474,84 @@ type callbackDialer struct {
 
 func (c *callbackDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	return c.fn(ctx, network, address)
+}
+
+func clientSOCKSAuth(c net.Conn, user, pass string) error {
+	if _, err := c.Write([]byte{0x05, 0x01, 0x02}); err != nil {
+		return err
+	}
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(c, buf); err != nil {
+		return err
+	}
+	if buf[1] != 0x02 {
+		return fmt.Errorf("method %d", buf[1])
+	}
+	msg := []byte{0x01, byte(len(user))}
+	msg = append(msg, user...)
+	msg = append(msg, byte(len(pass)))
+	msg = append(msg, pass...)
+	_, err := c.Write(msg)
+	return err
+}
+
+func socksConnectAuth(t *testing.T, proxy, dest, user, pass string) (net.Conn, error) {
+	t.Helper()
+	c, err := net.Dial("tcp", proxy)
+	if err != nil {
+		return nil, err
+	}
+	if err := clientSOCKSAuth(c, user, pass); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	status := make([]byte, 2)
+	if _, err := io.ReadFull(c, status); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	if status[1] != 0 {
+		_ = c.Close()
+		return nil, errors.New("socks5 auth rejected")
+	}
+	return finishSOCKSConnect(c, dest)
+}
+
+func finishSOCKSConnect(c net.Conn, dest string) (net.Conn, error) {
+	host, portStr, err := net.SplitHostPort(dest)
+	if err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	ip := net.ParseIP(host).To4()
+	if ip == nil {
+		_ = c.Close()
+		return nil, errors.New("test dest must be ipv4")
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	req := []byte{0x05, 0x01, 0x00, 0x01}
+	req = append(req, ip...)
+	req = append(req, byte(port>>8), byte(port))
+	if _, err := c.Write(req); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	hdr := make([]byte, 4)
+	if _, err := io.ReadFull(c, hdr); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	if hdr[1] != 0 {
+		_ = c.Close()
+		return nil, fmt.Errorf("socks5 rep %d", hdr[1])
+	}
+	if _, err := io.ReadFull(c, make([]byte, 6)); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	return c, nil
 }
