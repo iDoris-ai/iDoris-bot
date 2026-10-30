@@ -813,48 +813,6 @@ func stageSystemSecrets(cfg []byte, destDir string) ([]byte, error) {
 	return append(body, '\n'), nil
 }
 
-// winInstallOps is the Windows install sequence with the secret write
-// replaceable in tests. protectDir runs before stage.
-type winInstallOps struct {
-	mkdir       func(dir string) error
-	protectDir  func(dir string) error
-	readConfig  func(path string) ([]byte, error)
-	stage       func(cfg []byte, destDir string) ([]byte, []string, error)
-	writeConfig func(dir, path string, data []byte) error
-	protectRest func(config, exeDir, exe string, creds []string) error
-	createTask  func(exe string) error
-}
-
-// arrangeWindowsInstall protects the destination, then writes secrets.
-// It does not delete the live configuration directory. replaceWindowsTask
-// is the install path; this remains for the order of protect-before-secrets.
-func arrangeWindowsInstall(ops winInstallOps, exeDir, exe, configPath string) error {
-	if err := ops.mkdir(windowsConfigDir); err != nil {
-		return err
-	}
-	if err := ops.protectDir(windowsConfigDir); err != nil {
-		return err
-	}
-	cfg, err := ops.readConfig(configPath)
-	if err != nil {
-		return err
-	}
-	body, creds, err := ops.stage(cfg, windowsConfigDir)
-	if err != nil {
-		return err
-	}
-	if err := ops.writeConfig(windowsConfigDir, windowsConfigPath, body); err != nil {
-		return err
-	}
-	if err := ops.protectRest(windowsConfigPath, exeDir, exe, creds); err != nil {
-		return err
-	}
-	if err := ops.createTask(exe); err != nil {
-		return err
-	}
-	return nil
-}
-
 func writeRootFile(dir, path string, data []byte, mode os.FileMode) error {
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return err
