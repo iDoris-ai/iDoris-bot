@@ -124,14 +124,61 @@ type StateFile struct {
 	st   DaemonState
 }
 
+// stateHolds is the state-file lock for this process. A second OpenState of
+// the same path in this process reuses it. A second process flock-fails.
+// Entries are held until exit; closing them would let the next OpenState
+// in this process race a peer that the first call already excluded.
+var (
+	stateHoldMu sync.Mutex
+	stateHolds  = map[string]*ControllerLock{}
+)
+
+func holdStateFile(path string) error {
+	canon, err := stateLockKey(path)
+	if err != nil {
+		return err
+	}
+	stateHoldMu.Lock()
+	defer stateHoldMu.Unlock()
+	if _, ok := stateHolds[canon]; ok {
+		return nil
+	}
+	lk, err := acquireLock(canon+".lock", "state file")
+	if err != nil {
+		return err
+	}
+	stateHolds[canon] = lk
+	return nil
+}
+
+func stateLockKey(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", errors.New("state file path is empty")
+	}
+	if !filepath.IsAbs(path) {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return "", err
+		}
+		path = abs
+	}
+	return canonicalizePath(path), nil
+}
+
 // OpenState reads path when it exists. A missing file is an empty binding.
 // An existing file must pass CheckSecretFile.
 func OpenState(path string) (*StateFile, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("state file path is empty")
 	}
+	// Held before any read or write. A second process fails here, so it
+	// cannot replace a persisted backoff before its own start is rejected.
+	if err := holdStateFile(path); err != nil {
+		return nil, err
+	}
 	s := &StateFile{path: path}
-	if _, err := os.Lstat(path); err != nil {
+	if _, err := os.Lstat(path); err != nil { //nolint:gosec // G703: daemon state file path
 		if errors.Is(err, os.ErrNotExist) {
 			return s, nil
 		}
