@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/join"
@@ -41,12 +40,18 @@ func parseConfig(b []byte) (*Config, error) {
 	return &cfg, nil
 }
 
-// SaveFile writes cfg atomically and preserves the existing file mode.
+// SaveFile writes cfg under the config lock and preserves the existing inode.
 // The plaintext of any enrollment token is not part of cfg.
 func SaveFile(path string, cfg *Config) error {
 	if cfg == nil {
 		return errors.New("enroll: config is nil")
 	}
+	return withFileLock(path, func() error {
+		return saveUnlocked(path, cfg)
+	})
+}
+
+func saveUnlocked(path string, cfg *Config) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
@@ -56,80 +61,98 @@ func SaveFile(path string, cfg *Config) error {
 	if err := enc.Encode(cfg); err != nil {
 		return err
 	}
-	return writeAtomic(path, buf.Bytes())
+	return writeInPlace(path, buf.Bytes())
 }
 
-func writeAtomic(path string, data []byte) error {
+// writeInPlace truncates the existing inode. rename would leave a single-file
+// bind mount serving the old file after SIGHUP. path.bak holds the previous bytes.
+func writeInPlace(path string, data []byte) error {
 	st, err := os.Stat(path)
 	if err != nil {
 		return err
 	}
-	dir := filepath.Dir(path)
-	f, err := os.CreateTemp(dir, ".enroll-*.tmp")
+	original, err := os.ReadFile(path) //nolint:gosec // path is the operator-chosen enroll config
 	if err != nil {
 		return err
 	}
-	tmp := f.Name()
-	ok := false
-	defer func() {
-		if !ok {
-			_ = os.Remove(tmp)
-		}
-	}()
+	if err := os.WriteFile(path+".bak", original, st.Mode().Perm()); err != nil { //nolint:gosec // backup beside the operator-chosen config
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0) //nolint:gosec // rewrite the same inode, including through a symlink
+	if err != nil {
+		return err
+	}
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()
+		_ = restoreInPlace(path, original)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = restoreInPlace(path, original)
 		return err
 	}
 	if err := f.Chmod(st.Mode().Perm()); err != nil {
 		_ = f.Close()
 		return err
 	}
-	if err := f.Close(); err != nil {
+	return f.Close()
+}
+
+func restoreInPlace(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0) //nolint:gosec // restore the same inode
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
+	_, werr := f.Write(data)
+	cerr := f.Close()
+	if werr != nil {
+		return werr
 	}
-	ok = true
-	return nil
+	return cerr
 }
 
 // Invite mints a new enrollment token for entry, appends only its SHA-256 to
 // token_hashes, and returns the join code. The plaintext token exists only
 // inside that code. The caller prints the code once and does not log it.
 func Invite(path, entry, hostnameHint, enrollURL string, allowInsecure bool) (string, error) {
-	cfg, err := LoadFile(path)
-	if err != nil {
-		return "", err
-	}
-	idx := entryIndex(cfg, entry)
-	if idx < 0 {
-		return "", fmt.Errorf("enroll: unknown entry %q", entry)
-	}
-	token, hash, err := distinctToken(cfg)
-	if err != nil {
-		return "", err
-	}
-	role := cfg.Tenants[idx].Role
-	if role == "" {
-		role = join.RoleMember
-	}
-	code, err := join.Encode(join.Payload{
-		V:            join.Version,
-		EnrollURL:    enrollURL,
-		Token:        token,
-		Role:         role,
-		Tenant:       cfg.Tenants[idx].Name,
-		HostnameHint: hostnameHint,
-	}, join.Options{AllowInsecure: allowInsecure})
-	if err != nil {
-		return "", err
-	}
-	cfg.Tenants[idx].TokenHashes = append(cfg.Tenants[idx].TokenHashes, hash)
-	if err := SaveFile(path, cfg); err != nil {
-		return "", err
-	}
-	return code, nil
+	var code string
+	err := withFileLock(path, func() error {
+		cfg, err := LoadFile(path)
+		if err != nil {
+			return err
+		}
+		idx := entryIndex(cfg, entry)
+		if idx < 0 {
+			return fmt.Errorf("enroll: unknown entry %q", entry)
+		}
+		token, hash, err := distinctToken(cfg)
+		if err != nil {
+			return err
+		}
+		role := cfg.Tenants[idx].Role
+		if role == "" {
+			role = join.RoleMember
+		}
+		minted, err := join.Encode(join.Payload{
+			V:            join.Version,
+			EnrollURL:    enrollURL,
+			Token:        token,
+			Role:         role,
+			Tenant:       cfg.Tenants[idx].Name,
+			HostnameHint: hostnameHint,
+		}, join.Options{AllowInsecure: allowInsecure})
+		if err != nil {
+			return err
+		}
+		cfg.Tenants[idx].TokenHashes = append(cfg.Tenants[idx].TokenHashes, hash)
+		if err := saveUnlocked(path, cfg); err != nil {
+			return err
+		}
+		code = minted
+		return nil
+	})
+	return code, err
 }
 
 // Revoke removes the single token hash in entry that starts with prefix.
@@ -145,36 +168,37 @@ func Revoke(path, entry, prefix string) (string, error) {
 			return "", errors.New("enroll: hash prefix must be hex")
 		}
 	}
-	cfg, err := LoadFile(path)
-	if err != nil {
-		return "", err
-	}
-	idx := entryIndex(cfg, entry)
-	if idx < 0 {
-		return "", fmt.Errorf("enroll: unknown entry %q", entry)
-	}
-	hashes := cfg.Tenants[idx].TokenHashes
-	match := -1
-	for i, h := range hashes {
-		if strings.HasPrefix(strings.ToLower(h), prefix) {
-			if match >= 0 {
-				return "", fmt.Errorf("enroll: hash prefix %s matches more than one token", prefix)
-			}
-			match = i
+	var removed string
+	err := withFileLock(path, func() error {
+		cfg, err := LoadFile(path)
+		if err != nil {
+			return err
 		}
-	}
-	if match < 0 {
-		return "", fmt.Errorf("enroll: hash prefix %s matches no token in %q", prefix, entry)
-	}
-	if len(hashes) == 1 {
-		return "", errors.New("enroll: refusing to remove the last token hash")
-	}
-	removed := strings.ToLower(hashes[match])
-	cfg.Tenants[idx].TokenHashes = append(hashes[:match], hashes[match+1:]...)
-	if err := SaveFile(path, cfg); err != nil {
-		return "", err
-	}
-	return removed, nil
+		idx := entryIndex(cfg, entry)
+		if idx < 0 {
+			return fmt.Errorf("enroll: unknown entry %q", entry)
+		}
+		hashes := cfg.Tenants[idx].TokenHashes
+		match := -1
+		for i, h := range hashes {
+			if strings.HasPrefix(strings.ToLower(h), prefix) {
+				if match >= 0 {
+					return fmt.Errorf("enroll: hash prefix %s matches more than one token", prefix)
+				}
+				match = i
+			}
+		}
+		if match < 0 {
+			return fmt.Errorf("enroll: hash prefix %s matches no token in %q", prefix, entry)
+		}
+		if len(hashes) == 1 {
+			return errors.New("enroll: refusing to remove the last token hash")
+		}
+		removed = strings.ToLower(hashes[match])
+		cfg.Tenants[idx].TokenHashes = append(hashes[:match], hashes[match+1:]...)
+		return saveUnlocked(path, cfg)
+	})
+	return removed, err
 }
 
 const sha256HexLen = 64
