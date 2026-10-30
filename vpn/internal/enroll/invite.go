@@ -30,7 +30,9 @@ func configPath(path string) (string, error) {
 
 // LoadFile reads a config file. It does not apply environment overrides, so a
 // rewrite cannot persist a value that only existed in the process environment.
-// A truncated file is put back from the fsynced .bak when that backup still parses.
+// An empty file is put back from the fsynced .bak when that backup parses.
+// Any other undecodable bytes are left on disk for parseConfig to reject.
+// LoadFile does not take the config lock. SIGHUP calls ReadFileLocked.
 func LoadFile(path string) (*Config, error) {
 	b, err := readConfigBytes(path)
 	if err != nil {
@@ -63,6 +65,12 @@ func readConfigBytes(path string) ([]byte, error) {
 		return nil, err
 	}
 	if decodesConfig(b) {
+		return b, nil
+	}
+	// An empty file is the window after O_TRUNC and before Write. Other
+	// undecodable bytes stay on disk. Replacing them from .bak would publish
+	// the previous bytes again, including a hash a completed Revoke removed.
+	if len(b) != 0 {
 		return b, nil
 	}
 	bak, berr := os.ReadFile(resolved + ".bak") //nolint:gosec // backup beside the canonical config

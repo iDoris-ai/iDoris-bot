@@ -4,6 +4,7 @@ package enroll
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -234,7 +235,7 @@ func TestWriteFailureRestoresBytes(t *testing.T) {
 	}
 }
 
-func TestCorruptFileRestoresBak(t *testing.T) {
+func TestEmptyFileRestoresBak(t *testing.T) {
 	path := writeHashes(t, 0o640, []string{HashToken("seed-token")})
 	original, err := os.ReadFile(path)
 	if err != nil {
@@ -244,14 +245,7 @@ func TestCorruptFileRestoresBak(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := configInode(t, path)
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.Write([]byte("{")); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Close(); err != nil {
+	if err := os.WriteFile(path, nil, 0o640); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := LoadFile(path)
@@ -266,7 +260,7 @@ func TestCorruptFileRestoresBak(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(got, original) {
-		t.Fatal("live file was not restored from bak")
+		t.Fatal("empty file was not restored from bak")
 	}
 	bak, err := os.ReadFile(path + ".bak")
 	if err != nil {
@@ -284,6 +278,107 @@ func TestCorruptFileRestoresBak(t *testing.T) {
 	}
 	if !bytes.Equal(locked, original) {
 		t.Fatal("locked read did not return the restored bytes")
+	}
+}
+
+func TestEmptyFileWithUnparsedBakStaysEmpty(t *testing.T) {
+	path := writeHashes(t, 0o640, []string{HashToken("seed-token")})
+	if err := os.WriteFile(path+".bak", []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadFile(path); err == nil {
+		t.Fatal("empty file with an unparsed bak loaded")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatal("unparsed bak was written onto the live file")
+	}
+}
+
+func TestUnknownFieldIsNotReplacedFromBak(t *testing.T) {
+	path := writeHashes(t, 0o640, []string{HashToken("seed-token")})
+	if _, err := Invite(path, "acme", "", "https://enroll.example.org", false); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	doc["operator_typo"] = true
+	edited, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	edited = append(edited, '\n')
+	if err := os.WriteFile(path, edited, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadFile(path); err == nil {
+		t.Fatal("unknown field was accepted")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, edited) {
+		t.Fatal("reload overwrote the operator edit")
+	}
+	locked, err := ReadFileLocked(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(locked, edited) {
+		t.Fatal("locked read overwrote the operator edit")
+	}
+}
+
+func TestRevokeThenTruncationDoesNotRestoreHash(t *testing.T) {
+	h0 := HashToken("seed-token")
+	h1 := HashToken("second-token")
+	path := writeHashes(t, 0o640, []string{h0, h1})
+	if _, err := Revoke(path, "acme", h0[:8]); err != nil {
+		t.Fatal(err)
+	}
+	live, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(live, []byte(h0)) {
+		t.Fatal("revoke left the hash in the live file")
+	}
+	trunc := []byte("{")
+	if err := os.WriteFile(path, trunc, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadFile(path); err == nil {
+		t.Fatal("truncated file loaded")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, trunc) {
+		t.Fatal("truncation was replaced from bak")
+	}
+	if bytes.Contains(got, []byte(h0)) {
+		t.Fatal("revoked hash returned to the live file")
+	}
+	locked, err := ReadFileLocked(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(locked, trunc) {
+		t.Fatal("locked read restored bak over the truncation")
 	}
 }
 
