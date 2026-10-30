@@ -83,7 +83,7 @@ idoris-vpnd service install --config ~/.idoris/vpnd.json
 sudo loginctl enable-linger "$USER"
 ```
 
-或者用 `sudo idoris-vpnd service install --system --config FILE` 装成机器级服务（见 `docs/16` 第 12 节和 `docs/14` 第 11 节）。这次没有在 Linux 真机上执行 `loginctl` 或以 root 安装系统单元。
+或者用 `sudo idoris-vpnd service install --system --config FILE` 装成机器级服务（见 `docs/16` 第 12 节和 `docs/14` 第 11 节）。`loginctl enable-linger` 这次没有在 Linux 上执行。机器级 systemd 单元已经在真实 systemd 里以 root 装过并保持 `active`，见 docs/14 第 11 节。
 
 成员要收下别人宣布的路由时，配置里写 `"accept_routes": true`。
 
