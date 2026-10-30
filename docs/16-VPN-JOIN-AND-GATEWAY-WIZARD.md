@@ -72,7 +72,7 @@ idoris-vpn-enroll revoke --config F --entry E --hash-prefix P
 idoris-vpn-enroll list-credentials --config F --entry E
 ```
 
-过期或删除 Headscale 节点不会收回登记权：守护进程还能再要一把预授权密钥。下线顺序是：先 `revoke`，再让正在跑的 `idoris-vpn-enroll serve` 收到 `SIGHUP`（或重启进程），然后才过期或删除节点。部署侧用 `ctl.sh offboard` 把这三步包起来；本文件不改 `deploy/`。
+过期或删除 Headscale 节点不会收回登记权：守护进程还能再要一把预授权密钥。下线顺序是：先 `revoke`，再让正在跑的 `idoris-vpn-enroll serve` 重新读配置，然后才过期或删除节点。重新读配置靠 `SIGHUP` 或重启进程；compose 把 `config.json` 按单文件绑进容器，`revoke` 的 rename 会让绑定指着旧文件，SIGHUP 在那里不可靠，所以 `ctl.sh offboard` 用重启 enroll 容器。部署侧用 `ctl.sh offboard` 把这几步包起来。
 
 `invite` / `revoke` 只改文件，不给进程发信号。`SIGHUP` 重新读配置；新文件不合法时保留旧配置并写日志。吊销过的凭证在这次重载之后不能再登记。`/v1/discover` 返回 `tenant`、`role` 和 `lan_cidrs`，不签发密钥。
 
@@ -191,11 +191,11 @@ Error: invalid argument "wiz-gw-wait" for "-i, --identifier" flag: strconv.Parse
 
 ## 10. 部署侧要补的改动（本轮没有改 `deploy/`）
 
-登记配置由 `deploy/vpn/bootstrap.sh` 写入 `enroll/config.json`。本轮不改 `deploy/`。下线要由部署侧的 `ctl.sh offboard` 按第 3 节的顺序包起来：`revoke`，`SIGHUP`，再过期或删除节点。只删节点，凭证还在。
+登记配置由 `deploy/vpn/bootstrap.sh` 写入 `enroll/config.json`。部署侧的 `ctl.sh token new|list|revoke` 和 `ctl.sh offboard` 已按第 3 节的顺序包好：`revoke`，重新加载（compose 里是重启 enroll 容器），再过期或删除节点。只删节点，凭证还在。
 
 建议部署侧保持这些，而不是改客户端：
 
-1. `ctl.sh` 在 enroll 容器里执行下面的 CLI，不要再包一层会把加入码写进日志的 echo。写完文件后对 enroll 进程发 `SIGHUP`（或重启容器）。邀请、吊销、列出凭证的参数是：
+1. `ctl.sh` 在 enroll 容器里执行下面的 CLI，不要再包一层会把加入码写进日志的 echo。写完文件后让 enroll 重新读配置（裸进程发 `SIGHUP`；compose 部署里重启容器）。邀请、吊销、列出凭证的参数是：
 
 ```text
 idoris-vpn-enroll invite --config F --entry E --label L --enroll-url U
@@ -248,4 +248,4 @@ macOS 需要 sudo。plist 写到 `/Library/LaunchDaemons/ai.idoris.vpnd.plist`�
 
 Windows 不引入新依赖，用系统自带的 `schtasks.exe`。任务名 `idoris-vpnd`，`ONSTART`，`/RU SYSTEM`，`/RL HIGHEST`。配置复制到 `C:\ProgramData\idoris\vpn.json`。卸载是 `schtasks /Delete /TN idoris-vpnd /F`，配置留下。参数列表由 `vpn/cmd/idoris-vpnd/testdata/idoris-vpnd.task.txt` 锁住；单测不执行 `schtasks`。
 
-本机转发和 SOCKS5 谁能连上，写在 `docs/13-VPN-CLIENT-MODES.md` 第 12 节。那一节和这里的本地页面不是同一件事：页面有自己的秘密和 CSRF；转发监听没有，除非改成 unix 套接字或给 SOCKS5 配认证。
+本机转发和 SOCKS5 谁能连上，写在 `docs/13-VPN-CLIENT-MODES.md` 第 13 节。那一节和这里的本地页面不是同一件事：页面有自己的秘密和 CSRF。回环 TCP 转发本身不认证。`unix:` 套接字是 0600。SOCKS5 默认要用户名和密码，凭据在 `socks5_auth_file`，或在 `<state_dir>/socks5.auth`（0600，创建时日志只打路径）。

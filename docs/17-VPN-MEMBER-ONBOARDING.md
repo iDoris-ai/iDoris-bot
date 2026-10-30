@@ -150,19 +150,13 @@ docker compose exec headscale headscale preauthkeys create --user <数字id> --e
 
 这台机器要在开机时就在线，用第 4 节的 linger 或系统单元。嵌入模式可以当成员用，但不能宣布路由。
 
-Tailscale SSH 还要在注册完成之后，在这台主机上执行：
-
-```bash
-sudo tailscale set --ssh
-```
-
-策略里的 tcp/22 和 `ssh` 规则不会替你打开 SSH。`idoris-vpnd` 没有 `RunSSH`。管理员连上来时会停在待批准，操作员执行：
+Local AI 主机在 system 模式的 idoris-vpnd 配置里写 `"ssh": true`。策略里的 SSH 规则仍然决定谁可以连。管理员连上来时会停在待批准，操作员执行：
 
 ```bash
 docker compose exec headscale headscale auth approve --auth-id <id>
 ```
 
-id 在 SSH 横幅和 `<server_url>/auth/<id>` 上。这次没有对真实主机会话执行这两条。
+id 在 SSH 横幅和 `<server_url>/auth/<id>` 上。这条没有对真实主机会话执行过。
 
 ## 8. 网关主人
 
