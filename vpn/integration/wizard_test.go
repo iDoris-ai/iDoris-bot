@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/enroll"
+	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/gateway"
 	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/headscale"
 	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/join"
 	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/vpnd"
@@ -44,8 +45,27 @@ type wizNets struct {
 }
 
 func wizChooseNets() (wizNets, error) {
-	panic("stub")
+	var b [2]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return wizNets{}, err
+	}
+	// 200-219 stays clear of the LAN suite, which uses 240-254.
+	second := 200 + int(b[0]%20)
+	third := int(b[1] % 200)
+	octet := func(n int) string { return fmt.Sprintf("%d", n) }
+	host := func(th, last int) string {
+		return "10." + octet(second) + "." + octet(th) + "." + octet(last)
+	}
+	return wizNets{
+		officeCIDR: "10." + octet(second) + "." + octet(third) + ".0/24",
+		officeGW:   host(third, 1),
+		homeCIDR:   "10." + octet(second) + "." + octet(third+1) + ".0/24",
+		homeGW:     host(third+1, 1),
+		echo:       host(third, 10),
+		echoB:      host(third, 11),
+	}, nil
 }
+
 func wizProjectName() (string, error) {
 	var b [3]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -111,11 +131,57 @@ func (e *wizEnv) down(t *testing.T) {
 }
 
 func wizPolicy(echo, echoB string) string {
-	panic("stub")
+	// The tag is applied by the pre-auth key (tenant acl_tags), not by a
+	// client advertise-tags request. Headscale v0.29.6 rejects the latter.
+	//
+	// The same tag is an ACL source. Headscale only copies an approved
+	// primary onto the advertising node's own netmap when that node can
+	// access the prefix (mapper.WithSelfNode → ReduceRoutes). Without
+	// this, tailscaled's Status.Self.PrimaryRoutes stays empty and
+	// idoris-vpnd keeps reporting routes-pending-approval after the
+	// server has already approved the route. echo B is a destination
+	// only ("<ip>/32:8740"), never an autoApprovers key.
+	return fmt.Sprintf(`{
+  "groups": {"group:admins": ["admin@"]},
+  "tagOwners": {"tag:wiz-gateway": ["group:admins"]},
+  "autoApprovers": {
+    "routes": {%q: ["tag:wiz-gateway"]}
+  },
+  "acls": [
+    {"action": "accept", "src": ["wiz@", "tag:wiz-gateway"], "dst": [%q, %q]}
+  ]
 }
+`, echo+"/32", echo+"/32:8740", echoB+"/32:8740")
+}
+
 func wizInvite(t *testing.T, bin, cfgPath, hint, enrollURL string) (string, join.Payload) {
-	panic("stub")
+	t.Helper()
+	cmd := exec.Command(bin, "invite",
+		"--config", cfgPath,
+		"--entry", "wiz",
+		"--hostname-hint", hint,
+		"--enroll-url", enrollURL,
+		"--allow-insecure")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("invite %s: %v\n%s", hint, err, wizSecretRE.ReplaceAllString(stderr.String(), "[redacted]"))
+	}
+	code := strings.TrimSpace(stdout.String())
+	if code == "" || strings.Contains(code, "\n") {
+		t.Fatalf("invite %s: stdout must be exactly one join code line", hint)
+	}
+	payload, err := join.Decode(code, join.Options{AllowInsecure: true})
+	if err != nil {
+		t.Fatalf("invite %s: decode: %v", hint, err)
+	}
+	if payload.Role != join.RoleGateway || payload.Tenant != "wiz" || payload.HostnameHint != hint || payload.Token == "" {
+		t.Fatalf("invite %s: role %s tenant %s hint %s", hint, payload.Role, payload.Tenant, payload.HostnameHint)
+	}
+	return code, payload
 }
+
 func buildHostBin(t *testing.T, pkg, out string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
@@ -387,17 +453,155 @@ func (e *wizEnv) probeEnroll(t *testing.T, host, enrollURL string) string {
 }
 
 func (e *wizEnv) memberUp(t *testing.T, hs *headscale.Client, userID string) {
-	panic("stub")
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	key, err := hs.CreatePreAuthKey(ctx, headscale.CreatePreAuthKeyRequest{
+		UserID:     userID,
+		Reusable:   true,
+		Expiration: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.secrets = append(e.secrets, key.Key)
+	e.pinHeadscale(t, "wiz-member")
+	e.must(t, 70*time.Second, "exec", "-T", "wiz-member", "tailscale", "up",
+		"--reset",
+		"--login-server=https://headscale",
+		"--auth-key="+key.Key,
+		"--accept-routes",
+		"--accept-dns=true",
+		"--hostname=wiz-member",
+		"--timeout=45s",
+	)
+	waitFor(t, "wiz-member online", 60*time.Second, func() (bool, string) {
+		st, err := e.exec(15*time.Second, "exec", "-T", "wiz-member", "tailscale", "status", "--json")
+		if err != nil {
+			return false, e.redact(err.Error())
+		}
+		parsed, err := lanParseStatus(st)
+		if err != nil {
+			return false, err.Error()
+		}
+		if parsed.BackendState != "Running" {
+			return false, parsed.BackendState
+		}
+		nodes, err := hs.ListNodes(context.Background(), "wiz")
+		if err != nil {
+			return false, err.Error()
+		}
+		for _, n := range nodes {
+			if lanNodeHost(n) == "wiz-member" && n.Online {
+				return true, ""
+			}
+		}
+		return false, "running, not online in headscale yet"
+	})
 }
+
+func (e *wizEnv) pinHeadscale(t *testing.T, host string) {
+	t.Helper()
+	out := e.must(t, 15*time.Second, "exec", "-T", host, "getent", "hosts", "headscale")
+	ip := lanFirstIPv4(out)
+	if ip == "" {
+		t.Fatalf("getent headscale on %s: %q", host, out)
+	}
+	script := fmt.Sprintf("grep -q '[[:space:]]headscale$' /etc/hosts || echo '%s headscale' >> /etc/hosts", ip)
+	e.must(t, 10*time.Second, "exec", "-T", host, "sh", "-c", script)
+}
+
 func (e *wizEnv) join(t *testing.T, host, code, device string) string {
-	panic("stub")
+	t.Helper()
+	out, err := e.exec(60*time.Second, "exec", "-e", "HOME=/root", "-T", host,
+		"/opt/idoris-vpnd", "join",
+		"--yes", "--device", device, "--no-service", "--allow-insecure", code)
+	red := e.redact(out)
+	if err != nil {
+		t.Fatalf("join %s: %v\n%s", host, err, red)
+	}
+	if strings.Contains(out, code) || strings.Contains(out, "idv1_") {
+		t.Fatal("join stdout contains the join code or token")
+	}
+	return red
 }
+
 func (e *wizEnv) assertJoinPlan(t *testing.T, out string, nets wizNets, route string, auto bool) {
-	panic("stub")
+	t.Helper()
+	var candidates, recommended int
+	var rec string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "candidate:") {
+			candidates++
+		}
+		if strings.HasPrefix(line, "candidate: recommended ") {
+			recommended++
+			rec = line
+		}
+	}
+	if candidates < 1 || recommended != 1 || !strings.Contains(rec, nets.officeCIDR) || !strings.Contains(rec, "gateway "+nets.officeGW) {
+		t.Fatalf("detection candidates=%d recommended=%q\n%s", candidates, rec, out)
+	}
+	if !strings.Contains(out, "routes: "+route) || strings.Contains(out, "routes: "+nets.officeCIDR) {
+		t.Fatalf("route selection:\n%s", out)
+	}
+	want := "auto-approve: no"
+	if auto {
+		want = "auto-approve: yes"
+	}
+	if !strings.Contains(out, want) || !strings.Contains(out, "ip-forward: enabled") || !strings.Contains(out, "role: gateway") {
+		t.Fatalf("plan summary missing %s:\n%s", want, out)
+	}
+	if strings.Contains(out, "discover failed") {
+		t.Fatalf("discover failed, so approval is a guess:\n%s", out)
+	}
 }
+
 func (e *wizEnv) assertWrittenConfig(t *testing.T, host, route, office string, auto bool) {
-	panic("stub")
+	t.Helper()
+	raw := e.must(t, 10*time.Second, "exec", "-T", host, "cat", "/root/.idoris/vpn.json")
+	if strings.Contains(raw, "idv1_") || strings.Contains(raw, office) {
+		t.Fatalf("vpn.json leaked a token or advertised the office prefix:\n%s", e.redact(raw))
+	}
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var cfg vpnd.Config
+	if err := dec.Decode(&cfg); err != nil {
+		t.Fatalf("vpn.json: %v\n%s", err, raw)
+	}
+	if cfg.Mode != "system" || cfg.Role != join.RoleGateway || cfg.AcceptRoutes || !cfg.EnrollAllowInsecure {
+		t.Fatalf("config mode=%s role=%s accept=%v insecure=%v", cfg.Mode, cfg.Role, cfg.AcceptRoutes, cfg.EnrollAllowInsecure)
+	}
+	if len(cfg.AdvertiseRoutes) != 1 || cfg.AdvertiseRoutes[0] != route {
+		t.Fatalf("advertise_routes %v", cfg.AdvertiseRoutes)
+	}
+	if len(cfg.AdvertiseTags) != 1 || cfg.AdvertiseTags[0] != "tag:wiz-gateway" {
+		t.Fatalf("tags %v", cfg.AdvertiseTags)
+	}
+	if cfg.EnrollToken != "" || cfg.AuthKey != "" || cfg.EnrollTokenFile == "" {
+		t.Fatal("config stored a plaintext secret or missed the token file")
+	}
+	planRaw := e.must(t, 10*time.Second, "exec", "-T", host, "cat", "/root/.idoris/gateway-plan.json")
+	if strings.Contains(planRaw, "idv1_") {
+		t.Fatal("plan file contains a token")
+	}
+	var plan gateway.Plan
+	if err := json.Unmarshal([]byte(planRaw), &plan); err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Routes) != 1 || plan.Routes[0] != route || plan.Network != office || plan.WholeSubnet || plan.WillAutoApprove != auto {
+		t.Fatalf("plan routes %v network %s whole %v auto %v", plan.Routes, plan.Network, plan.WholeSubnet, plan.WillAutoApprove)
+	}
+	fwd := e.must(t, 10*time.Second, "exec", "-T", host, "cat", "/etc/sysctl.d/99-idoris-vpn.conf")
+	if !strings.Contains(fwd, "net.ipv4.ip_forward = 1") {
+		t.Fatalf("sysctl drop-in:\n%s", fwd)
+	}
+	proc := e.must(t, 10*time.Second, "exec", "-T", host, "cat", "/proc/sys/net/ipv4/ip_forward")
+	if strings.TrimSpace(proc) != "1" {
+		t.Fatalf("ip_forward=%q", proc)
+	}
 }
+
 func (e *wizEnv) startDaemon(t *testing.T, host string) {
 	t.Helper()
 	e.must(t, 20*time.Second, "exec", "-d", "-e", "HOME=/root", "-T", host,
@@ -423,17 +627,106 @@ func (e *wizEnv) status(t *testing.T, host string) (wizSnap, string, error) {
 }
 
 func (e *wizEnv) waitStatus(t *testing.T, host string, budget time.Duration, cond func(wizSnap) (bool, string)) wizSnap {
-	panic("stub")
+	t.Helper()
+	var found wizSnap
+	waitFor(t, host+" status", budget, func() (bool, string) {
+		st, raw, err := e.status(t, host)
+		if err != nil {
+			return false, e.redact(err.Error() + " " + raw)
+		}
+		ok, note := cond(st)
+		if ok {
+			found = st
+		}
+		return ok, e.redact(note)
+	})
+	return found
 }
+
 func (e *wizEnv) mustHealth(t *testing.T, host string, connected bool) {
-	panic("stub")
+	t.Helper()
+	// BusyBox wget drops the body and exits 1 on HTTP 503. A raw request
+	// keeps the status line and the phase name.
+	script := `printf 'GET /healthz HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n' | nc -w 3 127.0.0.1 7845`
+	out, err := e.exec(12*time.Second, "exec", "-T", host, "sh", "-c", script)
+	body := e.redact(out)
+	if err != nil {
+		t.Fatalf("healthz: %v\n%s", err, body)
+	}
+	if connected {
+		if !strings.Contains(body, "200") || !strings.Contains(body, "\nok") {
+			t.Fatalf("healthz want 200 ok:\n%s", body)
+		}
+		return
+	}
+	if !strings.Contains(body, "503") || !strings.Contains(body, string(vpnd.PhaseRoutesPending)) {
+		t.Fatalf("healthz want 503 %s:\n%s", vpnd.PhaseRoutesPending, body)
+	}
 }
+
+func (e *wizEnv) listRoutes(t *testing.T) []gwRouteNode {
+	t.Helper()
+	raw := e.must(t, 20*time.Second, "exec", "-T", "headscale", "headscale", "nodes", "list-routes", "-o", "json")
+	nodes, err := gwParseRoutes(raw)
+	if err != nil {
+		t.Fatalf("list-routes: %v\n%s", err, e.redact(raw))
+	}
+	return nodes
+}
+
 func (e *wizEnv) waitRoutes(t *testing.T, host string, budget time.Duration, cond func(gwRouteNode) (bool, string)) gwRouteNode {
-	panic("stub")
+	t.Helper()
+	var found gwRouteNode
+	waitFor(t, host+" routes", budget, func() (bool, string) {
+		nodes := e.listRoutes(t)
+		for _, n := range nodes {
+			if gwSameHost(n, host) {
+				ok, note := cond(n)
+				if ok {
+					found = n
+				}
+				return ok, note
+			}
+		}
+		return false, "node not in list-routes"
+	})
+	return found
 }
+
 func (e *wizEnv) nodeHasTag(t *testing.T, host, tag string) bool {
-	panic("stub")
+	t.Helper()
+	out := e.must(t, 15*time.Second, "exec", "-T", "headscale", "headscale", "nodes", "list", "-o", "json")
+	raw := lanExtractJSON(out)
+	var nodes []struct {
+		GivenName string   `json:"givenName"`
+		Name      string   `json:"name"`
+		Tags      []string `json:"tags"`
+	}
+	if err := json.Unmarshal(raw, &nodes); err != nil {
+		var wrap struct {
+			Nodes []struct {
+				GivenName string   `json:"givenName"`
+				Name      string   `json:"name"`
+				Tags      []string `json:"tags"`
+			} `json:"nodes"`
+		}
+		if err2 := json.Unmarshal(raw, &wrap); err2 != nil {
+			t.Logf("nodes list: %v / %v", err, err2)
+			return false
+		}
+		nodes = wrap.Nodes
+	}
+	for _, n := range nodes {
+		if n.GivenName != host && !strings.HasPrefix(n.Name, host+".") && n.Name != host {
+			continue
+		}
+		if gwHas(n.Tags, tag) {
+			return true
+		}
+	}
+	return false
 }
+
 func (e *wizEnv) approve(t *testing.T, host, numericID, cidr string) {
 	t.Helper()
 	e.approveCalls++
@@ -449,9 +742,23 @@ func (e *wizEnv) approve(t *testing.T, host, numericID, cidr string) {
 		"--identifier", numericID, "--routes", cidr)
 }
 
+// waitEcho retries the member's TCP probe. The route can be installed
+// before the WireGuard session to the gateway has passed a packet.
 func (e *wizEnv) waitEcho(t *testing.T, ip string) {
-	panic("stub")
+	t.Helper()
+	waitFor(t, "wiz-member reaches "+ip+":8740", 45*time.Second, func() (bool, string) {
+		out, err := e.exec(8*time.Second, "exec", "-T", "wiz-member", "nc", "-w", "2", ip, "8740")
+		text := strings.TrimSpace(out)
+		if err == nil && strings.Contains(text, "ok") {
+			return true, text
+		}
+		if err != nil {
+			text = strings.TrimSpace(text + " " + err.Error())
+		}
+		return false, text
+	})
 }
+
 func (e *wizEnv) nc(t *testing.T, container, host, port string, waitSec int) (string, error) {
 	t.Helper()
 	out, err := e.exec(time.Duration(waitSec+8)*time.Second, "exec", "-T", container, "nc", "-w", fmt.Sprintf("%d", waitSec), host, port)
