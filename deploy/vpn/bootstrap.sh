@@ -458,51 +458,26 @@ fi
 if [[ ${#new_rows[@]} -gt 0 ]]; then
   spec_file="$(mktemp enroll/config.sync.XXXXXX)"
   printf '%s\n' "${new_rows[@]}" > "$spec_file"
-  python3 - "$control_url" enroll/config.json "$spec_file" > enroll/config.json.tmp <<'PY'
-import datetime, json, os, re, sys
-control_url, path, spec_path = sys.argv[1:4]
-if os.path.exists(path):
-    with open(path) as f:
-        cfg = json.load(f)
-else:
-    cfg = {
-        "control_url": control_url,
-        "headscale_url": "http://headscale:8080",
-        "headscale_api_key_file": "/etc/idoris/headscale.apikey",
-        "tenants": [],
-    }
-have = {t["name"] for t in cfg.get("tenants", [])}
-with open(spec_path) as f:
-    for line in f:
-        name, user, tags, rate, ttl, digest, role = line.rstrip("\n").split("|")
-        if name in have:
-            continue
-        label = "bootstrap-" + name
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", label):
-            raise SystemExit("bootstrap label %r is not a valid credential label" % label)
-        created = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        entry = {
-            "name": name,
-            "headscale_user_id": user,
-            "token_hashes": [{
-                "hash": digest,
-                "label": label,
-                "created_at": created,
-            }],
-            "preauth_ttl": ttl or "10m",
-        }
-        if role:
-            entry["role"] = role
-        if tags:
-            entry["acl_tags"] = tags.split(",")
-        if rate:
-            entry["rate_per_minute"] = int(rate)
-        cfg["tenants"].append(entry)
-json.dump(cfg, sys.stdout, indent=2)
-print()
+  # Re-read inside <config>.lock. A revoke that wins the lock first stays
+  # revoked; one that arrives during this write runs after it.
+  set +e
+  python3 - "$control_url" "$here/enroll/config.json" "$spec_file" "$enroll_uid" "$enroll_gid" <<'PY'
+import sys
+from enroll_lock import locked_update, merge_bootstrap_rows
+
+control_url, path, spec_path, uid_s, gid_s = sys.argv[1:6]
+with open(spec_path, encoding="utf-8") as handle:
+    spec = handle.read()
+
+def mutate(cfg):
+    return merge_bootstrap_rows(cfg, control_url, spec)
+
+locked_update(path, mutate, runtime_uid=int(uid_s), runtime_gid=int(gid_s))
 PY
-  mv enroll/config.json.tmp enroll/config.json
+  py_rc=$?
+  set -e
   rm -f "$spec_file"
+  [[ "$py_rc" -eq 0 ]] || exit "$py_rc"
   echo "wrote enroll/config.json"
   if [[ -n "$(compose ps --status running -q enroll)" ]]; then
     compose restart enroll >/dev/null
@@ -515,7 +490,9 @@ if [[ -f enroll/config.json && ! -L enroll/config.json ]]; then
   enroll_cksum="$(cksum enroll/config.json | awk '{print $1}')"
   python3 "$here/policy.py" reconcile-enroll \
     --state "$here/headscale/managed.json" \
-    --config "$here/enroll/config.json"
+    --config "$here/enroll/config.json" \
+    --runtime-uid "$enroll_uid" \
+    --runtime-gid "$enroll_gid"
   if [[ "$(cksum enroll/config.json | awk '{print $1}')" != "$enroll_cksum" ]] && service_running enroll; then
     compose restart enroll >/dev/null
   fi
