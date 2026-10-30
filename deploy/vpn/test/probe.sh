@@ -24,7 +24,7 @@ command -v docker >/dev/null || die "docker not found"
 docker compose version >/dev/null 2>&1 || die "docker compose v2 is required"
 command -v python3 >/dev/null || die "python3 is required"
 
-PROJ="idorisvp$(python3 -c 'import random; print(random.randint(100000, 999999))')"
+PROJ="idoris-vpn-ctl-$(python3 -c 'import random; print(random.randint(100000, 999999))')"
 export COMPOSE_PROJECT_NAME="$PROJ"
 ENROLL_UID="$(id -u)"
 ENROLL_GID="$(id -g)"
@@ -47,6 +47,30 @@ DERP_STUN_PORT="$(free_udp)"
 export HEADSCALE_PORT HEADPLANE_PORT ENROLL_PORT DERP_STUN_PORT
 
 dc() { docker compose -f "$root/compose.yaml" -f "$lab/override.yaml" "$@"; }
+
+# Copy a lab secret into the deploy tree only when that path is empty.
+# Cleanup deletes paths recorded in staged-files.
+stage_secret() {
+  local dest="$1" src="$2"
+  if [[ -e "$dest" || -L "$dest" ]]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$dest")"
+  cp "$src" "$dest"
+  chmod 600 "$dest"
+  printf '%s\n' "$dest" >> "$lab/staged-files"
+}
+
+# Re-copy a file this probe created. A credential test rewrites the lab
+# config after the first copy; backup must see that later file.
+refresh_staged() {
+  local dest="$1" src="$2"
+  [[ -f "$lab/staged-files" ]] || return 0
+  if grep -qxF "$dest" "$lab/staged-files"; then
+    cp "$src" "$dest"
+    chmod 600 "$dest"
+  fi
+}
 
 cleanup() {
   local ec=$?
@@ -122,8 +146,11 @@ python3 "$root/policy.py" add-tenant \
   --org globex >/dev/null
 
 # Placeholder enroll files so compose can create the container later.
-printf '%s\n' '{"control_url":"http://headscale:8080","headscale_url":"http://headscale:8080","headscale_api_key_file":"/etc/idoris/headscale.apikey","tenants":[{"name":"placeholder","headscale_user_id":"1","token_hashes":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}]}' > "$lab/enroll.json"
-printf '%s' 'placeholder' > "$lab/headscale.apikey"
+# credentials.sh and ctl.sh share this directory with the running service.
+mkdir -p "$lab/enroll-home"
+printf '%s\n' '{"control_url":"http://headscale:8080","headscale_url":"http://headscale:8080","headscale_api_key_file":"/etc/idoris/headscale.apikey","tenants":[{"name":"placeholder","headscale_user_id":"1","token_hashes":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}]}' > "$lab/enroll-home/config.json"
+printf '%s' 'placeholder' > "$lab/enroll-home/headscale.apikey"
+chmod 600 "$lab/enroll-home/config.json" "$lab/enroll-home/headscale.apikey"
 
 cat > "$lab/override.yaml" <<'EOF'
 services:
@@ -135,8 +162,8 @@ services:
       - headscale-run:/var/run/headscale
   enroll:
     volumes: !override
-      - ./test/.lab/enroll.json:/etc/idoris/enroll.json:ro
-      - ./test/.lab/headscale.apikey:/etc/idoris/headscale.apikey:ro
+      - ./test/.lab/enroll-home/config.json:/etc/idoris/enroll.json:ro
+      - ./test/.lab/enroll-home/headscale.apikey:/etc/idoris/headscale.apikey:ro
 EOF
 
 echo "probe: project=${PROJ} headscale=${HEADSCALE_PORT} enroll=${ENROLL_PORT} stun=${DERP_STUN_PORT}"
@@ -174,7 +201,8 @@ for name in ("admin", "acme", "globex"):
 
 api_key="$(dc exec -T headscale headscale apikeys create --expiration 24h | tr -d '\r\n')"
 [[ "$api_key" == hskey-api-* ]] || die "apikeys create did not return an API key"
-printf '%s' "$api_key" > "$lab/headscale.apikey"
+printf '%s' "$api_key" > "$lab/enroll-home/headscale.apikey"
+chmod 600 "$lab/enroll-home/headscale.apikey"
 unset api_key
 
 image="$(dc config --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["enroll"]["image"])')"
@@ -205,7 +233,7 @@ for spec in "${entries[@]}"; do
   printf '%s\n' "${ename}|${euser}|${etags}|${erate}|${ettl}|${hash}" >> "$lab/enroll.spec"
 done
 
-python3 - "$lab/users.txt" "$lab/enroll.spec" "$lab/enroll.json" <<'PY'
+python3 - "$lab/users.txt" "$lab/enroll.spec" "$lab/enroll-home/config.json" <<'PY'
 import json, sys
 users = {}
 for line in open(sys.argv[1]):
@@ -618,22 +646,26 @@ else
   echo "  ok   globex-member denied Headplane on ${vip}:3000"
 fi
 
+echo "probe: credential lifecycle"
+# compose run (ctl.sh) also bind-mounts deploy/vpn/enroll/*. Those files have
+# to exist. The credential commands write ENROLL_DIR, which is the file the
+# running enroll process reloads.
+stage_secret "$root/enroll/config.json" "$lab/enroll-home/config.json"
+stage_secret "$root/enroll/headscale.apikey" "$lab/enroll-home/headscale.apikey"
+if ENROLL_DIR="$lab/enroll-home" PROJ="$PROJ" bash "$root/test/credentials.sh"; then
+  pass=$((pass + 1))
+  echo "  ok   credential lifecycle"
+else
+  fail=$((fail + 1))
+  echo "  FAIL credential lifecycle" >&2
+fi
+
 echo "probe: backup/restore keeps the published Headplane stopped"
 printf 'mode=tailnet-admin\n' > "$root/.admin-mode"
 chmod 600 "$root/.admin-mode"
 # ctl.sh backup reads host files. The lab keeps the live copies under test/.lab
 # so a developer tree without secrets can still take the bundle. Only paths
 # this probe created are deleted on the way out.
-stage_secret() {
-  local dest="$1" src="$2"
-  if [[ -e "$dest" || -L "$dest" ]]; then
-    return 0
-  fi
-  mkdir -p "$(dirname "$dest")"
-  cp "$src" "$dest"
-  chmod 600 "$dest"
-  printf '%s\n' "$dest" >> "$lab/staged-files"
-}
 if [[ ! -e "$root/.env" && ! -L "$root/.env" ]]; then
   cat > "$root/.env" <<EOF
 COMPOSE_PROJECT_NAME=${PROJ}
@@ -647,8 +679,10 @@ EOF
   chmod 600 "$root/.env"
   printf '%s\n' "$root/.env" >> "$lab/staged-files"
 fi
-stage_secret "$root/enroll/config.json" "$lab/enroll.json"
-stage_secret "$root/enroll/headscale.apikey" "$lab/headscale.apikey"
+refresh_staged "$root/enroll/config.json" "$lab/enroll-home/config.json"
+refresh_staged "$root/enroll/headscale.apikey" "$lab/enroll-home/headscale.apikey"
+stage_secret "$root/enroll/config.json" "$lab/enroll-home/config.json"
+stage_secret "$root/enroll/headscale.apikey" "$lab/enroll-home/headscale.apikey"
 stage_secret "$root/headscale/managed.json" "$lab/managed.json"
 python3 - "$lab/file-modes" \
   "$root/headscale/config.yaml" "$root/headscale/policy.hujson" \

@@ -92,7 +92,7 @@ Usage: bash deploy/vpn/ctl.sh <command> [args]
                                  is listed as "-".
   token revoke --entry NAME (--label LABEL | --hash-prefix HEX)
                                  exactly one selector, passed to the enroll
-                                 CLI. Then SIGHUP enroll. Refuses to remove
+                                 CLI. Then restart enroll. Refuses to remove
                                  the last credential.
   offboard --entry NAME (--label LABEL | --hash-prefix HEX) [--node-id N]
                                  revoke that credential first. Only if revoke
@@ -173,8 +173,11 @@ enroll_cli() {
 
 reload_enroll() {
   if service_running enroll; then
-    docker compose kill -s HUP enroll >/dev/null
-    echo "sent SIGHUP to enroll so it reloads config.json"
+    # invite and revoke replace config.json by rename. A file bind keeps the
+    # old inode, so SIGHUP does not see the new file. Restart re-binds the
+    # path. bootstrap.sh does the same after it renames this file.
+    docker compose restart enroll >/dev/null
+    echo "restarted enroll so it reloads config.json"
   else
     echo "enroll is not running; the next start reads config.json"
   fi
