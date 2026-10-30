@@ -439,6 +439,10 @@ func validateConfigBytes(data []byte) error {
 		return fmt.Errorf("gateway: config: %w", err)
 	}
 	if cfg.EnrollToken == "" && cfg.AuthKey == "" {
+		// Only the shape is validated here. The token file may not exist yet, and
+		// Resolve rejects an inline value next to a file, so swap one for the other.
+		cfg.EnrollTokenFile = ""
+		cfg.AuthKeyFile = ""
 		cfg.EnrollToken = "validation-placeholder"
 	}
 	if err := cfg.Resolve(); err != nil {
