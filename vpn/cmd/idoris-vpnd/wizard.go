@@ -197,7 +197,7 @@ func (d *deps) runJoin(opt joinOpt) error {
 		approved = nil
 		discovered = ""
 	}
-	role, err := reconcileJoinRole(opt.payload.Role, opt.override, discovered)
+	role, err := gateway.ReconcileRole(opt.payload.Role, opt.override, discovered)
 	if err != nil {
 		return err
 	}
@@ -785,25 +785,6 @@ func (d *deps) confirmAuthority(authority, expect string, yes bool) error {
 		return errors.New("not applied")
 	}
 	return nil
-}
-
-// reconcileJoinRole prefers an authenticated discovery role. A disagreement
-// between that role and the code, or an override, is an error and not a plan.
-// With no discovery role, an explicit override is kept.
-func reconcileJoinRole(codeRole, override, discovered string) (string, error) {
-	if discovered != "" {
-		if codeRole != "" && codeRole != discovered {
-			return "", fmt.Errorf("join: the enrollment server says this code is for a %q machine, but the code says %q", discovered, codeRole)
-		}
-		if override != "" && override != discovered {
-			return "", fmt.Errorf("join: --role-override %q does not match the enrollment server role %q", override, discovered)
-		}
-		return discovered, nil
-	}
-	if override != "" {
-		return override, nil
-	}
-	return codeRole, nil
 }
 
 func credentialRole(opt joinOpt) string {
