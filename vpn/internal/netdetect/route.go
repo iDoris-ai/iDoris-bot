@@ -29,11 +29,15 @@ func ParseProcNetRoute(r io.Reader) (DefaultRoute, bool) {
 			continue
 		}
 		f := strings.Fields(line)
-		if len(f) < 7 || !strings.EqualFold(f[1], "00000000") {
+		// Iface, Destination, Gateway, Flags, RefCnt, Use, Metric, Mask.
+		// Destination 00000000 with any other mask is a split route (0.0.0.0/1),
+		// which OpenVPN redirect-gateway def1 installs. It is not the default.
+		if len(f) < 8 || !strings.EqualFold(f[1], "00000000") || !strings.EqualFold(f[7], "00000000") {
 			continue
 		}
 		flags, err := strconv.ParseUint(f[3], 16, 64)
-		if err != nil || flags&0x1 == 0 {
+		// RTF_UP is 0x1. RTF_REJECT is 0x200 and must not win.
+		if err != nil || flags&0x1 == 0 || flags&0x200 != 0 {
 			continue
 		}
 		gw, err := parseLEHexIPv4(f[2])
@@ -42,7 +46,7 @@ func ParseProcNetRoute(r io.Reader) (DefaultRoute, bool) {
 		}
 		metric, err := strconv.Atoi(f[6])
 		if err != nil {
-			metric = 0
+			continue
 		}
 		if !found || metric < bestMetric {
 			best = DefaultRoute{Iface: f[0], Gateway: gw, Metric: metric}
