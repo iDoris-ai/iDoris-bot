@@ -1,6 +1,6 @@
 # 14 · VPN 运维：单组织默认、管理员、Headplane、子网网关
 
-**日期：** 2026-10-27 · **状态：** 在本机 Docker 上用 Headscale v0.29.6、Headplane 0.8.2、`tailscale/tailscale:v1.104.2` 验证过。公网域名、真实 TLS 证书和一部手机的注册不在这次验收里。成员逐步操作见 `docs/17-VPN-MEMBER-ONBOARDING.md`。身份模型和「user 不是隔离边界」见 `docs/12-VPN-HEADSCALE.md`。
+**日期：** 2026-10-28 · **状态：** 在本机 Docker 上用 Headscale v0.29.6、Headplane 0.8.2、`tailscale/tailscale:v1.104.2` 验证过。公网域名、真实 TLS 证书和一部手机的注册不在这次验收里。成员逐步操作见 `docs/17-VPN-MEMBER-ONBOARDING.md`。身份模型和「user 不是隔离边界」见 `docs/12-VPN-HEADSCALE.md`。
 
 产品默认是**一个组织**（大约十几个人）加一台 Local AI。成员在办公室局域网里直接访问这台机器；在家里则通过 tailnet。多组织可以加在同一台 Headscale 上，那是显式的进阶操作，隔离只靠策略文件。
 
@@ -19,7 +19,7 @@ bash deploy/vpn/bootstrap.sh init --org office --admin admin
 - 明文 token 在拉起服务**之前**追加到 `enroll/minted-tokens.txt`（0600）。后面的步骤失败时，这是哈希已经写进配置之后唯一的明文副本。用完后把文件挪到别处再删。
 - 在 `headscale/policy.hujson` 的 `BEGIN/END idoris-managed` 标记之间写入该组织的规则，跑 `headscale policy check`，再对 Headscale 发 SIGHUP。标记以外的手写规则会保留。
 - 创建 Headscale 用户 `admin` 和 `office`。
-- 建注册项并打印 token：`admin`（`role: admin`，个人节点，无 tag，每分钟 5 次，TTL 5 分钟）、`office`（`role: member`，TTL 10 分钟）、`office-local-ai`（`role: local-ai`，`tag:office-local-ai`，每分钟 5 次）。带了 `--lan-cidr` 时还有 `office-gateway`（`role: gateway`）。`--tailnet-admin` 时还有 `vpn-server`（只有 `tag:vpn-server`，没有 join role；sidecar 用原始 token 和 `acl_tags`）。新凭证写成 `token_hashes` 对象，标签是 `bootstrap-<注册项名>`（例如 `bootstrap-office`）。打印先一行标签，再一行 token。
+- 建注册项并打印 token：`admin`（`role: admin`，个人节点，无 tag，每分钟 5 次，TTL 5 分钟）、`office`（`role: member`，TTL 10 分钟）、`office-local-ai`（`role: local-ai`，`tag:office-local-ai`，每分钟 5 次）。带了 `--lan-cidr` 时还有 `office-gateway`（`role: gateway`），并且把同一批前缀写进该项的 `lan_cidrs`（已有项只补前缀，不换 token）。`--tailnet-admin` 或 `--headplane-access tailnet` 时还有 `vpn-server`（只有 `tag:vpn-server`，没有 join role；sidecar 用原始 token 和 `acl_tags`）。这两个旗标在生成策略之前归一，见第 7 节。新凭证写成 `token_hashes` 对象，标签是 `bootstrap-<注册项名>`（例如 `bootstrap-office`）。打印先一行标签，再一行 token。
 
 `invite` 会把租户上的 `role` 写进加入码。角色为空时加入码写成 `member`。这次改动只作用于**新**写出来的注册项；已经存在的项再跑 `init` 不会补角色。给旧项补角色时，在 `enroll/config.json` 里加上 `"role"`（`admin`、`member`、`local-ai`、`gateway` 之一），再 `ctl.sh token new --entry <项> --label <标签>`。已有的十六进制字符串仍然能加载；`token list` 里没有标签的显示为 `-`。
 
@@ -38,6 +38,8 @@ Headscale v0.29 的 `policy check` 打到正在运行的服务器上的 gRPC，�
 - 不会把注册容器设成 uid 0。
 
 Headplane 镜像的用户是 `0`（root），cookie 文件保持 0600，不改属主。这次在 macOS 上以非 root 操作员跑通了探针和登录证明；没有在一台以 root 执行 `bootstrap.sh` 的 Linux 上再跑一遍 chown。
+
+`restore` 用包里校验过的 `ENROLL_UID` / `ENROLL_GID`（缺省 65532，拒绝 0）做同样的属主处理，目录也算在内：不跟随符号链接，目录 0700，文件 0600。操作员不是 root、而且 id 已经一致时只 `chmod`。不是 root 且 id 对不上时拒绝，提示以 root 再跑 `restore`。这次的 root 属主检查跑在一个临时 Alpine 容器里（容器自己的文件系统，不是 macOS 绑定挂载）：65532 和另一个 uid 都能读到密钥，非 root 去改成别的 uid 会被拒绝。演练见第 6 节。
 
 ## 3. 管理员、MagicDNS、反向规则
 
@@ -110,34 +112,45 @@ bash deploy/vpn/bootstrap.sh add-tenant globex --lan-cidr 192.168.50.0/24
 
 ## 6. 恢复包
 
-`ctl.sh backup [DIR]` 先停**当前**那个 Headplane 写入者和 Headscale，复制完再把刚才在跑的服务拉起来。另一个 Headplane 不会被启动。
+`ctl.sh backup [DIR]` 先停**当前**那个 Headplane 写入者、`vpn-sidecar`（如果容器在）和 Headscale，复制完再把刚才在跑的服务拉起来。另一个 Headplane 不会被启动。默认目录是 `$here/backups/<UTC 时间戳>`。父目录 `backups` 不存在时建成 0700。它若是符号链接，或已经存在但不是 0700，就拒绝，也不会把一个过宽的目录 chmod 成 0700。别的路径仍然要求父目录事先存在。
 
 包里有：
 
 - `headscale/db.sqlite`，以及当时存在的 `db.sqlite-wal`、`db.sqlite-shm`
 - `headscale/noise_private.key`
-- `headscale/derp_server_private.key`，仅当容器里真有这个文件。Headscale v0.29.6 在 `derp.server.enabled: false` 时不创建它。探针和干净主机演练都关掉了内嵌 DERP，所以包里没有这把密钥
+- `headscale/derp_server_private.key`，仅当容器里真有这个文件。空文件在恢复时拒绝，而且是在停容器之前。Headscale v0.29.6 在 `derp.server.enabled: false` 时不创建它。探针和干净主机演练都关掉了内嵌 DERP，所以包里没有这把密钥
 - Headplane 数据目录
-- `state/`：`enroll/config.json`（token 哈希）、`enroll/headscale.apikey`、`headplane/cookie_secret`、`.env`、`headscale/managed.json`、部署中的 `config.yaml`、`policy.hujson`、`headplane/config.yaml`、`compose.yaml`
+- `sidecar/state.tar`，仅当 tailnet-admin 的 sidecar 卷里有非空的 `tailscaled.state`。这是管理节点的私钥：目录 0700，文件 0600，离开这台机器之前要加密。清单里不写密钥内容。没有 sidecar 时省略这个文件
+- `state/`：`enroll/config.json`（token 哈希）、`enroll/headscale.apikey`、`headplane/cookie_secret`、`.env`、`headscale/managed.json`、部署中的 `config.yaml`、`policy.hujson`、`headplane/config.yaml`、`compose.yaml`（只放在包里，见下）
 - `admin-mode` 和 `manifest.json`（镜像标签、id、digest、Headscale 版本、文件权限）。清单里出现 `idv1_`、`hskey-` 或 `ENROLL_TOKEN` 时拒绝写入
 
 目录 0700，文件 0600。目标已存在且不是 0700 目录、或是符号链接时拒绝。`mkdir` 受 `umask 077` 影响，演练里用「先建再 chmod」造出一个 0755 目录来证明拒绝。
+
+包是数据，不是代码。`restore` 在改宿主机文件、停任何容器之前先检查整棵树：拒绝符号链接、特殊文件、绝对路径和 `..`。`state/compose.yaml` 不写回，检出目录里的那份留下；两边不一致时打印 `restore: bundle compose.yaml differs from this checkout; keeping the checkout file`。`.env` 只接受项目名、端口、绑定地址、uid/gid、URL 和访问模式这一列；`ENROLL_IMAGE`、`IDORIS_VPN_VERSION` 和未知键都拒绝。普通文件 `state/enroll/token-labels.json` 仍然忽略（打印 `ignoring obsolete`）。同名符号链接按符号链接拒绝，不走忽略。
+
+目的项目在改动之前就定下来：包里的 `COMPOSE_PROJECT_NAME`，否则是当前目录的项目名。和当前 shell 里的 `COMPOSE_PROJECT_NAME` 冲突就拒绝。撞名检查对当前项目和恢复后的项目各做一次。之后每一次 `docker compose` 都带 `-p`，子进程里的 `COMPOSE_PROJECT_NAME` 设成同一个名字。
+
+数据库写入者必须全部停干净。中途停失败就把已经停掉的服务拉起来，宿主机文件还没动。通过之后先把将被覆盖的文件和卷复制到一个 0700 的临时目录。从这一步起失败会回滚：写回原来的文件和卷，再把原来在跑的服务拉起来。空的 DERP 私钥在停容器之前就拒绝。非空但不是 sqlite 的数据库会过前面的检查，在 `up --wait` 失败后回滚。
+
+恢复用 `up -d --force-recreate`，不用 `start`。`start` 不改已经发布的端口。随后用 `docker compose port` 和 inspect 核对实际绑定。每次 `docker compose` 都按 `.env` 设置子进程的环境，`.env` 里没有的键会从子进程里去掉。父进程的环境不动。所以 `HEADPLANE_BIND=0.0.0.0 ctl.sh up --headplane-access tunnel` 仍然把 Headplane 绑在 `127.0.0.1`。注册文件的属主按恢复出来的 `ENROLL_UID` / `ENROLL_GID` 处理，见第 2 节。
+
+tailnet-admin 的包如果带了 `sidecar/state.tar`，先解进卷再启动 sidecar 和 `headplane-tailnet`。没有这份 tar、shell 里也没有 `VPN_SERVER_ENROLL_TOKEN` 时，不把整个恢复判失败：Headscale 和注册服务照常起来，并打印补登记（`ctl.sh token new --entry vpn-server --label recovery ...`，再 `ctl.sh up --tailnet-admin`）。这次探针走的是有 tar 的那条路，没有执行这条补登记。
 
 ```bash
 bash deploy/vpn/ctl.sh restore /path/to/bundle --force
 ```
 
-恢复会写回上面全部文件，并只启动备份里记下的管理模式。noise 私钥必须和 sqlite 一起回来，否则节点要重新注册。内嵌 DERP 开着时，DERP 私钥也要一起回来；包里没有这把密钥时，恢复不会凭空造一把。不要把旧 sqlite 恢复进已经迁移过的更新 minor 版本。新打的包不含 `state/enroll/token-labels.json`。旧包里如果还有这个文件，`restore` 打印 `ignoring obsolete`，不把它复制回去；包里没有它也照常恢复。
+noise 私钥必须和 sqlite 一起回来，否则节点要重新注册。内嵌 DERP 开着时，DERP 私钥也要一起回来；包里没有这把密钥时，恢复不会凭空造一把。不要把旧 sqlite 恢复进已经迁移过的更新 minor 版本。
 
-异地副本不要把明文目录拷走。仓库里不放 age 或 gpg 的密钥。`backup` 结束时打印的 cron（每天 03:15 UTC；`\%` 是为了让 cron 不把 `%` 当成换行）：
+异地副本不要把明文目录拷走。仓库里不放 age 或 gpg 的密钥。每次都要先打一个新包，再归档这一次的目录。`deploy/vpn/offhost-backup.sh` 读 `backup_dir=`，用 `manifest.json` 的 `created_utc` 做归档名，成功后把这个时间写进 `OFFHOST_DIR/idoris-vpn-backup.created`。备份、tar 或 age 失败时不更新这个文件。看这个时间，不要看归档的 mtime。`backup` 结束时打印的 cron（每天 03:15 UTC）调用的是这个脚本。`AGE_RECIPIENT` 换成自己的 age 公钥，路径换成部署目录：
 
 ```cron
-15 3 * * * umask 077; tar -C /var/backups -cf - idoris-vpn-YYYYmmddTHHMMSSZ | age -r AGE_RECIPIENT -o /mnt/offhost/idoris-vpn-$(date -u +\%Y\%m\%d).tar.age
+15 3 * * * umask 077; AGE_RECIPIENT=AGE_RECIPIENT OFFHOST_DIR=/mnt/offhost bash /path/to/deploy/vpn/offhost-backup.sh
 ```
 
-把路径换成 `backup` 实际打印的那次目录。systemd timer 跑同一条命令即可。age 的身份放在另一台机器上。看 `/mnt/offhost` 上最新文件的时间，超过一天没有新文件就当备份停了。
+打印时用 `%q` 给路径加引号。age 的身份放在另一台机器上。这条命令在临时目录里用替身 `ctl.sh` 和 `age` 跑过两轮：两次得到两个快照和两个归档，戳等于第二次的 `created_utc`；age 或 backup 失败时戳不动。没有在一台真实的 cron 上装过。
 
-干净主机演练是 `bash deploy/vpn/test/restore-drill.sh`：在 `deploy/` 下复制一份栈（compose 的构建上下文要能找到 `vpn/`），注册一个节点，备份，`down -v`，删掉原目录，在空副本上 `restore`，检查原节点仍在列表里，并且**同一枚** token 还能再注册一个节点。2026-10-27 项目 `idoris-vpn-ctl-771396` 退出码 0，日志以 `drill: ok` 结束。0755 目录和符号链接目标被拒绝；恢复后 `drill-member` 仍在列表里，同一枚 token 又注册了 `drill-member-2`。`token list` 把恢复出来的旧哈希显示为 `-`，没有打出完整哈希。新包里没有 `token-labels.json`。随后把这个文件放进包里再 `restore --force`，退出码 0，输出里有 `ignoring obsolete`，目标树没有这个文件，`drill-member` 还在，`token list` 仍是那一行 `-`。同一轮用注册镜像的 `list-credentials` 读了一份混合配置：旧的十六进制字符串列成 `-`、`aaaaaaaaaaaa`、`-`，对象标签 `bootstrap-acme` 列成该标签、`bbbbbbbbbbbb` 和 `2026-10-27T00:00:00Z`。这一轮内嵌 DERP 是关的，包里没有 DERP 私钥。
+干净主机演练是 `bash deploy/vpn/test/restore-drill.sh`：在 `deploy/` 下复制一份栈（compose 的构建上下文要能找到 `vpn/`），注册一个节点，备份，`down -v`，删掉原目录，在空副本上 `restore`，检查原节点仍在列表里，并且**同一枚** token 还能再注册一个节点。副本和源目录对过指纹。2026-10-28 项目 `idoris-vpn-r2d-128161`（Headplane 端口 58578）退出码 0，日志以 `drill: ok` 结束。同一轮还检查了：临时 Alpine 容器里 root 把注册树交给 65532 和 65531，非 root 改成别的 uid 被拒绝（`ownership ok`）；0755 目录和符号链接目标被拒绝；`backups` 父目录是符号链接时拒绝，删掉链接后默认备份父目录和子目录都是 0700；`HEADPLANE_BIND=0.0.0.0 ctl.sh up --headplane-access tunnel` 实际绑在 `127.0.0.1:58578`，`lan` 绑在 `0.0.0.0:58578`，再把原包 `restore` 之后回到 `127.0.0.1` 且 `drill-member` 还在；符号链接、名叫 `token-labels.json` 的符号链接、`ENROLL_IMAGE` 和空 DERP 私钥都在停 Headscale 之前被拒绝；一份非 sqlite 的数据库触发回滚，`drill-member` 还在并且 Headscale 恢复健康；包里的 `compose.yaml` 多了一行注释，恢复打印 `restore: bundle compose.yaml differs from this checkout; keeping the checkout file`，目标文件的 sha256 仍是检出目录那份。恢复后 `drill-member` 仍在列表里，同一枚 token 又注册了 `drill-member-2`。`token list` 把恢复出来的旧哈希显示为 `-`，没有打出完整哈希。新包里没有 `token-labels.json`。随后把这个文件放进包里再 `restore --force`，退出码 0，输出里有 `ignoring obsolete`，目标树没有这个文件。同一轮用注册镜像的 `list-credentials` 读了一份混合配置：旧的十六进制字符串列成 `-`、`aaaaaaaaaaaa`、`-`，对象标签 `bootstrap-acme` 列成该标签、`bbbbbbbbbbbb` 和 `2026-10-27T00:00:00Z`。这一轮内嵌 DERP 是关的，包里没有 DERP 私钥。演练本身不删 sidecar 卷；删卷之后靠 `sidecar/state.tar` 回来是探针做的，见第 15 节。
 
 ## 7. Headplane 的四种访问
 
@@ -152,7 +165,9 @@ bash deploy/vpn/ctl.sh restore /path/to/bundle --force
 
 `proxy` 的主机名如果等于 `server_url` 的主机名，会拒绝，除非 `HEADPLANE_ALLOW_PUBLIC_ADMIN=1`。反代要传 `Host` 和 `X-Forwarded-Proto`。Headplane 在 `policy.mode: file` 时 ACL 页只读。
 
-`--tailnet-admin` 不能和别的 `--headplane-access` 一起用。`ctl.sh up` 不带访问参数时，按 `.env` 里的 `HEADPLANE_ACCESS` 再套一次（默认 `tunnel`）。保存的 `tailnet` 只在管理模式已经是 `tailnet-admin` 时保留；发布模式配上 `tailnet` 会被改回 `tunnel`。
+`--tailnet-admin` 不能和别的 `--headplane-access` 一起用。两个旗标在参数解析之后、生成策略和注册项之前就归一：`--headplane-access tailnet` 等于 `--tailnet-admin`，会建 `vpn-server`。冲突在调用 docker 之前拒绝。这一步用真实的 `policy.py` 和一个不拉容器的 docker 替身测过，不是一整次 `bootstrap.sh` 拉起的 tailnet。`ctl.sh up` 不带访问参数时，按 `.env` 里的 `HEADPLANE_ACCESS` 再套一次（默认 `tunnel`）。保存的 `tailnet` 只在管理模式已经是 `tailnet-admin` 时保留；发布模式配上 `tailnet` 会被改回 `tunnel`。
+
+子进程的 compose 环境以 `.env` 为准，见第 6 节。shell 里导出的 `HEADPLANE_BIND` 不会盖过 `tunnel` 写进去的 `127.0.0.1`。
 
 隧道：
 
@@ -179,7 +194,7 @@ bash deploy/vpn/ctl.sh up --tailnet-admin
 
 选中的模式写在 gitignore 的 `.admin-mode` 里，值是 `published` 或 `tailnet-admin`。`bootstrap.sh`、`ctl.sh up` / `down` / `backup` / `restore` / `upgrade` 只停**当时在写**的那个 Headplane，恢复时也只拉起原来在跑的服务。发布出来的 `headplane` 和 `headplane-tailnet` 不会一起跑。
 
-探针在 `tailnet-admin` 下做 backup 和 restore，并检查发布出来的 Headplane 仍然是停的、它的主机端口仍然拒绝连接。数字见第 15 节。
+探针在 `tailnet-admin` 下做 backup 和 restore，并检查发布出来的 Headplane 仍然是停的、它的主机端口仍然拒绝连接。备份带上 `sidecar/state.tar`。随后删掉全部卷、清掉 shell 里的 `VPN_SERVER_ENROLL_TOKEN`，再 `restore`：sidecar 和 `headplane-tailnet` 起来，状态文件的 sha256 和备份前一致，发布出来的 Headplane 仍然停止。数字见第 15 节。没有 sidecar 状态、也没有 token 时的补登记命令见第 6 节；这次没有走那条路。
 
 ## 9. 每套部署一个 compose 项目
 
@@ -199,7 +214,7 @@ STUN 要单独看。compose 把宿主机的 `DERP_STUN_PORT` 映射到容器里�
 bash deploy/vpn/bootstrap.sh init --org office --lan-cidr 192.168.1.0/24
 ```
 
-脚本会加上 `tag:office-gateway`、注册项 `office-gateway`、`autoApprovers.routes`（只有这个 tag 能自动批准该前缀），以及 `office@` 到该前缀的 ACL。端口是 8740、8742、443，再加 11434（局域网里的 Ollama）。成员到带 tag 的 Local AI 主机没有 11434。
+脚本会加上 `tag:office-gateway`、注册项 `office-gateway`、`autoApprovers.routes`（只有这个 tag 能自动批准该前缀），以及 `office@` 到该前缀的 ACL。同一批前缀写入该项的 `lan_cidrs`，`GET /v1/discover` 原样返回。端口是 8740、8742、443，再加 11434（局域网里的 Ollama）。成员到带 tag 的 Local AI 主机没有 11434。
 
 没有「网关 → 成员」的规则。子网流量默认做 SNAT，回包来自网关节点自己的地址，有状态的 ACL 放行回包。不要把局域网前缀写成源。
 
@@ -295,7 +310,9 @@ bash deploy/vpn/ctl.sh apikeys expire --prefix <旧前缀>
 
 ## 13. 镜像和 Actions 钉在摘要上
 
-`deploy/vpn/compose.yaml` 和 `deploy/vpn/enroll/Dockerfile` 使用 `name:tag@sha256:...`。标签留下来是为了可读，拉取以摘要为准。`ops-lib.sh` 里修卷用的 alpine 也钉了摘要。注册服务自己的镜像仍是本地构建的 `idoris-vpn-enroll:local`。
+`deploy/vpn/compose.yaml`、`vpn/integration/**/compose*.yaml` 的 `image:` 行、`deploy/vpn/enroll/Dockerfile` 的 `# syntax=` 和 `FROM` 默认值，以及探针、演练、`tailnet-entrypoint.sh`、`credentials.sh`、`headplane-login.sh` 里拉起的第三方镜像，都是 `name:tag@sha256:...`。标签留在名字或注释里，拉取以摘要为准。`ops-lib.sh` 里修卷和属主检查用的 alpine 也钉了摘要。注册服务自己的镜像仍是本地构建的 `${ENROLL_IMAGE:-idoris-vpn-enroll:local}`。恢复拒绝用包里的 `ENROLL_IMAGE` 或 `IDORIS_VPN_VERSION` 换掉它。
+
+`FROM` 的摘要写在 `ARG` 的默认值上。构建时传入另一个 `GO_IMAGE` 或 `RUNTIME_IMAGE` 仍然可以换掉。`.github/workflows/vpn-ci.yml` 没有 `services:` 或 `container:` 镜像；`make integration` 用的是上面那些 compose 文件。
 
 `.github/workflows/` 下的 Action 钉在完整 commit SHA 上，后面跟 `# vX.Y.Z`。注解标签要剥到 commit（`refs/tags/<tag>^{}`）；轻量标签的 SHA 就是 commit。
 
@@ -306,11 +323,11 @@ docker buildx imagetools inspect headscale/headscale:v0.29.6
 git ls-remote https://github.com/actions/checkout refs/tags/v4.4.0
 ```
 
-把新的索引摘要写回 `image:` 行，保留标签。然后在 `deploy/vpn` 里 `docker compose pull`，并构建一次注册镜像确认 Dockerfile 的 `FROM` 仍能解析。不要用浮动的 `latest`。这次对三张第三方镜像做了 `docker compose pull`，并对钉了摘要的 Dockerfile 做了一次 `docker build`。
+把新的索引摘要写回 `image:` 行，保留标签。然后在 `deploy/vpn` 里 `docker compose pull`，并构建一次注册镜像确认 Dockerfile 的 `FROM` 仍能解析。不要用浮动的 `latest`。这次跑了 `docker compose config -q`（`deploy/vpn/compose.yaml` 的默认和 `tailnet-admin`，以及 `vpn/integration/compose.yaml`，项目名是一次性的 `idoris-vpn-r2d-cfg` / `idoris-vpn-r2d-int`）。隔离探针拉起了钉过摘要的 Headscale、Headplane 和 tailscale 容器，并构建了注册镜像。没有另跑一遍 `docker compose pull`。
 
 ## 14. CI
 
-`.github/workflows/vpn-deploy.yml` 在 `deploy/vpn/**` 变更时跑：shellcheck、`py_compile`、策略单测（含对抗前缀）、`docker compose config -q`（默认和 `tailnet-admin`）。这些在每次 push / pull request 上跑。
+`.github/workflows/vpn-deploy.yml` 在 `deploy/vpn/**` 变更时跑：shellcheck（含 `offhost-backup.sh`、探针、演练、登录证明和三个 shell 测试）、`py_compile`（`policy.py` 和 `bundle.py`）、策略和包的单测、`docker compose config -q`（默认和 `tailnet-admin`）。这些在每次 push / pull request 上跑。本机这次跑过同一组 shellcheck、`bash -n`，以及 `python3 -m unittest discover -s deploy/vpn/test -p 'test_*.py'`（32 个测试通过）。没有触发 GitHub 上的这次工作流。
 
 隔离探针需要 Docker 和 `/dev/net/tun`，还会拉起多台 tailscale 容器。托管的 `ubuntu-latest` 经常没有 TUN，所以探针只在 `workflow_dispatch` 和每天 `17 6 * * *` 的 schedule 上跑。便宜检查不在 schedule 上重复。
 
@@ -324,9 +341,9 @@ git ls-remote https://github.com/actions/checkout refs/tags/v4.4.0
 bash deploy/vpn/test/probe.sh
 ```
 
-脚本自选 compose 项目名和端口，复制一份实验室配置（`server_url` 改成 `http://headscale:8080`，关掉内嵌 DERP），拉起两个组织、管理员、一台网关和一台模拟的局域网主机，然后拆掉卷。不会改仓库里的 `server_url`。生产配置仍然拒绝明文和非 443。
+脚本自选 compose 项目名和端口，把部署树复制到 `deploy/.probe-src`（和 `deploy/vpn` 同级，compose 的构建上下文才能找到 `vpn/`）。实验室改写只发生在副本上：`server_url` 改成 `http://headscale:8080`，关掉内嵌 DERP。结束时对源目录里的 `.admin-mode`、`.env`、compose 和注册文件对指纹，包括在 `docker compose build` 之前就退出的那一次。不会改仓库里的 `server_url`。生产配置仍然拒绝明文和非 443。
 
-最近一次（2026-10-27，compose 项目 `idoris-vpn-ctl-245872`，退出码 0）：`probe: 52 passed, 0 failed`，然后 `probe: ok`。其中 38 条是节点之间的允许/拒绝：成员只能打本组织 Local AI 的 8740/8742/443，打不到 22 和 8080，打不到另一组织，打不到管理员；Local AI 打成员的 22 和 8740 被拒绝；管理员只能打两台 Local AI 的 22。其余是路由自动批准、经 `tailscale0` 的局域网 8740 允许和 22 拒绝、另一组织没有该路由、管理员能打开 tailnet 上的 Headplane（当时是 `100.64.0.7:3000`）、两个成员不能，在 `tailnet-admin` 下 backup 和 restore 之后发布出来的 Headplane 仍是停止的、主机端口（当时 `127.0.0.1:51614`）仍拒绝连接，以及凭证生命周期：`token new --label laptop-a` 可以注册，再铸 `laptop-b`，重复标签被拒绝，吊销 `laptop-a` 之后登记返回 401，`laptop-b` 仍可登记，`offboard --label laptop-b --node-id` 先吊销再 expire 再 delete，最后一枚凭证拒绝删除。内嵌 DERP 关着，备份跳过了容器里不存在的 `derp_server_private.key`。
+最近一次（2026-10-28，compose 项目 `idoris-vpn-r2d-438232`，退出码 0）：`probe: 55 passed, 0 failed`，然后 `probe: ok`。其中 38 条是节点之间的允许/拒绝：成员只能打本组织 Local AI 的 8740/8742/443，打不到 22 和 8080，打不到另一组织，打不到管理员；Local AI 打成员的 22 和 8740 被拒绝；管理员只能打两台 Local AI 的 22。其余是 `GET /v1/discover` 给 `acme-gateway` 返回了 `10.88.88.0/24`、路由自动批准、经 `tailscale0` 的局域网 8740 允许和 22 拒绝、另一组织没有该路由、管理员能打开 tailnet 上的 Headplane（当时是 `100.64.0.7:3000`）、两个成员不能，在 `tailnet-admin` 下 backup 和 restore 之后发布出来的 Headplane 仍是停止的、主机端口（当时 `127.0.0.1:56046`）仍拒绝连接，删掉全部卷并清掉 shell 里的 `VPN_SERVER_ENROLL_TOKEN` 之后 sidecar 状态的 sha256 和备份一致、发布出来的 Headplane 仍然停止，以及凭证生命周期：`token new --label laptop-a` 可以注册，再铸 `laptop-b`，重复标签被拒绝，吊销 `laptop-a` 之后登记返回 401，`laptop-b` 仍可登记，`offboard --label laptop-b --node-id` 先吊销再 expire 再 delete，最后一枚凭证拒绝删除。内嵌 DERP 关着，备份跳过了容器里不存在的 `derp_server_private.key`。同一天用 `PROBE_EARLY_ABORT=1` 在 `docker compose build` 之前退出：源目录的 `.admin-mode`（内容 `mode=tailnet-admin`）sha256 前后都是 `af2ee253b422d1620f160b3f23261b6ecd61bbc648e2801efebc26c643ba42ab`，清理没有报告源目录被改过。
 
 这是实验室明文注册，不覆盖生产上的 https:443 重拨。
 

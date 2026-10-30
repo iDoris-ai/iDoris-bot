@@ -35,7 +35,7 @@ CGO_ENABLED=0 go build -trimpath -o idoris-vpnd ./cmd/idoris-vpnd
 2. token 放在只有自己可读的文件里，例如 `chmod 600 ~/.idoris/enroll.token`，文件内容就是那一行 token。
 3. MagicDNS 名字是 `<主机名>.idoris.internal`。组织名不在里面。Local AI 的主机名用 `office-local-ai` 这种带前缀的。
 
-加入码里的 `role` 来自注册项。`bootstrap.sh` 现在会给新建的项写上 `admin`、`member`、`local-ai` 或 `gateway`。旧项没有 `role` 时，加入码会写成 `member`；预授权 key 仍然使用该项的 `acl_tags`。`vpn-server` 没有 join role，sidecar 用原始 token。
+加入码里的 `role` 来自注册项。`bootstrap.sh` 现在会给新建的项写上 `admin`、`member`、`local-ai` 或 `gateway`。旧项没有 `role` 时，加入码会写成 `member`；预授权 key 仍然使用该项的 `acl_tags`。`vpn-server` 没有 join role，sidecar 用原始 token。`--headplane-access tailnet` 和 `--tailnet-admin` 是同一个决定，也会建 `vpn-server`。两个旗标互相冲突时，在生成策略之前就拒绝。
 
 丢了 token、节点过期、设备被偷、域名写错，见第 8 到 11 节。
 
@@ -160,7 +160,7 @@ id 在 SSH 横幅和 `<server_url>/auth/<id>` 上。这条没有对真实主机�
 
 ## 8. 网关主人
 
-只能是 Linux，而且是 system 模式。先让操作员用 `--lan-cidr` 建好 `tag:<组织>-gateway` 和自动批准。然后：
+只能是 Linux，而且是 system 模式。先让操作员用 `--lan-cidr` 建好 `tag:<组织>-gateway` 和自动批准。同一批前缀会写进 `{组织}-gateway` 注册项的 `lan_cidrs`，来源是和 `autoApprovers` 同一份 `managed.json`。项已经存在时只补前缀，不换 token，也不换哈希。`GET /v1/discover` 把这些前缀放在 `lan_cidrs` 里。网关向导读的是这个字段；前缀为空时它才会说需要管理员批准。这次没有跑向导本身。隔离探针里 `acme-gateway` 的 discover 返回了 `10.88.88.0/24`（2026-10-28，项目 `idoris-vpn-r2d-438232`）。然后：
 
 ```json
 {
