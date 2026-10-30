@@ -52,7 +52,23 @@ func ReadFileLocked(path string) ([]byte, error) {
 		b, err = readConfigBytes(path)
 		return err
 	})
+	// Opening the lock file failed. The published compose bind is one config
+	// file, so a sibling lock cannot be created there. Return the config bytes
+	// from an unlocked read. Writers still stop when they cannot create it.
+	// A flock failure and the non-unix timeout are a different error.
+	if err != nil && lockOpenDenied(err) {
+		return readConfigBytes(path)
+	}
 	return b, err
+}
+
+// lockOpenDenied reports an OpenFile failure of the lock file.
+func lockOpenDenied(err error) bool {
+	if err == nil || !strings.HasPrefix(err.Error(), "enroll: lock:") {
+		return false
+	}
+	var pe *os.PathError
+	return errors.As(err, &pe)
 }
 
 func readConfigBytes(path string) ([]byte, error) {

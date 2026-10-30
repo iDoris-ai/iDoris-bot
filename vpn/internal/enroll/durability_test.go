@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -585,4 +587,67 @@ func TestConcurrentSaveFileStaysParseable(t *testing.T) {
 			t.Fatalf("round %d: torn url %s", round, got.ControlURL)
 		}
 	}
+}
+
+// TestReadOnlyDirectoryStillLoads is the published compose case: the enroll
+// service bind is a single config file and the process cannot create a sibling
+// lock. ReadFileLocked still returns the file bytes and leaves no .lock behind.
+// A writable directory keeps the exclusive lock; see TestSaveFileHoldsLockAcrossTruncate.
+func TestReadOnlyDirectoryStillLoads(t *testing.T) {
+	path := writeHashes(t, 0o640, []string{HashToken("seed-token")})
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Dir(path)
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	probe := filepath.Join(dir, ".probe-lock")
+	pf, perr := os.OpenFile(probe, os.O_CREATE|os.O_RDWR, 0o600)
+	if perr == nil {
+		_ = pf.Close()
+		_ = os.Remove(probe)
+		if !remountDirReadOnly(t, dir) {
+			t.Skip("mode 0555 did not block create, and a read-only mount is unavailable")
+		}
+	}
+
+	got, err := ReadFileLocked(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("bytes = %q", got)
+	}
+	if _, statErr := os.Stat(path + ".lock"); !os.IsNotExist(statErr) {
+		t.Fatalf("lock file: %v", statErr)
+	}
+}
+
+// remountDirReadOnly bind-mounts dir onto itself and remounts it read-only.
+// Root ignores a 0555 directory mode, which is how the enroll CI job runs.
+// Returns false when this host cannot build that mount.
+func remountDirReadOnly(t *testing.T, dir string) bool {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	if exec.Command("mount", "--bind", dir, dir).Run() != nil {
+		return false
+	}
+	t.Cleanup(func() { _ = exec.Command("umount", dir).Run() })
+	if exec.Command("mount", "-o", "remount,bind,ro", dir).Run() != nil {
+		return false
+	}
+	probe := filepath.Join(dir, ".probe-lock")
+	pf, err := os.OpenFile(probe, os.O_CREATE|os.O_RDWR, 0o600)
+	if err == nil {
+		_ = pf.Close()
+		_ = os.Remove(probe)
+		return false
+	}
+	return true
 }
