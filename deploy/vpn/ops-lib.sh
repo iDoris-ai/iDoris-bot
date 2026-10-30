@@ -1299,12 +1299,25 @@ here, snap = sys.argv[1:]
 meta = os.path.join(snap, "META")
 if os.path.isfile(meta):
     for line in open(meta):
-        rel, uid, gid, mode = line.rstrip("\n").split(" ", 3)
-        src = os.path.join(snap, "files", rel)
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        kind, rel, uid, gid, mode = line.split(" ", 4)
         dest = os.path.join(here, rel)
         parent = os.path.dirname(dest)
-        if os.path.islink(parent) or os.path.islink(dest):
+        if (parent and os.path.islink(parent)) or os.path.islink(dest):
             sys.exit("refusing to roll back through symlink %s" % dest)
+        if kind == "d":
+            if os.path.lexists(dest) and not os.path.isdir(dest):
+                sys.exit("refusing to roll back directory onto %s" % dest)
+            os.makedirs(dest, exist_ok=True)
+            os.chmod(dest, int(mode, 8))
+            if os.geteuid() == 0:
+                os.chown(dest, int(uid), int(gid))
+            continue
+        if kind != "f":
+            sys.exit("snapshot META kind %s" % kind)
+        src = os.path.join(snap, "files", rel)
         os.makedirs(parent, exist_ok=True)
         shutil.copy2(src, dest)
         os.chmod(dest, int(mode, 8))
@@ -1329,6 +1342,9 @@ PY
       if ! _restore_copy_volume_back "$_restore_vol" "${_restore_prev_mode}"; then
         _restore_copy_volume_alpine "$_restore_vol" || rc=1
       fi
+      # Sidecar state lives in a named volume. Dropping the containers this
+      # restore created must not leave the bundle's identity behind.
+      _restore_sidecar_volume "$_restore_vol" || rc=1
     fi
   fi
   COMPOSE_PROJECT_LOCK="${_restore_current}"
@@ -1433,9 +1449,6 @@ _restore_copy_volume_back() {
     docker cp "$dest/headplane/." "$hpid:/var/lib/headplane/" || return 1
     chown_volume_to_image "$hpid" /var/lib/headplane || return 1
   fi
-  if [[ -s "$dest/sidecar-state.tar" && -n "$(_compose_ps_id vpn-sidecar)" ]]; then
-    extract_sidecar_tar "$dest/sidecar-state.tar" || return 1
-  fi
   _restore_verify_database "$dest" || return 1
 }
 
@@ -1446,6 +1459,7 @@ import os, shutil, sys
 here, dest = sys.argv[1:]
 rels = [
     "enroll/config.json",
+    "enroll/config.json.lock",
     "enroll/headscale.apikey",
     "enroll/minted-tokens.txt",
     "headplane/cookie_secret",
@@ -1458,6 +1472,12 @@ rels = [
 ]
 meta = []
 missing = []
+enroll_dir = os.path.join(here, "enroll")
+if os.path.islink(enroll_dir):
+    sys.exit("refusing to snapshot symlink enroll")
+if os.path.isdir(enroll_dir):
+    st = os.stat(enroll_dir)
+    meta.append("d enroll %d %d %o" % (st.st_uid, st.st_gid, st.st_mode & 0o777))
 for rel in rels:
     src = os.path.join(here, rel)
     if os.path.islink(src):
@@ -1467,7 +1487,7 @@ for rel in rels:
         os.makedirs(os.path.dirname(target), exist_ok=True)
         shutil.copy2(src, target)
         st = os.stat(src)
-        meta.append("%s %d %d %o" % (rel, st.st_uid, st.st_gid, st.st_mode & 0o777))
+        meta.append("f %s %d %d %o" % (rel, st.st_uid, st.st_gid, st.st_mode & 0o777))
     else:
         missing.append(rel)
 open(os.path.join(dest, "META"), "w").write("\n".join(meta) + ("\n" if meta else ""))
@@ -1675,6 +1695,75 @@ _restore_copy_volume_alpine() {
     fi
   fi
   _restore_verify_database "$dest" || return 1
+  return 0
+}
+
+# Restore sidecar identity into the retained named volume. The vpn-sidecar
+# container is not required. Runs under rollback, so set -e is off.
+_restore_sidecar_volume() {
+  local dest="$1" vol owner dir rc
+  vol="$(_project_volume_name vpn-sidecar-state 2>/dev/null || true)"
+  if [[ -s "$dest/sidecar-state.tar" ]]; then
+    [[ -n "$vol" ]] || return 1
+    docker run --rm -i --user 0 --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
+      sh -c 'find /data -type f ! -name "*.sock" -exec rm -f {} + || true; tar -C /data -xf -' \
+      < "$dest/sidecar-state.tar" || return 1
+    owner="$(_image_user_from_compose vpn-sidecar 2>/dev/null || true)"
+    owner="${owner:-0:0}"
+    [[ "$owner" =~ ^[0-9]+:[0-9]+$ ]] || owner="0:0"
+    docker run --rm --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
+      chown -R "$owner" /data || return 1
+    dir="$(mktemp -d "$here/.running.XXXXXX")" || return 1
+    python3 - "$dest/sidecar-state.tar" "$dir/expected" <<'PY' || { rm -rf "$dir"; return 1; }
+import sys, tarfile
+tar_path, dest = sys.argv[1:]
+with tarfile.open(tar_path, "r:*") as tf:
+    wanted = None
+    for member in tf.getmembers():
+        name = member.name.replace("\\", "/").lstrip("./")
+        if name == "tailscaled.state" or name.endswith("/tailscaled.state"):
+            if member.isfile():
+                wanted = member
+                break
+    if wanted is None:
+        sys.stderr.write("restore: sidecar snapshot has no tailscaled.state\n")
+        raise SystemExit(1)
+    fh = tf.extractfile(wanted)
+    if fh is None:
+        raise SystemExit(1)
+    open(dest, "wb").write(fh.read())
+PY
+    set +e
+    _copy_volume_file_out "$vol" tailscaled.state "$dir/tailscaled.state"
+    rc=$?
+    set -e
+    if [[ "$rc" -ne 0 || ! -s "$dir/tailscaled.state" ]]; then
+      echo "restore: rollback could not read sidecar state" >&2
+      rm -rf "$dir"
+      return 1
+    fi
+    python3 - "$dir/expected" "$dir/tailscaled.state" <<'PY' || { rm -rf "$dir"; return 1; }
+import hashlib, sys
+def digest(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+snap, got = digest(sys.argv[1]), digest(sys.argv[2])
+if snap != got:
+    sys.stderr.write(
+        "restore: restored sidecar checksum %s does not match snapshot %s\n" % (got, snap)
+    )
+    raise SystemExit(1)
+PY
+    rm -rf "$dir"
+    return 0
+  fi
+  if [[ -n "$vol" ]]; then
+    docker run --rm --network none -v "${vol}:/data" "$ALPINE_VOLUME_IMAGE" \
+      rm -f /data/tailscaled.state || return 1
+  fi
   return 0
 }
 

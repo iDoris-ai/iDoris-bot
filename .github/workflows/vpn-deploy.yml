@@ -43,7 +43,10 @@ jobs:
             deploy/vpn/test/credentials.sh \
             deploy/vpn/test/test_access_flags.sh \
             deploy/vpn/test/test_offhost_backup.sh \
-            deploy/vpn/test/test_backup_parent.sh
+            deploy/vpn/test/test_backup_parent.sh \
+            deploy/vpn/test/test_restore_volumes.sh \
+            deploy/vpn/test/test_r5o_sidecar_rollback.sh \
+            deploy/vpn/test/test_r5o_enroll_meta.sh
           shellcheck -s sh \
             deploy/vpn/tailnet-admin/entrypoint.sh \
             deploy/vpn/test/tailnet-entrypoint.sh
