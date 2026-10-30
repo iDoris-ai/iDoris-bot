@@ -65,9 +65,12 @@ type Options struct {
 	// re-applied with EditPrefs while Running if the node has drifted.
 	// Empty means "do not manage routes".
 	AdvertiseRoutes []netip.Prefix
-	// Takeover allows switching away from a currently *running* foreign
-	// tailnet (e.g. the user's own Tailscale SaaS login). When false the
-	// daemon reports PhaseBlocked and waits. The daemon default is false.
+	// Takeover allows switching away from a foreign tailnet in any backend
+	// state that still holds that login: Running, Starting, Stopped, and
+	// NeedsLogin with a non-empty foreign control URL. When false the daemon
+	// reports PhaseBlocked and does not switch profiles or log in. A saved
+	// iDoris profile is not permission to displace that login. The daemon
+	// default is false.
 	Takeover bool
 	// LoginWhileStarting treats a Starting backend that does not yet have a
 	// node identity as needing an auth-key login. tsnet.Server.Start on a
@@ -326,6 +329,19 @@ func (r *Reconciler) graceFor(n int) time.Duration {
 }
 
 func (r *Reconciler) stepForeign(ctx context.Context, st *ipnstate.Status, prefs *ipn.Prefs) (Snapshot, error) {
+	// Ownership first. Switching to a saved iDoris profile, SwitchToEmptyProfile,
+	// and login are all mutations of the active profile. A saved profile must
+	// not authorise any of them while the active login is foreign.
+	if foreignControl(prefs.ControlURL, r.opt.ControlURL, st.BackendState) && !r.opt.Takeover {
+		url := strings.TrimSpace(prefs.ControlURL)
+		if url == "" {
+			url = "an existing tailnet (no control URL reported)"
+		}
+		return r.set(func(s *Snapshot) {
+			s.Phase = PhaseBlocked
+			s.LastError = fmt.Sprintf("tailscaled is logged into %s; takeover is disabled. Set mode: embedded to run alongside it, or takeover: true to switch this machine", url)
+		}), nil
+	}
 	cur, all, err := r.be.ProfileStatus(ctx)
 	if err != nil {
 		return r.fail(fmt.Errorf("profile status: %w", err)), err
@@ -341,13 +357,6 @@ func (r *Reconciler) stepForeign(ctx context.Context, st *ipnstate.Status, prefs
 			}
 			return r.set(func(s *Snapshot) { s.Phase = PhaseSwitching }), nil
 		}
-	}
-	foreignRunning := st.BackendState == ipn.Running.String() && prefs.ControlURL != ""
-	if foreignRunning && !r.opt.Takeover {
-		return r.set(func(s *Snapshot) {
-			s.Phase = PhaseBlocked
-			s.LastError = fmt.Sprintf("tailscaled is logged into %s; takeover is disabled. Set mode: embedded to run alongside it, or takeover: true to switch this machine", prefs.ControlURL)
-		}), nil
 	}
 	if r.recentLogin() {
 		return r.set(func(s *Snapshot) { s.Phase = PhaseStarting }), nil
