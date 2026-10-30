@@ -49,19 +49,30 @@ func LoadFile(path string) (*Config, error) {
 // O_TRUNC and the following Write, and a rejected reload would keep a token
 // that a concurrent Revoke already removed.
 func ReadFileLocked(path string) ([]byte, error) {
-	var b []byte
-	err := withFileLock(path, func() error {
-		var err error
-		b, err = readConfigBytes(path)
-		return err
-	})
-	// EACCES, EPERM, and EROFS: the published compose bind is one config file,
-	// so the lock file cannot be created beside it. This read does not write.
-	// ENOSPC, EMFILE, and a held-lock failure stay errors.
-	if err != nil && lockOpenDenied(err) {
+	release, err := acquireConfigLock(path)
+	if readWithoutLock(err) {
 		return readConfigUnlocked(path)
 	}
-	return b, err
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	return readConfigBytes(path)
+}
+
+// readWithoutLock reports that the lock file is absent or the directory
+// rejected it. ENOSPC and EMFILE stay errors. The unlocked read does not write.
+func readWithoutLock(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EMFILE) {
+		return false
+	}
+	if lockOpenDenied(err) {
+		return true
+	}
+	return errors.Is(err, os.ErrPermission) || errors.Is(err, os.ErrNotExist) || isEROFS(err)
 }
 
 // readConfigUnlocked reads the canonical file and does not write it.
@@ -170,18 +181,13 @@ func parseConfig(b []byte) (*Config, error) {
 	return &cfg, nil
 }
 
-// SaveFile writes cfg under the config lock and preserves the existing inode.
-// The plaintext of any enrollment token is not part of cfg.
+// SaveFile writes cfg onto the existing inode and preserves the file mode.
+// The caller must already hold the config lock. The plaintext of any
+// enrollment token is not part of cfg.
 func SaveFile(path string, cfg *Config) error {
 	if cfg == nil {
 		return errors.New("enroll: config is nil")
 	}
-	return withFileLock(path, func() error {
-		return saveUnlocked(path, cfg)
-	})
-}
-
-func saveUnlocked(path string, cfg *Config) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
@@ -287,11 +293,7 @@ func restoreInPlace(path string, data []byte) error {
 // once and does not log it.
 func Invite(path, entry, hostnameHint, enrollURL, label string, allowInsecure bool) (string, error) {
 	var code string
-	err := withFileLock(path, func() error {
-		cfg, err := LoadFile(path)
-		if err != nil {
-			return err
-		}
+	err := updateConfig(path, func(cfg *Config) error {
 		idx := entryIndex(cfg, entry)
 		if idx < 0 {
 			return fmt.Errorf("enroll: unknown entry %q", entry)
@@ -313,7 +315,7 @@ func Invite(path, entry, hostnameHint, enrollURL, label string, allowInsecure bo
 		if role == "" {
 			role = join.RoleMember
 		}
-		minted, err := join.Encode(join.Payload{
+		encoded, err := join.Encode(join.Payload{
 			V:            join.Version,
 			EnrollURL:    enrollURL,
 			Token:        token,
@@ -330,10 +332,7 @@ func Invite(path, entry, hostnameHint, enrollURL, label string, allowInsecure bo
 			CreatedAt: time.Now().UTC().Truncate(time.Second),
 		})
 		cfg.Tenants[idx].TokenHashes = append(cfg.Tenants[idx].TokenHashes, hash)
-		if err := saveUnlocked(path, cfg); err != nil {
-			return err
-		}
-		code = minted
+		code = encoded
 		return nil
 	})
 	if err != nil {
@@ -358,11 +357,7 @@ func RemoveCredential(path, entry string, m CredentialMatch) (Credential, error)
 		return Credential{}, errors.New("enroll: provide exactly one of label or hash prefix")
 	}
 	var removed Credential
-	err := withFileLock(path, func() error {
-		cfg, err := LoadFile(path)
-		if err != nil {
-			return err
-		}
+	err := updateConfig(path, func(cfg *Config) error {
 		idx := entryIndex(cfg, entry)
 		if idx < 0 {
 			return fmt.Errorf("enroll: unknown entry %q", entry)
@@ -409,23 +404,34 @@ func RemoveCredential(path, entry string, m CredentialMatch) (Credential, error)
 		cfg.Tenants[idx].Credentials = append(creds[:match], creds[match+1:]...)
 		hashes := cfg.Tenants[idx].TokenHashes
 		cfg.Tenants[idx].TokenHashes = append(hashes[:match], hashes[match+1:]...)
-		return saveUnlocked(path, cfg)
+		return nil
 	})
-	return removed, err
+	if err != nil {
+		return Credential{}, err
+	}
+	return removed, nil
 }
 
 // ListCredentials returns the credentials of one entry. The token plaintext
 // is not in the result. Callers that print this must use HashPrefix.
 func ListCredentials(path, entry string) ([]Credential, error) {
-	cfg, err := LoadFile(path)
+	var out []Credential
+	err := withConfigLock(path, func() error {
+		cfg, err := LoadFile(path)
+		if err != nil {
+			return err
+		}
+		idx := entryIndex(cfg, entry)
+		if idx < 0 {
+			return fmt.Errorf("enroll: unknown entry %q", entry)
+		}
+		out = append([]Credential(nil), cfg.Tenants[idx].Credentials...)
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	idx := entryIndex(cfg, entry)
-	if idx < 0 {
-		return nil, fmt.Errorf("enroll: unknown entry %q", entry)
-	}
-	return append([]Credential(nil), cfg.Tenants[idx].Credentials...), nil
+	return out, nil
 }
 
 // Revoke removes the single token hash in entry that starts with prefix.
