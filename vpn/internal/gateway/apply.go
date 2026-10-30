@@ -31,6 +31,10 @@ type ApplyOptions struct {
 	Token     string
 	NoService bool
 	PlanPath  string
+	// ReplaceExisting allows Apply to overwrite a config (and its token) that
+	// belongs to a different enrollment URL. Without it that case is an error,
+	// so one organisation's credential is never replaced by another's by accident.
+	ReplaceExisting bool
 }
 
 // ApplyResult is what the CLI and the local page show after Apply.
@@ -41,6 +45,10 @@ type ApplyResult struct {
 	IPForwardApplied bool   `json:"ip_forward_applied"`
 	SudoCommand      string `json:"sudo_command,omitempty"`
 	ServiceInstalled bool   `json:"service_installed"`
+	// AccessInfo is human-readable text telling the member how applications reach
+	// the Local AI (for example the loopback SOCKS5 address). It never holds a
+	// secret, only the path of the file that does.
+	AccessInfo []string `json:"access_info,omitempty"`
 }
 
 // SudoApplyCommand is the exact command a non-root gateway prints.
