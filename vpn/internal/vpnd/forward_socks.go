@@ -183,8 +183,3 @@ func socksTarget(client net.Conn) (string, error) {
 func socksReply(w io.Writer, rep byte) {
 	_, _ = w.Write([]byte{0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 }
-
-func init() {
-	_ = (*LocalAccess).serveSOCKS
-	_ = socksHandshakeTimeout
-}

@@ -125,8 +125,3 @@ func credEqual(gotUser, gotPass, wantUser, wantPass string) bool {
 	want := sum(wantUser, wantPass)
 	return subtle.ConstantTimeCompare(got[:], want[:]) == 1
 }
-
-func init() {
-	_ = resolveSOCKSAuth
-	_ = credEqual
-}
