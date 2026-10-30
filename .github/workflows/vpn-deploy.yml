@@ -36,15 +36,20 @@ jobs:
             deploy/vpn/bootstrap.sh \
             deploy/vpn/ctl.sh \
             deploy/vpn/ops-lib.sh \
+            deploy/vpn/offhost-backup.sh \
             deploy/vpn/test/probe.sh \
             deploy/vpn/test/restore-drill.sh \
-            deploy/vpn/test/headplane-login.sh
+            deploy/vpn/test/headplane-login.sh \
+            deploy/vpn/test/credentials.sh \
+            deploy/vpn/test/test_access_flags.sh \
+            deploy/vpn/test/test_offhost_backup.sh \
+            deploy/vpn/test/test_backup_parent.sh
           shellcheck -s sh \
             deploy/vpn/tailnet-admin/entrypoint.sh \
             deploy/vpn/test/tailnet-entrypoint.sh
       - name: Policy unit tests
         run: |
-          python3 -m py_compile deploy/vpn/policy.py deploy/vpn/test/test_policy.py
+          python3 -m py_compile deploy/vpn/policy.py deploy/vpn/bundle.py deploy/vpn/test/test_policy.py deploy/vpn/test/test_bundle.py
           python3 -m unittest discover -s deploy/vpn/test -p 'test_*.py' -v
       - name: Compose config
         working-directory: deploy/vpn
