@@ -149,7 +149,13 @@ func gatewayPlan(req Request) (Plan, error) {
 	}
 	p.Network = cand.Network
 	p.Warnings = append(p.Warnings, cand.Warnings...)
+	if err := requirePrivatePrefix(cand.Network); err != nil {
+		return Plan{}, err
+	}
 	if req.WholeSubnet {
+		if cand.Uncertain {
+			return Plan{}, fmt.Errorf("gateway: %s on %s is not a confirmed LAN interface; pass device addresses instead of advertising the whole subnet", cand.Network, cand.Name)
+		}
 		p.WholeSubnet = true
 		p.Routes = []string{cand.Network}
 		p.Warnings = append(p.Warnings, netdetect.Notice{
@@ -162,6 +168,11 @@ func gatewayPlan(req Request) (Plan, error) {
 			p.Routes = append(p.Routes, ip.String()+"/32")
 		}
 		p.RecommendedRoutes = append([]string(nil), p.Routes...)
+	}
+	for _, route := range p.Routes {
+		if err := requirePrivatePrefix(route); err != nil {
+			return Plan{}, err
+		}
 	}
 	tag, err := aclTag(req.Tenant, "gateway")
 	if err != nil {
@@ -243,6 +254,9 @@ func chooseNetwork(rep netdetect.Report, devices []netip.Addr, whole bool) (netd
 			if !p.Contains(ip) {
 				continue
 			}
+			if !netdetect.PrefixInsidePrivateLAN(p) {
+				return netdetect.Candidate{}, fmt.Errorf("gateway: candidate %s is not wholly inside an RFC1918 range", rep.Candidates[i].Network)
+			}
 			if match == nil || rep.Candidates[i].Bits > match.Bits {
 				c := rep.Candidates[i]
 				match = &c
@@ -280,6 +294,9 @@ func parseDevices(ips []string) ([]netip.Addr, error) {
 		if err != nil || !a.Is4() {
 			return nil, fmt.Errorf("gateway: %q is not an IPv4 address", s)
 		}
+		if !netdetect.AddrInsidePrivateLAN(a) {
+			return nil, fmt.Errorf("gateway: %q is not a private RFC1918 address", s)
+		}
 		if _, ok := seen[a]; ok {
 			continue
 		}
@@ -287,6 +304,17 @@ func parseDevices(ips []string) ([]netip.Addr, error) {
 		out = append(out, a)
 	}
 	return out, nil
+}
+
+func requirePrivatePrefix(s string) error {
+	p, err := netip.ParsePrefix(s)
+	if err != nil {
+		return fmt.Errorf("gateway: route %s: %w", s, err)
+	}
+	if !netdetect.PrefixInsidePrivateLAN(p) {
+		return fmt.Errorf("gateway: %s is not wholly inside an RFC1918 range", s)
+	}
+	return nil
 }
 
 func trimNonEmpty(ss []string) []string {
