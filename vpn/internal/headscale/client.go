@@ -90,11 +90,40 @@ type CreatePreAuthKeyRequest struct {
 	ACLTags    []string
 }
 
+// ErrRedirect is wrapped when an authenticated call receives a 3xx.
+// The Location value is in the error text. The API key was not sent there.
+var ErrRedirect = errors.New("refusing redirect")
+
+// httpClient returns a client that never follows redirects. A caller-supplied
+// client is copied so its CheckRedirect is not mutated; its Transport is kept
+// so tests can trust an httptest certificate. The default client follows
+// redirects and would resend the bearer token, including to an http:// origin.
 func (c *Client) httpClient() *http.Client {
+	hc := &http.Client{Timeout: 15 * time.Second}
 	if c.HTTP != nil {
-		return c.HTTP
+		cp := *c.HTTP
+		hc = &cp
+		if hc.Timeout == 0 {
+			hc.Timeout = 15 * time.Second
+		}
 	}
-	return &http.Client{Timeout: 15 * time.Second}
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return hc
+}
+
+func errRefusingRedirect(resp *http.Response) error {
+	loc := ""
+	code := 0
+	if resp != nil {
+		code = resp.StatusCode
+		loc = strings.TrimSpace(resp.Header.Get("Location"))
+	}
+	if loc == "" {
+		return fmt.Errorf("%w: HTTP %d with no Location", ErrRedirect, code)
+	}
+	return fmt.Errorf("%w to %q", ErrRedirect, loc)
 }
 
 func (c *Client) do(ctx context.Context, method, path string, query url.Values, in, out any) error {
@@ -132,6 +161,9 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		return fmt.Errorf("headscale %s %s: %w", method, path, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 && resp.StatusCode <= 399 {
+		return fmt.Errorf("headscale %s %s: %w", method, path, errRefusingRedirect(resp))
+	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return fmt.Errorf("headscale %s %s: read body: %w", method, path, err)
