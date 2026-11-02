@@ -1,0 +1,200 @@
+# LAN / DERP / subnet-router lab. The project name and subnets are injected by
+# lan_test.go (`docker compose -p idoris-vpn-lan-<random>`) so parallel agents
+# do not share a stack. Do not set a top-level `name:` here; it would override -p.
+#
+# Profiles:
+#   lan    member-office + ai-office on one bridge (direct path)
+#   relay  member-home + ai-office on disconnected bridges (DERP)
+#   gw     lab backend + gateway, plus home members
+services:
+  headscale:
+    image: headscale/headscale:v0.29.6@sha256:cabe84f0699913dbca9320f0883dca7565dd08df3c5be29edfabbebeff763966 # headscale/headscale:v0.29.6
+    command: serve
+    volumes:
+      - ./headscale-lan/config.yaml:/etc/headscale/config.yaml:ro
+      - ./headscale-lan:/etc/headscale/lan:ro
+      - ./.pki-lan:/etc/headscale/runtime:ro
+    ports:
+      - "127.0.0.1::443"
+    networks:
+      - office
+      - home
+    healthcheck:
+      test: ["CMD", "headscale", "health"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+      start_period: 2s
+
+  member-office:
+    image: tailscale/tailscale:v1.104.2@sha256:b11583ad2e93e4671128538c88cf11f460444a5d7e449311dd1933a400ab849d # tailscale/tailscale:v1.104.2
+    hostname: member-office
+    profiles: ["lan"]
+    entrypoint: ["/bin/sh", "/lan/node.sh"]
+    init: true
+    depends_on:
+      headscale:
+        condition: service_healthy
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      SSL_CERT_FILE: /etc/lan-pki/ca.pem
+      LAN_DROP_CIDR: ${LAN_HOME_CIDR:?}
+    volumes: &ts-vol
+      - ./headscale-lan/node.sh:/lan/node.sh:ro
+      - ./.pki-lan/ca.pem:/etc/lan-pki/ca.pem:ro
+    networks:
+      - office
+
+  ai-office:
+    image: tailscale/tailscale:v1.104.2@sha256:b11583ad2e93e4671128538c88cf11f460444a5d7e449311dd1933a400ab849d # tailscale/tailscale:v1.104.2
+    hostname: ai-office
+    profiles: ["lan", "relay"]
+    entrypoint: ["/bin/sh", "/lan/node.sh"]
+    init: true
+    depends_on:
+      headscale:
+        condition: service_healthy
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      SSL_CERT_FILE: /etc/lan-pki/ca.pem
+      LAN_DROP_CIDR: ${LAN_HOME_CIDR:?}
+      LAN_ECHO: "1"
+    volumes: *ts-vol
+    networks:
+      - office
+
+  member-home:
+    image: tailscale/tailscale:v1.104.2@sha256:b11583ad2e93e4671128538c88cf11f460444a5d7e449311dd1933a400ab849d # tailscale/tailscale:v1.104.2
+    hostname: member-home
+    profiles: ["relay", "gw"]
+    entrypoint: ["/bin/sh", "/lan/node.sh"]
+    init: true
+    depends_on:
+      headscale:
+        condition: service_healthy
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      SSL_CERT_FILE: /etc/lan-pki/ca.pem
+      # Drop the office underlay only. Lab traffic is allowed out tailscale0
+      # and dropped on every other interface (see node.sh).
+      LAN_DROP_CIDR: ${LAN_OFFICE_CIDR:?}
+      LAN_SINK_EXCEPT_TUN: ${LAN_LAB_CIDR:?}
+    volumes: *ts-vol
+    networks:
+      - home
+
+  member-noroute:
+    image: tailscale/tailscale:v1.104.2@sha256:b11583ad2e93e4671128538c88cf11f460444a5d7e449311dd1933a400ab849d # tailscale/tailscale:v1.104.2
+    hostname: member-noroute
+    profiles: ["gw"]
+    entrypoint: ["/bin/sh", "/lan/node.sh"]
+    init: true
+    depends_on:
+      headscale:
+        condition: service_healthy
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      SSL_CERT_FILE: /etc/lan-pki/ca.pem
+      LAN_DROP_CIDR: ${LAN_OFFICE_CIDR:?}
+      LAN_SINK_EXCEPT_TUN: ${LAN_LAB_CIDR:?}
+    volumes: *ts-vol
+    networks:
+      - home
+
+  gateway:
+    image: tailscale/tailscale:v1.104.2@sha256:b11583ad2e93e4671128538c88cf11f460444a5d7e449311dd1933a400ab849d # tailscale/tailscale:v1.104.2
+    hostname: gateway
+    profiles: ["gw"]
+    entrypoint: ["/bin/sh", "/lan/node.sh"]
+    init: true
+    depends_on:
+      headscale:
+        condition: service_healthy
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      SSL_CERT_FILE: /etc/lan-pki/ca.pem
+      LAN_DROP_CIDR: ${LAN_OFFICE_CIDR:?}
+      LAN_FORWARD: "1"
+    volumes: *ts-vol
+    networks:
+      - home
+      - lab
+
+  gateway-auto:
+    image: tailscale/tailscale:v1.104.2@sha256:b11583ad2e93e4671128538c88cf11f460444a5d7e449311dd1933a400ab849d # tailscale/tailscale:v1.104.2
+    hostname: gateway-auto
+    profiles: ["gw"]
+    entrypoint: ["/bin/sh", "/lan/node.sh"]
+    init: true
+    depends_on:
+      headscale:
+        condition: service_healthy
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      SSL_CERT_FILE: /etc/lan-pki/ca.pem
+      LAN_DROP_CIDR: ${LAN_OFFICE_CIDR:?}
+      LAN_FORWARD: "1"
+    volumes: *ts-vol
+    networks:
+      - home
+      - lab
+
+  backend:
+    image: tailscale/tailscale:v1.104.2@sha256:b11583ad2e93e4671128538c88cf11f460444a5d7e449311dd1933a400ab849d # tailscale/tailscale:v1.104.2
+    hostname: backend
+    profiles: ["gw"]
+    entrypoint: ["/bin/sh", "/lan/echo.sh"]
+    init: true
+    volumes:
+      - ./headscale-lan/echo.sh:/lan/echo.sh:ro
+    networks:
+      lab:
+        ipv4_address: ${LAN_LAB_BACKEND:?}
+
+networks:
+  office:
+    driver: bridge
+    enable_ipv6: false
+    ipam:
+      config:
+        - subnet: ${LAN_OFFICE_CIDR:?}
+          gateway: ${LAN_OFFICE_GW:?}
+  home:
+    driver: bridge
+    enable_ipv6: false
+    ipam:
+      config:
+        - subnet: ${LAN_HOME_CIDR:?}
+          gateway: ${LAN_HOME_GW:?}
+  lab:
+    driver: bridge
+    internal: true
+    enable_ipv6: false
+    ipam:
+      config:
+        - subnet: ${LAN_LAB_CIDR:?}
+          gateway: ${LAN_LAB_GW:?}

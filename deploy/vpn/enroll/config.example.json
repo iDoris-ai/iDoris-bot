@@ -1,0 +1,48 @@
+{
+  "control_url": "https://vpn.example.org",
+  "headscale_url": "http://headscale:8080",
+  "headscale_api_key_file": "/etc/idoris/headscale.apikey",
+  "tenants": [
+    {
+      "name": "admin",
+      "headscale_user_id": "1",
+      "token_hashes": ["1111111111111111111111111111111111111111111111111111111111111111"],
+      "role": "admin",
+      "preauth_ttl": "5m",
+      "rate_per_minute": 5
+    },
+    {
+      "name": "office",
+      "headscale_user_id": "2",
+      "token_hashes": ["2222222222222222222222222222222222222222222222222222222222222222"],
+      "role": "member",
+      "preauth_ttl": "10m"
+    },
+    {
+      "name": "office-local-ai",
+      "headscale_user_id": "2",
+      "token_hashes": ["3333333333333333333333333333333333333333333333333333333333333333"],
+      "acl_tags": ["tag:office-local-ai"],
+      "role": "local-ai",
+      "preauth_ttl": "10m",
+      "rate_per_minute": 5
+    },
+    {
+      "name": "office-gateway",
+      "headscale_user_id": "2",
+      "token_hashes": ["4444444444444444444444444444444444444444444444444444444444444444"],
+      "acl_tags": ["tag:office-gateway"],
+      "role": "gateway",
+      "preauth_ttl": "10m",
+      "rate_per_minute": 5
+    },
+    {
+      "name": "vpn-server",
+      "headscale_user_id": "1",
+      "token_hashes": ["5555555555555555555555555555555555555555555555555555555555555555"],
+      "acl_tags": ["tag:vpn-server"],
+      "preauth_ttl": "10m",
+      "rate_per_minute": 5
+    }
+  ]
+}

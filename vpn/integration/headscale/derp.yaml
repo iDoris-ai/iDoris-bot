@@ -1,0 +1,16 @@
+# Headscale refuses to start with an empty DERP map. This fixture region is a
+# placeholder so the control plane boots; the integration test only exercises
+# registration, not relayed traffic.
+regions:
+  900:
+    regionid: 900
+    regioncode: it
+    regionname: integration-placeholder
+    nodes:
+      - name: 900a
+        regionid: 900
+        hostname: headscale
+        ipv4: 127.0.0.1
+        stunport: 0
+        stunonly: false
+        derpport: 0

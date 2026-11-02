@@ -1,0 +1,424 @@
+// Package gateway plans and applies a subnet-router or a plain join.
+//
+// The narrow plan advertises only the device addresses as /32. A whole-subnet
+// route is an explicit choice. The client cannot approve its own routes: a
+// route is marked auto-approved only when it sits inside a CIDR the enrollment
+// service already published (the same list the operator put in Headscale
+// autoApprovers). The plan JSON never contains an enrollment token.
+package gateway
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/netip"
+	"strings"
+
+	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/join"
+	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/netdetect"
+)
+
+const (
+	// IPForwardConf is the sysctl drop-in applied on a Linux gateway.
+	IPForwardConf = "/etc/sysctl.d/99-idoris-vpn.conf"
+	// IPForwardBody enables IPv4 forwarding. It is rewritten verbatim so a
+	// second apply does not churn the file.
+	IPForwardBody = "# Managed by idoris-vpnd. Lets this Linux host forward the office LAN.\nnet.ipv4.ip_forward = 1\n"
+)
+
+// Request is the wizard's answers plus what the machine and the server said.
+type Request struct {
+	ThisMachineIsLocalAI bool
+	DeviceIPs            []string
+	WholeSubnet          bool
+	Detection            netdetect.Report
+	Approved             []string
+	Tenant               string
+	Hostname             string
+}
+
+// Step is one action Apply will take, shown before confirmation.
+type Step struct {
+	ID   string `json:"id"`
+	Text string `json:"text"`
+}
+
+// Plan is JSON-serialisable so a root step can replay it without the token.
+type Plan struct {
+	Role               string             `json:"role"`
+	Tag                string             `json:"tag,omitempty"`
+	Routes             []string           `json:"routes,omitempty"`
+	RecommendedRoutes  []string           `json:"recommended_routes,omitempty"`
+	Network            string             `json:"network,omitempty"`
+	Hostname           string             `json:"hostname,omitempty"`
+	Tenant             string             `json:"tenant,omitempty"`
+	Mode               string             `json:"mode"`
+	AcceptRoutes       bool               `json:"accept_routes"`
+	Warnings           []netdetect.Notice `json:"warnings,omitempty"`
+	WillAutoApprove    bool               `json:"will_auto_approve"`
+	NeedsAdminApproval bool               `json:"needs_admin_approval"`
+	AdminCommand       string             `json:"admin_command,omitempty"`
+	Steps              []Step             `json:"steps,omitempty"`
+	PlatformOK         bool               `json:"platform_ok"`
+	Blocked            bool               `json:"blocked"`
+	BlockReason        string             `json:"block_reason,omitempty"`
+	WholeSubnet        bool               `json:"whole_subnet"`
+	DeviceIPs          []string           `json:"device_ips,omitempty"`
+
+	EnrollURL     string `json:"enroll_url,omitempty"`
+	TokenFile     string `json:"token_file,omitempty"`
+	AllowInsecure bool   `json:"allow_insecure,omitempty"`
+	ConfigPath    string `json:"config_path,omitempty"`
+	Listen        string `json:"listen,omitempty"`
+	// DiscoveryControlURL is the control server the enrollment service
+	// returned for this credential. Replacing an authority drops the pin
+	// stored in the daemon config, so this is the URL completion has to
+	// wait for. It is not a secret.
+	DiscoveryControlURL string `json:"discovery_control_url,omitempty"`
+}
+
+// BuildPlan chooses the narrowest route that matches the answers.
+// ThisMachineIsLocalAI joins as local-ai and advertises nothing. Otherwise
+// the plan is a Linux gateway. A blocked plan is returned (not an error) when
+// the OS cannot be a gateway, so the UI can explain it. Malformed input is an error.
+func BuildPlan(req Request) (Plan, error) {
+	if req.ThisMachineIsLocalAI {
+		return localAIPlan(req)
+	}
+	return gatewayPlan(req)
+}
+
+// DropControlPinText is the plan warning shown when an enrollment authority
+// is replaced. The old control server pin is not kept.
+const DropControlPinText = "replacing the enrollment authority removes the previous control server pin; the next start discovers the new server and pins it; the old pin is not kept"
+
+// NoteControlPinDrop appends that warning when previousEnrollURL is a different
+// authority from the one this plan will write.
+func NoteControlPinDrop(plan *Plan, previousEnrollURL string) {
+	previousEnrollURL = strings.TrimSpace(previousEnrollURL)
+	if plan == nil || previousEnrollURL == "" || previousEnrollURL == plan.EnrollURL {
+		return
+	}
+	plan.Warnings = append(plan.Warnings, netdetect.Notice{Code: "drop-control-pin", Text: DropControlPinText})
+}
+
+// SimplePlan is a member or admin join: no routes, accept other people's routes.
+func SimplePlan(role, tenant, hostname string) (Plan, error) {
+	if role != join.RoleMember && role != join.RoleAdmin {
+		return Plan{}, fmt.Errorf("gateway: %q is not a member or admin join", role)
+	}
+	p := Plan{
+		Role:            role,
+		Hostname:        hostname,
+		Tenant:          tenant,
+		Mode:            "auto",
+		AcceptRoutes:    true,
+		WillAutoApprove: true,
+		PlatformOK:      true,
+	}
+	p.Steps = baseSteps(false)
+	return p, nil
+}
+
+func localAIPlan(req Request) (Plan, error) {
+	tag, err := aclTag(req.Tenant, "local-ai")
+	if err != nil {
+		return Plan{}, err
+	}
+	p := Plan{
+		Role:            join.RoleLocalAI,
+		Tag:             tag,
+		Hostname:        req.Hostname,
+		Tenant:          req.Tenant,
+		Mode:            "auto",
+		WillAutoApprove: true,
+		PlatformOK:      true,
+	}
+	p.Steps = baseSteps(false)
+	return p, nil
+}
+
+func gatewayPlan(req Request) (Plan, error) {
+	if req.WholeSubnet && len(trimNonEmpty(req.DeviceIPs)) > 0 {
+		return Plan{}, fmt.Errorf("gateway: pass device addresses or whole-subnet, not both")
+	}
+	p := Plan{
+		Role:       join.RoleGateway,
+		Hostname:   req.Hostname,
+		Tenant:     req.Tenant,
+		Mode:       "system",
+		PlatformOK: req.Detection.GatewaySupported && req.Detection.Platform == "linux",
+	}
+	if !p.PlatformOK {
+		p.Blocked = true
+		p.BlockReason = "A subnet-router gateway is only supported on Linux. This machine will not advertise a LAN."
+		p.Warnings = append([]netdetect.Notice(nil), req.Detection.Warnings...)
+		return p, nil
+	}
+	devices, err := parseDevices(req.DeviceIPs)
+	if err != nil {
+		return Plan{}, err
+	}
+	if !req.WholeSubnet && len(devices) == 0 {
+		return Plan{}, fmt.Errorf("gateway: a narrow route needs at least one device IP")
+	}
+	cand, err := chooseNetwork(req.Detection, devices, req.WholeSubnet)
+	if err != nil {
+		return Plan{}, err
+	}
+	p.Network = cand.Network
+	p.Warnings = append(p.Warnings, cand.Warnings...)
+	if err := requirePrivatePrefix(cand.Network); err != nil {
+		return Plan{}, err
+	}
+	if req.WholeSubnet {
+		if cand.Uncertain {
+			return Plan{}, fmt.Errorf("gateway: %s on %s is not a confirmed LAN interface; pass device addresses instead of advertising the whole subnet", cand.Network, cand.Name)
+		}
+		p.WholeSubnet = true
+		p.Routes = []string{cand.Network}
+		p.Warnings = append(p.Warnings, netdetect.Notice{
+			Code: "whole-subnet",
+			Text: "Advertising " + cand.Network + " exposes every address on that LAN and can shadow a member whose home network uses the same range. A /32 shadows only one address.",
+		})
+	} else {
+		for _, ip := range devices {
+			p.DeviceIPs = append(p.DeviceIPs, ip.String())
+			p.Routes = append(p.Routes, ip.String()+"/32")
+		}
+		p.RecommendedRoutes = append([]string(nil), p.Routes...)
+	}
+	for _, route := range p.Routes {
+		if err := requirePrivatePrefix(route); err != nil {
+			return Plan{}, err
+		}
+	}
+	tag, err := aclTag(req.Tenant, "gateway")
+	if err != nil {
+		return Plan{}, err
+	}
+	p.Tag = tag
+	p.WillAutoApprove = allCovered(p.Routes, req.Approved)
+	if p.WillAutoApprove {
+		p.Steps = append(baseSteps(true), Step{ID: "routes", Text: "Advertise " + strings.Join(p.Routes, ", ") + " (pre-approved)"})
+	} else {
+		p.NeedsAdminApproval = true
+		p.AdminCommand = AdminCommand(p.Hostname, p.Routes)
+		p.Warnings = append(p.Warnings, netdetect.Notice{
+			Code: "needs-approval",
+			Text: "These routes are not in the organisation's pre-approved list. The node stays connected and waits for an admin.",
+		})
+		p.Steps = append(baseSteps(true),
+			Step{ID: "routes", Text: "Advertise " + strings.Join(p.Routes, ", ")},
+			Step{ID: "approve", Text: "An admin runs: " + p.AdminCommand},
+		)
+	}
+	return p, nil
+}
+
+// LoadPlan reads a plan file. Unknown fields are rejected so a token cannot
+// hide in an extra key. The reader is capped at 1 MiB.
+func LoadPlan(r io.Reader) (Plan, error) {
+	dec := json.NewDecoder(io.LimitReader(r, 1<<20))
+	dec.DisallowUnknownFields()
+	var p Plan
+	if err := dec.Decode(&p); err != nil {
+		return Plan{}, fmt.Errorf("gateway: plan: %w", err)
+	}
+	return p, nil
+}
+
+// AdminCommand is the Headscale CLI that approves routes.
+// v0.29.6 --identifier is the numeric node id from `headscale nodes list`.
+// A hostname is rejected (ParseUint). The name is only a comment so the
+// operator can find the row.
+func AdminCommand(hostname string, routes []string) string {
+	name := strings.TrimSpace(hostname)
+	if name == "" {
+		name = "<NODE>"
+	}
+	return "headscale nodes approve-routes --identifier <ID> --routes " + strings.Join(routes, ",") + "  # <ID> is the numeric id of " + name + " from `headscale nodes list`"
+}
+
+func baseSteps(forward bool) []Step {
+	steps := []Step{
+		{ID: "config", Text: "Write the daemon config"},
+		{ID: "token", Text: "Store the enrollment token in a mode 0600 file"},
+	}
+	if forward {
+		steps = append(steps, Step{ID: "forward", Text: "Enable net.ipv4.ip_forward on Linux"})
+	}
+	steps = append(steps, Step{ID: "service", Text: "Install and start the user service"})
+	return steps
+}
+
+func chooseNetwork(rep netdetect.Report, devices []netip.Addr, whole bool) (netdetect.Candidate, error) {
+	if whole {
+		if rep.Recommended != nil {
+			return *rep.Recommended, nil
+		}
+		if len(rep.Candidates) == 1 {
+			return rep.Candidates[0], nil
+		}
+		return netdetect.Candidate{}, fmt.Errorf("gateway: no single LAN to advertise")
+	}
+	var chosen *netdetect.Candidate
+	for _, ip := range devices {
+		var match *netdetect.Candidate
+		for i := range rep.Candidates {
+			p, err := netip.ParsePrefix(rep.Candidates[i].Network)
+			if err != nil {
+				return netdetect.Candidate{}, fmt.Errorf("gateway: candidate network: %w", err)
+			}
+			if !p.Contains(ip) {
+				continue
+			}
+			if !netdetect.PrefixInsidePrivateLAN(p) {
+				return netdetect.Candidate{}, fmt.Errorf("gateway: candidate %s is not wholly inside an RFC1918 range", rep.Candidates[i].Network)
+			}
+			if match == nil || rep.Candidates[i].Bits > match.Bits {
+				c := rep.Candidates[i]
+				match = &c
+			}
+		}
+		if match == nil {
+			return netdetect.Candidate{}, fmt.Errorf("gateway: %s is not on a detected private LAN", ip)
+		}
+		if chosen == nil {
+			chosen = match
+			continue
+		}
+		if match.Network != chosen.Network {
+			return netdetect.Candidate{}, fmt.Errorf("gateway: devices span %s and %s", chosen.Network, match.Network)
+		}
+	}
+	if chosen == nil {
+		return netdetect.Candidate{}, fmt.Errorf("gateway: no LAN selected")
+	}
+	return *chosen, nil
+}
+
+func parseDevices(ips []string) ([]netip.Addr, error) {
+	var out []netip.Addr
+	seen := map[netip.Addr]struct{}{}
+	for _, s := range ips {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if strings.Contains(s, "/") {
+			return nil, fmt.Errorf("gateway: %q is a network; pass one device address", s)
+		}
+		a, err := netip.ParseAddr(s)
+		if err != nil || !a.Is4() {
+			return nil, fmt.Errorf("gateway: %q is not an IPv4 address", s)
+		}
+		if !netdetect.AddrInsidePrivateLAN(a) {
+			return nil, fmt.Errorf("gateway: %q is not a private RFC1918 address", s)
+		}
+		if _, ok := seen[a]; ok {
+			continue
+		}
+		seen[a] = struct{}{}
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+func requirePrivatePrefix(s string) error {
+	p, err := netip.ParsePrefix(s)
+	if err != nil {
+		return fmt.Errorf("gateway: route %s: %w", s, err)
+	}
+	if !netdetect.PrefixInsidePrivateLAN(p) {
+		return fmt.Errorf("gateway: %s is not wholly inside an RFC1918 range", s)
+	}
+	return nil
+}
+
+func trimNonEmpty(ss []string) []string {
+	var out []string
+	for _, s := range ss {
+		if strings.TrimSpace(s) != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func allCovered(routes, approved []string) bool {
+	if len(routes) == 0 {
+		return true
+	}
+	for _, route := range routes {
+		if !covered(route, approved) {
+			return false
+		}
+	}
+	return true
+}
+
+// covered reports whether route is equal to or a subset of some approved prefix.
+func covered(route string, approved []string) bool {
+	r, err := netip.ParsePrefix(route)
+	if err != nil {
+		return false
+	}
+	for _, a := range approved {
+		p, err := netip.ParsePrefix(strings.TrimSpace(a))
+		if err != nil {
+			continue
+		}
+		if p.Bits() <= r.Bits() && p.Overlaps(r) {
+			return true
+		}
+	}
+	return false
+}
+
+func aclTag(tenant, suffix string) (string, error) {
+	if tenant == "" {
+		return "", fmt.Errorf("gateway: tenant is required")
+	}
+	for _, r := range tenant {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-':
+		default:
+			return "", fmt.Errorf("gateway: tenant %q cannot be used in an ACL tag", tenant)
+		}
+	}
+	return "tag:" + tenant + "-" + suffix, nil
+}
+
+// ReconcileRole prefers an authenticated discovery role. A disagreement
+// between that role and the code, or an override, is an error and not a plan.
+// With no discovery role, an explicit override is kept.
+func ReconcileRole(codeRole, override, discovered string) (string, error) {
+	if discovered != "" {
+		if codeRole != "" && codeRole != discovered {
+			return "", fmt.Errorf("join: the enrollment server says this code is for a %q machine, but the code says %q", discovered, codeRole)
+		}
+		if override != "" && override != discovered {
+			return "", fmt.Errorf("join: --role-override %q does not match the enrollment server role %q", override, discovered)
+		}
+		return discovered, nil
+	}
+	if override != "" {
+		return override, nil
+	}
+	return codeRole, nil
+}
+
+// ValidateRoleChoice refuses a wizard answer that the credential cannot carry
+// out. A join code is bound to one role (its enrollment entry's tags), so a
+// gateway code cannot make this machine the Local AI and the other way round.
+func ValidateRoleChoice(codeRole string, thisMachineIsLocalAI bool) error {
+	want := join.RoleGateway
+	if thisMachineIsLocalAI {
+		want = join.RoleLocalAI
+	}
+	if codeRole == want {
+		return nil
+	}
+	return fmt.Errorf("gateway: this join code is for a %q machine, not a %q one: ask your administrator for a %s code", codeRole, want, want)
+}

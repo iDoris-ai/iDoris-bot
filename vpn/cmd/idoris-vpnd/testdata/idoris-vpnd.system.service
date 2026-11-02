@@ -1,0 +1,24 @@
+[Unit]
+Description=iDoris VPN membership daemon (Tailscale client -> iDoris Headscale)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Runs as root so it can open the tailscaled socket and edit prefs.
+# To run as an unprivileged user set User=idoris Group=idoris and on the host run: tailscale set --operator=idoris
+ExecStart=/usr/local/lib/idoris/idoris-vpnd run --config /etc/idoris/vpn.json
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+StateDirectory=idoris
+StateDirectoryMode=0750
+RuntimeDirectory=idoris
+RuntimeDirectoryMode=0750
+Environment=XDG_RUNTIME_DIR=/run/idoris
+ReadWritePaths=/var/lib/idoris
+ReadWritePaths=/run/idoris
+ReadWritePaths=/var/lib/idoris/node
+
+[Install]
+WantedBy=multi-user.target

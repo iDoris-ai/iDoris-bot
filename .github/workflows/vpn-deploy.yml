@@ -1,0 +1,80 @@
+name: vpn-deploy
+
+# Cheap checks run on every change under deploy/vpn.
+# The isolation probe (deploy/vpn/test/probe.sh) needs Docker plus /dev/net/tun
+# and starts many tailscale containers. That is not reliable on hosted
+# ubuntu-latest, so the probe runs only from workflow_dispatch and the nightly
+# schedule. See docs/14-VPN-OPERATIONS.md.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deploy/vpn/**"
+      - ".github/workflows/vpn-deploy.yml"
+  pull_request:
+    paths:
+      - "deploy/vpn/**"
+      - ".github/workflows/vpn-deploy.yml"
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: shellcheck
+        run: |
+          shellcheck -x \
+            deploy/vpn/bootstrap.sh \
+            deploy/vpn/ctl.sh \
+            deploy/vpn/ops-lib.sh \
+            deploy/vpn/offhost-backup.sh \
+            deploy/vpn/test/probe.sh \
+            deploy/vpn/test/restore-drill.sh \
+            deploy/vpn/test/headplane-login.sh \
+            deploy/vpn/test/credentials.sh \
+            deploy/vpn/test/test_access_flags.sh \
+            deploy/vpn/test/test_offhost_backup.sh \
+            deploy/vpn/test/test_backup_parent.sh \
+            deploy/vpn/test/test_restore_volumes.sh \
+            deploy/vpn/test/test_r5o_sidecar_rollback.sh \
+            deploy/vpn/test/test_r5o_enroll_meta.sh \
+            deploy/vpn/test/test_r5o_runtime_id.sh \
+            deploy/vpn/test/test_r6o_sidecar_snapshot.sh \
+            deploy/vpn/test/test_r6o_fixture_owner.sh
+          shellcheck -s sh \
+            deploy/vpn/tailnet-admin/entrypoint.sh \
+            deploy/vpn/test/tailnet-entrypoint.sh
+      - name: Policy unit tests
+        run: |
+          python3 -m py_compile deploy/vpn/policy.py deploy/vpn/bundle.py deploy/vpn/test/test_policy.py deploy/vpn/test/test_bundle.py
+          python3 -m unittest discover -s deploy/vpn/test -p 'test_*.py' -v
+      - name: Compose config
+        working-directory: deploy/vpn
+        env:
+          COMPOSE_PROJECT_NAME: idoris-vpn-ci
+        run: |
+          umask 077
+          printf '%s' '0123456789abcdef0123456789abcdef' > headplane/cookie_secret
+          printf '%s\n' '{"tenants":[]}' > enroll/config.json
+          printf '%s' placeholder > enroll/headscale.apikey
+          docker compose config -q
+          docker compose --profile tailnet-admin config -q
+
+  # Not on pull_request: hosted runners often have no /dev/net/tun, and this
+  # probe is too heavy to be the default gate. Run it nightly and on demand.
+  probe:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Isolation probe
+        run: bash deploy/vpn/test/probe.sh

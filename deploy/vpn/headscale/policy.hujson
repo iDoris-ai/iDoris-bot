@@ -1,0 +1,123 @@
+// iDoris VPN access policy (Headscale v0.29.x, file mode).
+//
+// Default is ONE organisation. `bash deploy/vpn/bootstrap.sh init` fills the
+// marked regions below for that organisation (default name "office") and for
+// the admin user (default "admin"). A second organisation is explicit:
+// `bash deploy/vpn/bootstrap.sh add-tenant <name>`. Do not copy blocks by hand.
+//
+// Model
+//   * An organisation is a Headscale user. Members' laptops and phones are the
+//     PERSONAL nodes of that user, written "<org>@" in this file. They enroll
+//     with the "<org>" entry of enroll/config.json (no tags).
+//   * The Local AI host is a TAGGED node, tag:<org>-local-ai, enrolled with
+//     the "<org>-local-ai" entry. Tagged nodes belong to the special user
+//     "tagged-devices", never to the organisation, so "<org>@" does not match
+//     them and they do not expire.
+//   * Default deny. For each organisation the marked regions allow only:
+//       <org>@              -> tag:<org>-local-ai : 8740, 8742, 443
+//       group:admins        -> tag:<org>-local-ai : 22, plus an ssh rule
+//     There is no default reverse grant. Tailscale ACLs are stateful, so a
+//     reply to a member-initiated connection needs no rule. An opt-in
+//     --ai-callback-ports list adds tag:<org>-local-ai -> <org>@:<port>
+//     only. The gateway tag has no grant back to members.
+//     There is no member-to-member rule and no rule that names two
+//     organisations. Do NOT add autogroup:member, autogroup:tagged, or "*"
+//     — those match every organisation on this Headscale.
+//   * Admins are the users listed in group:admins (Headscale has no
+//     autogroup:admin). An admin device enrolls like a member, as a personal
+//     node of the admin user, and can reach nothing except the rules here.
+//   * tag:vpn-server is the optional control-plane node (compose profile
+//     tailnet-admin). Only group:admins may open its ops ports (3000 Headplane,
+//     22 ssh). Members have no rule for it.
+//   * A subnet router, when bootstrap was given --lan-cidr, is tag:<org>-gateway.
+//     autoApprovers.routes approves that prefix only for that tag. Members of
+//     the same organisation may open 8740, 8742, 443 and 11434 on the prefix.
+//     Prefixes owned by different organisations must not overlap or nest
+//     (192.168.0.0/16 and 192.168.50.0/24 cannot coexist). The check is
+//     network math, re-run against managed.json on every init/add-tenant.
+//     RFC1918 (and IPv6 ULA) only, unless --allow-public-cidr is passed.
+//     100.64.0.0/10, fd7a:115c:a1e0::/48, loopback, link-local and multicast
+//     are rejected. A same-organisation overlap is kept and warned about.
+//
+// Markers
+//   bootstrap.sh rewrites the lines between each BEGIN/END pair. Edit rules
+//   OUTSIDE the pairs if you need an exception; the next init/add-tenant keeps
+//   those lines and regenerates the pairs. HuJSON allows the trailing commas.
+//
+//   To add another admin without a new enrollment entry, put "name@" in the
+//   group:admins array outside the marker, then create that Headscale user.
+//
+// Tailscale SSH needs BOTH an ssh rule and an ACL opening tcp/22. "check"
+// pauses each login until an operator runs `headscale auth approve --auth-id
+// <id>` (the id is in the SSH banner and at <server_url>/auth/<id>). Use
+// "accept" instead of "check" to skip that. users is autogroup:nonroot, so
+// root SSH is not granted.
+//
+// MagicDNS names are <hostname>.<base_domain> for the whole instance. The
+// organisation is not part of the name. Give the Local AI host a prefixed
+// hostname such as office-local-ai.
+//
+// The "tests" block stays commented out on purpose. Headscale evaluates it
+// against LIVE nodes on `policy check` and on every SIGHUP, and a test whose
+// src or dst resolves to no node REJECTS the reload. A zero-node organisation
+// would then be unable to load. Uncomment only after the named nodes exist.
+{
+  "groups": {
+    "group:admins": [
+      // BEGIN idoris-managed admins
+      "admin@",
+      // END idoris-managed admins
+    ],
+  },
+
+  // tagOwners gates `tailscale up --advertise-tags`. The enrollment service
+  // tags nodes with the Headscale API key, which does not consult tagOwners.
+  // Keeping the owners here stops a member from self-assigning the tag.
+  "tagOwners": {
+    "tag:vpn-server": ["group:admins"],
+    // BEGIN idoris-managed tagOwners
+    // END idoris-managed tagOwners
+  },
+
+  "acls": [
+    // Control-plane node. Nothing else may reach it: there is no member rule.
+    {
+      "action": "accept",
+      "src": ["group:admins"],
+      "dst": [
+        "tag:vpn-server:3000", // Headplane, only over the tailnet
+        "tag:vpn-server:22"    // sshd on that node, if you run one
+      ]
+    },
+    // BEGIN idoris-managed acls
+    // END idoris-managed acls
+  ],
+
+  "ssh": [
+    {
+      "action": "check",
+      "src": ["group:admins"],
+      "dst": ["tag:vpn-server"],
+      "users": ["autogroup:nonroot"]
+    },
+    // BEGIN idoris-managed ssh
+    // END idoris-managed ssh
+  ],
+
+  // routes values must be CIDR prefixes. An empty object is valid and means
+  // nothing is auto-approved; ctl.sh routes approve remains the manual path.
+  "autoApprovers": {
+    "routes": {
+      // BEGIN idoris-managed routes
+      // END idoris-managed routes
+    },
+  },
+
+  // "tests": [
+  //   {
+  //     "src": "office@",
+  //     "accept": ["tag:office-local-ai:8740", "tag:office-local-ai:8742", "tag:office-local-ai:443"],
+  //     "deny": ["tag:office-local-ai:22", "tag:office-local-ai:8080"]
+  //   }
+  // ],
+}

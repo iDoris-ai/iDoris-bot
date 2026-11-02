@@ -1,0 +1,12 @@
+/Create
+/TN
+idoris-vpnd
+/SC
+ONSTART
+/RU
+SYSTEM
+/RL
+HIGHEST
+/F
+/TR
+cmd /c set STATE_DIRECTORY=C:\ProgramData\idoris&& "C:\Program Files\iDoris\idoris-vpnd.exe" run --config C:\ProgramData\idoris\vpn.json

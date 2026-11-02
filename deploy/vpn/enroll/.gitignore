@@ -1,0 +1,8 @@
+# Secrets written by bootstrap.sh
+headscale.apikey
+config.json
+config.json.tmp
+config.sync.*
+minted-tokens.txt
+# Obsolete sidecar. Labels live on token_hashes objects.
+token-labels.json

@@ -1,0 +1,444 @@
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+
+	"github.com/iDoris-ai/iDoris-bridge/vpn/internal/vpnd"
+)
+
+const launchdLabel = "ai.idoris.vpnd"
+
+// userServiceAction is what a user-service install did to the process.
+// started is a first install (enable --now, or launchctl bootstrap).
+// restarted is an install over a unit that was already active.
+type userServiceAction string
+
+const (
+	userServiceStarted   userServiceAction = "started"
+	userServiceRestarted userServiceAction = "restarted"
+)
+
+// runServiceCommand runs systemctl, launchctl, and schtasks. Tests replace it.
+var runServiceCommand = func(name string, args ...string) ([]byte, error) {
+	return exec.Command(name, args...).CombinedOutput()
+}
+
+func serviceCmd(args []string) error {
+	if len(args) < 1 {
+		return errors.New("service: expected install or uninstall")
+	}
+	fs := flag.NewFlagSet("service", flag.ContinueOnError)
+	configPath := fs.String("config", "", "JSON config file the service should load")
+	system := fs.Bool("system", false, "install a machine service that runs before login (requires root or SYSTEM)")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	switch args[0] {
+	case "install":
+		if *configPath == "" {
+			return errors.New("service install: --config is required")
+		}
+		abs, err := filepath.Abs(*configPath)
+		if err != nil {
+			return err
+		}
+		if _, err := os.Stat(abs); err != nil { //nolint:gosec // G703: operator-chosen config path, made absolute
+			return fmt.Errorf("config: %w", err)
+		}
+		// A user service requires the operator to own every secret. A machine
+		// service also accepts a 0600 file owned by the user who invoked sudo;
+		// checkSystemInstallSecrets is that check. CheckSecretFile would reject
+		// that file because the process is root.
+		if *system {
+			if err := checkSystemInstallSecrets(abs); err != nil {
+				return err
+			}
+			return installSystemService(abs)
+		}
+		if err := checkInstallSecrets(abs); err != nil {
+			return err
+		}
+		if err := installService(abs); err != nil {
+			return err
+		}
+		fmt.Println(userServiceNotice(runtime.GOOS))
+		return nil
+	case "uninstall":
+		if *system {
+			return uninstallSystemService()
+		}
+		return uninstallService()
+	default:
+		return fmt.Errorf("service: unknown action %q", args[0])
+	}
+}
+
+// userServiceNotice tells the operator that a per-user service stays stopped
+// until they log in. Linux additionally needs lingering.
+func userServiceNotice(goos string) string {
+	msg := "a user service does not run before this user logs in"
+	if goos == "linux" {
+		msg += "; enable it with: loginctl enable-linger"
+	}
+	return msg
+}
+
+// checkInstallSecrets calls CheckSecretFile for the enrollment token file,
+// the auth key file, the SOCKS5 auth file, and the config itself when it
+// holds an inline enroll_token or auth_key. A config that only names those
+// files may stay 0644.
+func checkInstallSecrets(configPath string) error {
+	b, err := os.ReadFile(configPath) //nolint:gosec // operator-chosen config, checked before install
+	if err != nil {
+		return err
+	}
+	var probe struct {
+		EnrollToken     string `json:"enroll_token"`
+		EnrollTokenFile string `json:"enroll_token_file"`
+		AuthKey         string `json:"auth_key"`
+		AuthKeyFile     string `json:"auth_key_file"`
+		SOCKS5AuthFile  string `json:"socks5_auth_file"`
+	}
+	if err := json.Unmarshal(b, &probe); err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	if probe.EnrollToken != "" || probe.AuthKey != "" {
+		if err := vpnd.CheckSecretFile(configPath); err != nil {
+			return fmt.Errorf("config holds an inline secret: %w", err)
+		}
+	}
+	files := []struct{ name, path string }{
+		{"enroll_token_file", probe.EnrollTokenFile},
+		{"auth_key_file", probe.AuthKeyFile},
+		{"socks5_auth_file", probe.SOCKS5AuthFile},
+	}
+	for _, f := range files {
+		if strings.TrimSpace(f.path) == "" {
+			continue
+		}
+		if err := vpnd.CheckSecretFile(f.path); err != nil {
+			return fmt.Errorf("%s: %w", f.name, err)
+		}
+	}
+	return nil
+}
+
+// checkSystemInstallSecrets is the machine-service check. A 0600 file owned
+// by root, or by the user who invoked sudo, is accepted. The installer then
+// copies it to a root-owned path. A user service keeps CheckSecretFile.
+func checkSystemInstallSecrets(configPath string) error {
+	b, err := os.ReadFile(configPath) //nolint:gosec // operator-chosen config, checked before install
+	if err != nil {
+		return err
+	}
+	var probe struct {
+		EnrollToken     string `json:"enroll_token"`
+		EnrollTokenFile string `json:"enroll_token_file"`
+		AuthKey         string `json:"auth_key"`
+		AuthKeyFile     string `json:"auth_key_file"`
+		SOCKS5AuthFile  string `json:"socks5_auth_file"`
+	}
+	if err := json.Unmarshal(b, &probe); err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	if probe.EnrollToken != "" || probe.AuthKey != "" {
+		if err := acceptInstallSecret(configPath); err != nil {
+			return fmt.Errorf("config holds an inline secret: %w", err)
+		}
+	}
+	files := []struct{ name, path string }{
+		{"enroll_token_file", probe.EnrollTokenFile},
+		{"auth_key_file", probe.AuthKeyFile},
+		{"socks5_auth_file", probe.SOCKS5AuthFile},
+	}
+	for _, f := range files {
+		if strings.TrimSpace(f.path) == "" {
+			continue
+		}
+		if err := acceptInstallSecret(f.path); err != nil {
+			return fmt.Errorf("%s: %w", f.name, err)
+		}
+	}
+	return nil
+}
+
+func selfPath() (string, error) {
+	p, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(p)
+}
+
+func installService(configPath string) error {
+	_, err := installUserService(configPath)
+	return err
+}
+
+// installUserService installs the per-user unit and reports whether it
+// started a new process or restarted one that was already active.
+// installService is the wrapper host.InstallService calls; it drops the
+// action. Wizard text that needs the distinction calls installUserService.
+func installUserService(configPath string) (userServiceAction, error) {
+	abs, err := filepath.Abs(configPath)
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Stat(abs); err != nil { //nolint:gosec // G703: operator-chosen config path, made absolute
+		return "", fmt.Errorf("config: %w", err)
+	}
+	configPath = abs
+	exe, err := selfPath()
+	if err != nil {
+		return "", err
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		if _, err := os.Stat(systemLaunchdPath); err == nil {
+			return "", errors.New("a system LaunchDaemon is installed; remove it with: idoris-vpnd service uninstall --system")
+		}
+		return installLaunchd(exe, configPath)
+	case "linux":
+		if err := rejectEnabledSystemUnit(); err != nil {
+			return "", err
+		}
+		return installSystemdUser(exe, configPath)
+	default:
+		return "", fmt.Errorf("service install is not supported on %s; run `idoris-vpnd run` under your service manager", runtime.GOOS)
+	}
+}
+
+func rejectEnabledSystemUnit() error {
+	out, err := runServiceCommand("systemctl", "is-enabled", systemUnitName)
+	if err == nil && strings.TrimSpace(string(out)) == "enabled" {
+		return errors.New("the system unit is enabled; remove it with: idoris-vpnd service uninstall --system")
+	}
+	return nil
+}
+
+func uninstallService() error {
+	switch runtime.GOOS {
+	case "darwin":
+		p, err := launchdPlistPath()
+		if err != nil {
+			return err
+		}
+		_ = exec.Command("launchctl", "bootout", fmt.Sprintf("gui/%d/%s", os.Getuid(), launchdLabel)).Run()
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		fmt.Println("removed", p)
+		return nil
+	case "linux":
+		_ = exec.Command("systemctl", "--user", "disable", "--now", "idoris-vpnd.service").Run()
+		p, err := systemdUnitPath()
+		if err != nil {
+			return err
+		}
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		fmt.Println("removed", p)
+		return nil
+	default:
+		return fmt.Errorf("service uninstall is not supported on %s", runtime.GOOS)
+	}
+}
+
+func launchdPlistPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist"), nil
+}
+
+func plistEscape(s string) string {
+	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
+	return r.Replace(s)
+}
+
+func renderLaunchdPlist(exe, configPath, logDir string) string {
+	return renderLaunchdPlistEnv(exe, configPath, logDir, nil)
+}
+
+// renderSystemLaunchdPlist is the machine LaunchDaemon. STATE_DIRECTORY
+// matches the Linux StateDirectory=idoris convention so the daemon does not
+// consult HOME. The user LaunchAgent must not set it.
+func renderSystemLaunchdPlist(exe, configPath, logDir string) string {
+	return renderLaunchdPlistEnv(exe, configPath, logDir, [][2]string{
+		{"STATE_DIRECTORY", systemStateDir},
+	})
+}
+
+func renderLaunchdPlistEnv(exe, configPath, logDir string, env [][2]string) string {
+	var envXML string
+	if len(env) > 0 {
+		var b strings.Builder
+		b.WriteString("  <key>EnvironmentVariables</key>\n  <dict>\n")
+		for _, kv := range env {
+			fmt.Fprintf(&b, "    <key>%s</key><string>%s</string>\n", plistEscape(kv[0]), plistEscape(kv[1]))
+		}
+		b.WriteString("  </dict>\n")
+		envXML = b.String()
+	}
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>%s</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>%s</string>
+    <string>run</string>
+    <string>--config</string>
+    <string>%s</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+%s  <key>StandardOutPath</key><string>%s/vpnd.log</string>
+  <key>StandardErrorPath</key><string>%s/vpnd.log</string>
+</dict>
+</plist>
+`, launchdLabel, plistEscape(exe), plistEscape(configPath), envXML, plistEscape(logDir), plistEscape(logDir))
+}
+
+func installLaunchd(exe, configPath string) (userServiceAction, error) {
+	p, err := launchdPlistPath()
+	if err != nil {
+		return "", err
+	}
+	home, _ := os.UserHomeDir()
+	logDir := filepath.Join(home, "Library", "Logs", "iDoris")
+	if err := os.MkdirAll(logDir, 0o750); err != nil {
+		return "", err
+	}
+	plist := renderLaunchdPlist(exe, configPath, logDir)
+	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(p, []byte(plist), 0o600); err != nil { //nolint:gosec // G703: user LaunchAgent path under the current home, not a request path
+		return "", err
+	}
+	uid := os.Getuid()
+	_, err = runServiceCommand("launchctl", "print", fmt.Sprintf("gui/%d/%s", uid, launchdLabel))
+	action, err := activateLaunchdUser(p, uid, err == nil)
+	if err != nil {
+		return "", err
+	}
+	if action == userServiceRestarted {
+		fmt.Println("restarted", launchdLabel, "from", p)
+	} else {
+		fmt.Println("installed and started", launchdLabel, "from", p)
+	}
+	fmt.Println("logs:", filepath.Join(logDir, "vpnd.log"))
+	return action, nil
+}
+
+// activateLaunchdUser bootstraps a LaunchAgent. An already-loaded agent is
+// booted out, bootstrapped, and kickstarted so the new plist replaces the
+// running process. A first install is bootstrap only; RunAtLoad starts it.
+func activateLaunchdUser(plist string, uid int, already bool) (userServiceAction, error) {
+	domain := fmt.Sprintf("gui/%d", uid)
+	target := domain + "/" + launchdLabel
+	if already {
+		if out, err := runServiceCommand("launchctl", "bootout", target); err != nil {
+			return "", fmt.Errorf("launchctl bootout: %w: %s", err, strings.TrimSpace(string(out)))
+		}
+	}
+	if out, err := runServiceCommand("launchctl", "bootstrap", domain, plist); err != nil {
+		return "", fmt.Errorf("launchctl bootstrap: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	if !already {
+		return userServiceStarted, nil
+	}
+	if out, err := runServiceCommand("launchctl", "kickstart", "-k", target); err != nil {
+		return "", fmt.Errorf("launchctl kickstart: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return userServiceRestarted, nil
+}
+
+func systemdUnitPath() (string, error) {
+	base := os.Getenv("XDG_CONFIG_HOME")
+	if base == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		base = filepath.Join(home, ".config")
+	}
+	return filepath.Join(base, "systemd", "user", "idoris-vpnd.service"), nil
+}
+
+func renderSystemdUserUnit(exe, configPath string) string {
+	return fmt.Sprintf(`[Unit]
+Description=iDoris VPN membership daemon (Tailscale client -> iDoris Headscale)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%s
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
+`, renderExecStart(exe, configPath))
+}
+
+func installSystemdUser(exe, configPath string) (userServiceAction, error) {
+	p, err := systemdUnitPath()
+	if err != nil {
+		return "", err
+	}
+	unit := renderSystemdUserUnit(exe, configPath)
+	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(p, []byte(unit), 0o600); err != nil {
+		return "", err
+	}
+	out, err := runServiceCommand("systemctl", "--user", "is-active", systemUnitName)
+	active := err == nil && strings.TrimSpace(string(out)) == "active"
+	action, err := activateSystemdUser(active)
+	if err != nil {
+		return "", err
+	}
+	if action == userServiceRestarted {
+		fmt.Println("restarted", systemUnitName, "from", p)
+	} else {
+		fmt.Println("installed and started", systemUnitName, "from", p)
+	}
+	return action, nil
+}
+
+// activateSystemdUser reloads the user manager and either restarts an
+// already-active unit or enables it on first install. enable --now does not
+// restart a unit that is already running, so the active path uses restart.
+func activateSystemdUser(already bool) (userServiceAction, error) {
+	if out, err := runServiceCommand("systemctl", "--user", "daemon-reload"); err != nil {
+		return "", fmt.Errorf("systemctl --user daemon-reload: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	if already {
+		out, err := runServiceCommand("systemctl", "--user", "restart", systemUnitName)
+		if err != nil {
+			return "", fmt.Errorf("systemctl --user restart: %w: %s", err, strings.TrimSpace(string(out)))
+		}
+		return userServiceRestarted, nil
+	}
+	out, err := runServiceCommand("systemctl", "--user", "enable", "--now", systemUnitName)
+	if err != nil {
+		return "", fmt.Errorf("systemctl --user enable --now: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return userServiceStarted, nil
+}
