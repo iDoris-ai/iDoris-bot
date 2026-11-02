@@ -23,3 +23,13 @@ The coordinator owns implementation, candidate integration, tests, manifests and
 ## Delivery
 
 This document is linked from the release PR body because the daemon reads PR intent from the body. Publishing a link is not proof that the remote daemon has consumed it. Record a reviewer acknowledgement or resulting exact-version review before claiming successful handoff. Draft proposals are intentionally not normal queue work.
+
+## Scoped protocol decision, 2026-11-02
+
+The remote daemon acknowledged on PR #188 that its bridge window currently admits only #15–#19; this is not a parent-merge prerequisite. The coordinator authorized a release-specific final-candidate audit under the owner's approved plan. No global reviewer policy is changed.
+
+For this audit, each module is reviewed against the same pinned base/candidate tree with a separate reviewer context and independent final judgment. Scope reports are published as COMMENTs with evidence, not as whole-PR approvals. The coordinator supplies a complete primary-path manifest; cross-module review covers interfaces in addition to those primary paths.
+
+The final external reviewer must reconcile all module reports, historical blocking findings, new fix PRs, integration changes and current-head CI before issuing one whole-release verdict. This is a newly audited final tree, not the DevLoop aggregation-only shortcut. No claim is made that the historical 177 task PRs have all been approved.
+
+Focused fixes target the release candidate and receive normal independent review. #189 fixes enrollment backup ownership; its approval does not approve the whole candidate. The original stack heads remain unchanged.

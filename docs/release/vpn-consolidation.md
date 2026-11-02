@@ -43,3 +43,14 @@ Each coverage record includes base SHA, reviewed head SHA, path scope, external 
 ## Operating constraints
 
 Use standard/default service only; Fast/priority forbidden. Preserve paused jobs and active worker ownership. Remote PR-Daemon is authoritative; do not start a local reviewer/watcher. Any newly configured status/CI/review poll uses 5 minutes. Unchanged polls do not rerun tests or spawn workers.
+
+## Initial execution evidence
+
+- Draft release proposal: [#188](https://github.com/iDoris-ai/iDoris-bridge/pull/188).
+- Focused ownership regression fix: [#189](https://github.com/iDoris-ai/iDoris-bridge/pull/189).
+- Baseline source passed go vet/race unit tests, lint (0 issues), license-notice checks for all six OS/architecture combinations, host/Linux builds, deployment Python tests (36) and deployment shellcheck.
+- The focused fix passed independent coordinator enrollment race tests, Docker `TestR5OConfigOwner` and enrollment lint. Full integration and external approval remain pending.
+- Three isolated Grok workers produced the repair, daemon capability analysis and final-tree coverage work. The coordinator separately checked the patch and tests.
+- Existing remote daemon acknowledged the coordination request on #188. It confirmed that bridge's review window, rather than a main-only rule, is the queue bottleneck. The scoped final-tree audit protocol is recorded in the linked cooperation document and PR comments.
+
+These are initialization results, not a release approval. Read current PR checks and exact-version external reports for subsequent status.

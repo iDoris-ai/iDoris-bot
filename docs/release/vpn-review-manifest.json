@@ -1,0 +1,738 @@
+{
+  "schema": "idoris-bridge-release-review/v1",
+  "version": 1,
+  "repo": "iDoris-ai/iDoris-bridge",
+  "release_pr": 188,
+  "base_sha": "fe13b0ef2fd0d009fae6d296a5c6a4cb89e66059",
+  "source_sha": "528e1990dace6815be4e7eef06283a2d084d3fe0",
+  "source_tree": "e5e39fe50fed725619a8b85d49c18bf7b0b41de3",
+  "candidate_ref": "release/vpn-consolidated-20261102",
+  "binding": "The review-start PR comment pins the manifest commit, full candidate SHA and tree. Never interpret source_sha as approval of a later candidate.",
+  "review_protocol": "Scoped final-candidate audit authorized 2026-11-02; module COMMENT evidence followed by independent whole-PR verdict. Not DevLoop aggregation-only approval.",
+  "path_count": 292,
+  "source_path_count": 289,
+  "modules": [
+    {
+      "id": "enrollment-credentials",
+      "title": "Enrollment and credentials",
+      "primary_paths": [
+        "deploy/vpn/enroll/.gitignore",
+        "deploy/vpn/enroll/Dockerfile",
+        "deploy/vpn/enroll/Dockerfile.dockerignore",
+        "deploy/vpn/enroll/config.example.json",
+        "deploy/vpn/enroll_lock.py",
+        "deploy/vpn/test/credentials.sh",
+        "deploy/vpn/test/lock_owner_inner.py",
+        "deploy/vpn/test/test_allow_empty.sh",
+        "deploy/vpn/test/test_enroll_lock.py",
+        "deploy/vpn/test/test_lock_owner.sh",
+        "vpn/cmd/idoris-vpn-enroll/main.go",
+        "vpn/cmd/idoris-vpn-enroll/main_test.go",
+        "vpn/cmd/idoris-vpn-enroll/signal_other.go",
+        "vpn/cmd/idoris-vpn-enroll/signal_unix.go",
+        "vpn/integration/r5lead_expire_test.go",
+        "vpn/integration/r5o_owner_test.go",
+        "vpn/internal/enroll/client.go",
+        "vpn/internal/enroll/configlock.go",
+        "vpn/internal/enroll/configlock_readonly_test.go",
+        "vpn/internal/enroll/configlock_unix.go",
+        "vpn/internal/enroll/configlock_unix_test.go",
+        "vpn/internal/enroll/configlock_windows.go",
+        "vpn/internal/enroll/credential.go",
+        "vpn/internal/enroll/credential_test.go",
+        "vpn/internal/enroll/durability_test.go",
+        "vpn/internal/enroll/invite.go",
+        "vpn/internal/enroll/invite_test.go",
+        "vpn/internal/enroll/owner_unix.go",
+        "vpn/internal/enroll/owner_windows.go",
+        "vpn/internal/enroll/r4o_cutoff_test.go",
+        "vpn/internal/enroll/r4o_lock_test.go",
+        "vpn/internal/enroll/r5o_owner_unix_test.go",
+        "vpn/internal/enroll/readyz.go",
+        "vpn/internal/enroll/readyz_cache_test.go",
+        "vpn/internal/enroll/readyz_test.go",
+        "vpn/internal/enroll/redirect.go",
+        "vpn/internal/enroll/redirect_test.go",
+        "vpn/internal/enroll/regress_test.go",
+        "vpn/internal/enroll/regress_unix_test.go",
+        "vpn/internal/enroll/revoke_empty_test.go",
+        "vpn/internal/enroll/server.go",
+        "vpn/internal/enroll/server_limit.go",
+        "vpn/internal/enroll/server_limit_test.go",
+        "vpn/internal/enroll/server_recheck_test.go",
+        "vpn/internal/enroll/server_test.go",
+        "vpn/internal/headscale/apikey.go",
+        "vpn/internal/headscale/apikey_test.go",
+        "vpn/internal/headscale/client.go",
+        "vpn/internal/headscale/client_test.go",
+        "vpn/internal/headscale/redirect_test.go"
+      ],
+      "suggested_checks": [
+        "cd vpn && go test -race -count=1 ./internal/enroll/ ./internal/headscale/ ./cmd/idoris-vpn-enroll/",
+        "cd vpn && go test -tags integration -count=1 -timeout 15m -run \"TestR5OConfigOwner|TestR5LeadExpirePreAuthKeyAgainstHeadscale\" ./integration/"
+      ],
+      "review_status": "pending",
+      "evidence": []
+    },
+    {
+      "id": "client-access",
+      "title": "Client identity and access",
+      "primary_paths": [
+        "vpn/cmd/idoris-vpnd/main.go",
+        "vpn/cmd/idoris-vpnd/main_test.go",
+        "vpn/cmd/idoris-vpnd/testdata/ai.idoris.vpnd.daemon.plist",
+        "vpn/cmd/idoris-vpnd/testdata/idoris-vpnd.icacls.txt",
+        "vpn/cmd/idoris-vpnd/testdata/idoris-vpnd.system.service",
+        "vpn/cmd/idoris-vpnd/testdata/idoris-vpnd.task.txt",
+        "vpn/cmd/idoris-vpnd/testdata/idoris-vpnd.user.service",
+        "vpn/integration/echosrv/main.go",
+        "vpn/integration/embedded/compose.yaml",
+        "vpn/integration/embedded/foreign/config.yaml",
+        "vpn/integration/embedded/foreign/derp.yaml",
+        "vpn/integration/embedded/headscale/config.yaml",
+        "vpn/integration/embedded/headscale/policy.hujson",
+        "vpn/integration/embedded_test.go",
+        "vpn/integration/hardA/compose.yaml",
+        "vpn/integration/hardA_client_test.go",
+        "vpn/integration/integration_test.go",
+        "vpn/integration/r4c_identity_test.go",
+        "vpn/integration/r4c_lock_test.go",
+        "vpn/integration/wire_access_test.go",
+        "vpn/integration/wireclient/main.go",
+        "vpn/internal/vpnd/access_gate.go",
+        "vpn/internal/vpnd/access_gate_test.go",
+        "vpn/internal/vpnd/backend.go",
+        "vpn/internal/vpnd/config.go",
+        "vpn/internal/vpnd/config_test.go",
+        "vpn/internal/vpnd/embedded.go",
+        "vpn/internal/vpnd/embedded_test.go",
+        "vpn/internal/vpnd/forward.go",
+        "vpn/internal/vpnd/forward_access_test.go",
+        "vpn/internal/vpnd/forward_auth.go",
+        "vpn/internal/vpnd/forward_listen.go",
+        "vpn/internal/vpnd/forward_other.go",
+        "vpn/internal/vpnd/forward_owner.go",
+        "vpn/internal/vpnd/forward_owner_test.go",
+        "vpn/internal/vpnd/forward_socks.go",
+        "vpn/internal/vpnd/forward_test.go",
+        "vpn/internal/vpnd/forward_unix.go",
+        "vpn/internal/vpnd/lock.go",
+        "vpn/internal/vpnd/lock_path.go",
+        "vpn/internal/vpnd/lock_proc_test.go",
+        "vpn/internal/vpnd/lock_test.go",
+        "vpn/internal/vpnd/lock_unix.go",
+        "vpn/internal/vpnd/lock_windows.go",
+        "vpn/internal/vpnd/mode.go",
+        "vpn/internal/vpnd/mode_test.go",
+        "vpn/internal/vpnd/r3c1_reconcile_test.go",
+        "vpn/internal/vpnd/r4c_forward_test.go",
+        "vpn/internal/vpnd/r4c_gate_test.go",
+        "vpn/internal/vpnd/r4c_identity_test.go",
+        "vpn/internal/vpnd/r4c_lock_test.go",
+        "vpn/internal/vpnd/r4c_profile_test.go",
+        "vpn/internal/vpnd/r4c_state_lock_test.go",
+        "vpn/internal/vpnd/r4w_socks_auth_path.go",
+        "vpn/internal/vpnd/r5c_access_test.go",
+        "vpn/internal/vpnd/r5c_identity_test.go",
+        "vpn/internal/vpnd/r5lead_snapshot_test.go",
+        "vpn/internal/vpnd/r6c_identity_test.go",
+        "vpn/internal/vpnd/reconciler.go",
+        "vpn/internal/vpnd/reconciler_test.go",
+        "vpn/internal/vpnd/routes.go",
+        "vpn/internal/vpnd/secret.go",
+        "vpn/internal/vpnd/secret_acl.go",
+        "vpn/internal/vpnd/secret_acl_test.go",
+        "vpn/internal/vpnd/secret_unix.go",
+        "vpn/internal/vpnd/secret_windows.go",
+        "vpn/internal/vpnd/servicedir.go",
+        "vpn/internal/vpnd/servicedir_test.go",
+        "vpn/internal/vpnd/socks_len_test.go",
+        "vpn/internal/vpnd/startup.go",
+        "vpn/internal/vpnd/startup_test.go",
+        "vpn/internal/vpnd/state.go",
+        "vpn/internal/vpnd/state_test.go",
+        "vpn/internal/vpnd/status_listen_test.go",
+        "vpn/internal/vpnd/status_owner_unix.go",
+        "vpn/internal/vpnd/status_owner_windows.go",
+        "vpn/internal/vpnd/status_query_test.go",
+        "vpn/internal/vpnd/status_test.go",
+        "vpn/internal/vpnd/statusapi.go"
+      ],
+      "suggested_checks": [
+        "cd vpn && go test -race -count=1 ./internal/vpnd/ ./cmd/idoris-vpnd/"
+      ],
+      "review_status": "pending",
+      "evidence": []
+    },
+    {
+      "id": "wizard-gateway",
+      "title": "Join wizard and gateway",
+      "primary_paths": [
+        "vpn/cmd/idoris-vpnd/host.go",
+        "vpn/cmd/idoris-vpnd/host_secret_test.go",
+        "vpn/cmd/idoris-vpnd/r5w_browser_test.go",
+        "vpn/cmd/idoris-vpnd/ui_cmd.go",
+        "vpn/cmd/idoris-vpnd/ui_cmd_test.go",
+        "vpn/cmd/idoris-vpnd/wizard.go",
+        "vpn/cmd/idoris-vpnd/wizard_test.go",
+        "vpn/integration/compose.lan.yaml",
+        "vpn/integration/headscale-lan/config.yaml",
+        "vpn/integration/headscale-lan/echo.sh",
+        "vpn/integration/headscale-lan/node.sh",
+        "vpn/integration/headscale-lan/policy.auto.hujson",
+        "vpn/integration/headscale-lan/policy.manual.hujson",
+        "vpn/integration/lan_test.go",
+        "vpn/integration/r4w_handoff_test.go",
+        "vpn/integration/r5w_member_socks_test.go",
+        "vpn/integration/wizard/compose.yaml",
+        "vpn/integration/wizard_test.go",
+        "vpn/internal/gateway/apply.go",
+        "vpn/internal/gateway/apply_fs_test.go",
+        "vpn/internal/gateway/handoff.go",
+        "vpn/internal/gateway/handoff_other.go",
+        "vpn/internal/gateway/handoff_test.go",
+        "vpn/internal/gateway/handoff_unix.go",
+        "vpn/internal/gateway/handoff_unix_test.go",
+        "vpn/internal/gateway/paths.go",
+        "vpn/internal/gateway/paths_test.go",
+        "vpn/internal/gateway/plan.go",
+        "vpn/internal/gateway/plan_test.go",
+        "vpn/internal/gateway/r4w_authpath_test.go",
+        "vpn/internal/gateway/r4w_config_test.go",
+        "vpn/internal/gateway/r4w_inline_test.go",
+        "vpn/internal/gateway/r4w_paths_test.go",
+        "vpn/internal/gateway/r4w_pin_test.go",
+        "vpn/internal/gateway/r4w_socks_test.go",
+        "vpn/internal/gateway/r5w_identity_test.go",
+        "vpn/internal/gateway/r5w_token_test.go",
+        "vpn/internal/join/join.go",
+        "vpn/internal/join/join_test.go",
+        "vpn/internal/netdetect/collect.go",
+        "vpn/internal/netdetect/detect.go",
+        "vpn/internal/netdetect/detect_review_test.go",
+        "vpn/internal/netdetect/detect_test.go",
+        "vpn/internal/netdetect/probe.go",
+        "vpn/internal/netdetect/route.go",
+        "vpn/internal/netdetect/route_review_test.go",
+        "vpn/internal/ui/app.css",
+        "vpn/internal/ui/app.js",
+        "vpn/internal/ui/index.html",
+        "vpn/internal/ui/r3w1_appjs_test.go",
+        "vpn/internal/ui/r3w1_auth_test.go",
+        "vpn/internal/ui/r3w1_authority_test.go",
+        "vpn/internal/ui/r3w1_config_test.go",
+        "vpn/internal/ui/r3w1_plan_test.go",
+        "vpn/internal/ui/r3w1_role_test.go",
+        "vpn/internal/ui/r4w_appjs_test.go",
+        "vpn/internal/ui/r4w_authority_test.go",
+        "vpn/internal/ui/r4w_member_test.go",
+        "vpn/internal/ui/r4w_role_test.go",
+        "vpn/internal/ui/r5w_appjs_test.go",
+        "vpn/internal/ui/r5w_identity_test.go",
+        "vpn/internal/ui/r6w_appjs_test.go",
+        "vpn/internal/ui/server.go",
+        "vpn/internal/ui/server_test.go"
+      ],
+      "suggested_checks": [
+        "cd vpn && go test -race -count=1 ./internal/join/ ./internal/netdetect/ ./internal/gateway/ ./internal/ui/ ./cmd/idoris-vpnd/",
+        "cd vpn && make integration-lan && make integration-wizard"
+      ],
+      "review_status": "pending",
+      "evidence": []
+    },
+    {
+      "id": "platform-services",
+      "title": "Native platform service installation",
+      "primary_paths": [
+        "vpn/cmd/idoris-vpnd/r4c_exe_unix_test.go",
+        "vpn/cmd/idoris-vpnd/r4c_prepare_test.go",
+        "vpn/cmd/idoris-vpnd/r4c_secret_unix_test.go",
+        "vpn/cmd/idoris-vpnd/r4c_service_test.go",
+        "vpn/cmd/idoris-vpnd/r5c_reinstall_test.go",
+        "vpn/cmd/idoris-vpnd/r6c_acl_test.go",
+        "vpn/cmd/idoris-vpnd/r6c_wininstall_test.go",
+        "vpn/cmd/idoris-vpnd/service.go",
+        "vpn/cmd/idoris-vpnd/service_acl.go",
+        "vpn/cmd/idoris-vpnd/service_acl_other.go",
+        "vpn/cmd/idoris-vpnd/service_acl_test.go",
+        "vpn/cmd/idoris-vpnd/service_acl_windows.go",
+        "vpn/cmd/idoris-vpnd/service_exe.go",
+        "vpn/cmd/idoris-vpnd/service_exe_test.go",
+        "vpn/cmd/idoris-vpnd/service_exe_unix.go",
+        "vpn/cmd/idoris-vpnd/service_exe_windows.go",
+        "vpn/cmd/idoris-vpnd/service_paths_test.go",
+        "vpn/cmd/idoris-vpnd/service_render_test.go",
+        "vpn/cmd/idoris-vpnd/service_root_unix.go",
+        "vpn/cmd/idoris-vpnd/service_root_windows.go",
+        "vpn/cmd/idoris-vpnd/service_secret_unix.go",
+        "vpn/cmd/idoris-vpnd/service_secret_unix_test.go",
+        "vpn/cmd/idoris-vpnd/service_secret_windows.go",
+        "vpn/cmd/idoris-vpnd/service_system.go",
+        "vpn/cmd/idoris-vpnd/service_user_test.go",
+        "vpn/cmd/idoris-vpnd/service_wininstall.go",
+        "vpn/cmd/idoris-vpnd/service_wininstall_test.go",
+        "vpn/integration/r3svc_systemd_test.go",
+        "vpn/integration/r4c_service_root_test.go",
+        "vpn/integration/r5c_user_service_test.go",
+        "vpn/internal/fsutil/atomic.go",
+        "vpn/internal/fsutil/atomic_test.go",
+        "vpn/internal/fsutil/owner_other.go",
+        "vpn/internal/fsutil/owner_unix.go",
+        "vpn/internal/fsutil/r6c_winacl_test.go",
+        "vpn/internal/fsutil/winacl.go",
+        "vpn/internal/fsutil/winacl_test.go",
+        "vpn/internal/fsutil/winacl_windows.go"
+      ],
+      "suggested_checks": [
+        "cd vpn && go test -race -count=1 ./cmd/idoris-vpnd/ ./internal/fsutil/",
+        "cd vpn && go test -tags integration -count=1 -timeout 15m -run \"TestR3svcSystemdMachineService|TestR4C.*Service|TestR5CSystemdUserServiceRestarts\" ./integration/"
+      ],
+      "review_status": "pending",
+      "evidence": []
+    },
+    {
+      "id": "deploy-restore",
+      "title": "Control plane, deployment and restore",
+      "primary_paths": [
+        "deploy/.gitignore",
+        "deploy/vpn/.gitignore",
+        "deploy/vpn/bootstrap.sh",
+        "deploy/vpn/bundle.py",
+        "deploy/vpn/compose.yaml",
+        "deploy/vpn/ctl.sh",
+        "deploy/vpn/headplane/config.yaml",
+        "deploy/vpn/headscale/config.yaml",
+        "deploy/vpn/headscale/policy.hujson",
+        "deploy/vpn/offhost-backup.sh",
+        "deploy/vpn/ops-lib.sh",
+        "deploy/vpn/policy.py",
+        "deploy/vpn/tailnet-admin/entrypoint.sh",
+        "deploy/vpn/test/headplane-login.sh",
+        "deploy/vpn/test/probe.sh",
+        "deploy/vpn/test/restore-drill.sh",
+        "deploy/vpn/test/tailnet-entrypoint.sh",
+        "deploy/vpn/test/test_access_flags.sh",
+        "deploy/vpn/test/test_backup_parent.sh",
+        "deploy/vpn/test/test_bundle.py",
+        "deploy/vpn/test/test_compose_env.sh",
+        "deploy/vpn/test/test_headplane_port.sh",
+        "deploy/vpn/test/test_offhost_backup.sh",
+        "deploy/vpn/test/test_policy.py",
+        "deploy/vpn/test/test_r5o_enroll_meta.sh",
+        "deploy/vpn/test/test_r5o_runtime_id.sh",
+        "deploy/vpn/test/test_r5o_sidecar_rollback.sh",
+        "deploy/vpn/test/test_r6o_fixture_owner.sh",
+        "deploy/vpn/test/test_r6o_sidecar_snapshot.sh",
+        "deploy/vpn/test/test_restore_volumes.sh",
+        "deploy/vpn/test/test_sidecar_identity.sh",
+        "vpn/integration/compose.yaml",
+        "vpn/integration/headscale/config.yaml",
+        "vpn/integration/headscale/derp.yaml",
+        "vpn/integration/pki_sans_test.go",
+        "vpn/integration/pki_test.go"
+      ],
+      "suggested_checks": [
+        "python3 -m unittest discover -s deploy/vpn/test -p 'test_*.py' -v",
+        "bash deploy/vpn/test/probe.sh",
+        "bash deploy/vpn/test/restore-drill.sh"
+      ],
+      "review_status": "pending",
+      "evidence": []
+    },
+    {
+      "id": "cross-module",
+      "title": "Cross-module behavior, CI, licenses and release docs",
+      "primary_paths": [
+        ".github/workflows/vpn-ci.yml",
+        ".github/workflows/vpn-deploy.yml",
+        ".github/workflows/vpn-licenses.yml",
+        ".github/workflows/vpn-release.yml",
+        "README.md",
+        "docs/12-VPN-HEADSCALE.md",
+        "docs/13-VPN-CLIENT-MODES.md",
+        "docs/14-VPN-OPERATIONS.md",
+        "docs/15-VPN-LAN-AND-GATEWAY.md",
+        "docs/16-VPN-JOIN-AND-GATEWAY-WIZARD.md",
+        "docs/17-VPN-MEMBER-ONBOARDING.md",
+        "docs/README.md",
+        "docs/adr/0005-vpn-tailscale-client-headscale-control.md",
+        "docs/release/pr-daemon-cooperation.md",
+        "docs/release/vpn-consolidation.md",
+        "docs/release/vpn-review-manifest.json",
+        "vendors/references.lock.tsv",
+        "vpn/.gitignore",
+        "vpn/.golangci.yml",
+        "vpn/Makefile",
+        "vpn/THIRD_PARTY_NOTICES.md",
+        "vpn/go.mod",
+        "vpn/go.sum",
+        "vpn/internal/version/version.go",
+        "vpn/scripts/licenses.go"
+      ],
+      "suggested_checks": [
+        "cd vpn && make test && make lint && make licenses && make build && make build-linux",
+        "cd vpn && make integration"
+      ],
+      "review_status": "pending",
+      "evidence": []
+    }
+  ],
+  "interfaces": [
+    {
+      "path": "vpn/cmd/idoris-vpnd/main.go",
+      "primary_owner": "client-access",
+      "secondary_modules": [
+        "wizard-gateway",
+        "enrollment-credentials"
+      ],
+      "reason": "同一二进制分发 run/status/service 与 join/gateway/ui；enroll 标志也在这里。主责是客户端进程。"
+    },
+    {
+      "path": "vpn/cmd/idoris-vpnd/main_test.go",
+      "primary_owner": "client-access",
+      "secondary_modules": [
+        "wizard-gateway",
+        "enrollment-credentials"
+      ],
+      "reason": "标志和凭证层测试覆盖向导与注册入口。"
+    },
+    {
+      "path": "vpn/internal/vpnd/r4w_socks_auth_path.go",
+      "primary_owner": "client-access",
+      "secondary_modules": [
+        "wizard-gateway"
+      ],
+      "reason": "成员 SOCKS 凭证路径与 daemon state_dir 约定一致，向导必须复审。"
+    },
+    {
+      "path": "vpn/internal/fsutil/atomic.go",
+      "primary_owner": "platform-services",
+      "secondary_modules": [
+        "enrollment-credentials",
+        "wizard-gateway"
+      ],
+      "reason": "注册配置写盘和网关 apply 都走原子替换。"
+    },
+    {
+      "path": "vpn/internal/fsutil/atomic_test.go",
+      "primary_owner": "platform-services",
+      "secondary_modules": [
+        "enrollment-credentials",
+        "wizard-gateway"
+      ],
+      "reason": "原子写回归与注册备份、向导密钥文件同一语义。"
+    },
+    {
+      "path": "vpn/cmd/idoris-vpnd/host.go",
+      "primary_owner": "wizard-gateway",
+      "secondary_modules": [
+        "client-access"
+      ],
+      "reason": "向导 apply 的宿主机文件实现，使用 fsutil。"
+    },
+    {
+      "path": "vpn/cmd/idoris-vpnd/wizard.go",
+      "primary_owner": "wizard-gateway",
+      "secondary_modules": [
+        "enrollment-credentials",
+        "client-access"
+      ],
+      "reason": "加入流程调用注册发现，并读写 vpnd 配置。"
+    },
+    {
+      "path": "vpn/internal/headscale/client.go",
+      "primary_owner": "enrollment-credentials",
+      "secondary_modules": [
+        "platform-services"
+      ],
+      "reason": "注册服务调用的 Headscale REST 面，必须与部署的 Headscale 版本一致。"
+    },
+    {
+      "path": "vpn/internal/headscale/apikey.go",
+      "primary_owner": "enrollment-credentials",
+      "secondary_modules": [
+        "platform-services"
+      ],
+      "reason": "控制面 API key 探测。"
+    },
+    {
+      "path": "deploy/vpn/policy.py",
+      "primary_owner": "deploy-restore",
+      "secondary_modules": [
+        "enrollment-credentials"
+      ],
+      "reason": "渲染 Headscale 策略，并 import enroll_lock；bootstrap 调用它。"
+    },
+    {
+      "path": "deploy/vpn/enroll_lock.py",
+      "primary_owner": "enrollment-credentials",
+      "secondary_modules": [
+        "platform-services",
+        "deploy-restore"
+      ],
+      "reason": "策略渲染和运维脚本共用的注册配置锁。"
+    },
+    {
+      "path": "deploy/vpn/ctl.sh",
+      "primary_owner": "deploy-restore",
+      "secondary_modules": [
+        "enrollment-credentials",
+        "platform-services"
+      ],
+      "reason": "token invite/revoke/offboard 和 tailnet-admin 启停的运维入口。"
+    },
+    {
+      "path": "deploy/vpn/ops-lib.sh",
+      "primary_owner": "deploy-restore",
+      "secondary_modules": [
+        "enrollment-credentials",
+        "platform-services"
+      ],
+      "reason": "运行身份、锁和 compose 辅助，被注册与控制面脚本引用。"
+    },
+    {
+      "path": "deploy/vpn/bootstrap.sh",
+      "primary_owner": "deploy-restore",
+      "secondary_modules": [
+        "platform-services",
+        "enrollment-credentials"
+      ],
+      "reason": "初始化策略、注册文件和 Headplane 访问模式。"
+    },
+    {
+      "path": "deploy/vpn/compose.yaml",
+      "primary_owner": "deploy-restore",
+      "secondary_modules": [
+        "platform-services",
+        "enrollment-credentials"
+      ],
+      "reason": "Headscale、Headplane、enroll、tailnet-admin 的运行组合。"
+    },
+    {
+      "path": "deploy/vpn/test/probe.sh",
+      "primary_owner": "deploy-restore",
+      "secondary_modules": [
+        "platform-services",
+        "enrollment-credentials",
+        "wizard-gateway",
+        "client-access"
+      ],
+      "reason": "双组织隔离探针同时覆盖策略、注册、子网路由和管理员入口。"
+    },
+    {
+      "path": "deploy/vpn/test/test_r5o_enroll_meta.sh",
+      "primary_owner": "deploy-restore",
+      "secondary_modules": [
+        "enrollment-credentials"
+      ],
+      "reason": "回滚必须恢复 enroll 目录和 config.json.lock 的属主。"
+    },
+    {
+      "path": "deploy/vpn/test/test_allow_empty.sh",
+      "primary_owner": "enrollment-credentials",
+      "secondary_modules": [
+        "deploy-restore"
+      ],
+      "reason": "ctl.sh 把 --allow-empty 传给注册 CLI。"
+    },
+    {
+      "path": "deploy/vpn/test/credentials.sh",
+      "primary_owner": "enrollment-credentials",
+      "secondary_modules": [
+        "deploy-restore"
+      ],
+      "reason": "探针启动后的凭证生命周期，依赖 ctl.sh 和正在运行的 enroll。"
+    },
+    {
+      "path": "vpn/integration/integration_test.go",
+      "primary_owner": "client-access",
+      "secondary_modules": [
+        "enrollment-credentials",
+        "platform-services"
+      ],
+      "reason": "真实 Headscale 上的注册、连接和重新认证。"
+    },
+    {
+      "path": "vpn/integration/compose.yaml",
+      "primary_owner": "deploy-restore",
+      "secondary_modules": [
+        "enrollment-credentials",
+        "client-access"
+      ],
+      "reason": "集成实验室的 Headscale/enroll/tailscale 组合。"
+    },
+    {
+      "path": "vpn/integration/r5o_owner_test.go",
+      "primary_owner": "enrollment-credentials",
+      "secondary_modules": [
+        "deploy-restore"
+      ],
+      "reason": "已知失败点：配置备份所有权。部署回滚测试必须一起看。"
+    },
+    {
+      "path": "vpn/integration/r5lead_expire_test.go",
+      "primary_owner": "enrollment-credentials",
+      "secondary_modules": [
+        "platform-services"
+      ],
+      "reason": "对真实 Headscale v0.29.6 过期 pre-auth key。"
+    },
+    {
+      "path": "vpn/integration/lan_test.go",
+      "primary_owner": "wizard-gateway",
+      "secondary_modules": [
+        "platform-services",
+        "client-access"
+      ],
+      "reason": "直连、离网中继和子网路由同时依赖控制面策略与客户端。"
+    },
+    {
+      "path": "vpn/integration/wizard_test.go",
+      "primary_owner": "wizard-gateway",
+      "secondary_modules": [
+        "platform-services",
+        "client-access"
+      ],
+      "reason": "向导加入的端到端证明，含策略批准和成员 SOCKS。"
+    },
+    {
+      "path": "docs/12-VPN-HEADSCALE.md",
+      "primary_owner": "cross-module",
+      "secondary_modules": [
+        "platform-services",
+        "enrollment-credentials",
+        "client-access"
+      ],
+      "reason": "控制面、注册和客户端的设计合同。"
+    },
+    {
+      "path": "docs/13-VPN-CLIENT-MODES.md",
+      "primary_owner": "cross-module",
+      "secondary_modules": [
+        "client-access"
+      ],
+      "reason": "auto/system/embedded 与转发模式。"
+    },
+    {
+      "path": "docs/14-VPN-OPERATIONS.md",
+      "primary_owner": "cross-module",
+      "secondary_modules": [
+        "deploy-restore",
+        "platform-services"
+      ],
+      "reason": "部署、备份和探针的操作合同。"
+    },
+    {
+      "path": "docs/15-VPN-LAN-AND-GATEWAY.md",
+      "primary_owner": "cross-module",
+      "secondary_modules": [
+        "wizard-gateway",
+        "platform-services"
+      ],
+      "reason": "局域网与子网网关。"
+    },
+    {
+      "path": "docs/16-VPN-JOIN-AND-GATEWAY-WIZARD.md",
+      "primary_owner": "cross-module",
+      "secondary_modules": [
+        "wizard-gateway"
+      ],
+      "reason": "加入码和网关向导。"
+    },
+    {
+      "path": "docs/17-VPN-MEMBER-ONBOARDING.md",
+      "primary_owner": "cross-module",
+      "secondary_modules": [
+        "enrollment-credentials",
+        "client-access"
+      ],
+      "reason": "成员邀请、撤销和客户端加入。"
+    },
+    {
+      "path": "docs/adr/0005-vpn-tailscale-client-headscale-control.md",
+      "primary_owner": "cross-module",
+      "secondary_modules": [
+        "enrollment-credentials",
+        "client-access",
+        "wizard-gateway",
+        "platform-services",
+        "deploy-restore"
+      ],
+      "reason": "本增量的总架构决定。"
+    },
+    {
+      "path": "vpn/go.mod",
+      "primary_owner": "cross-module",
+      "secondary_modules": [
+        "enrollment-credentials",
+        "client-access",
+        "wizard-gateway",
+        "platform-services"
+      ],
+      "reason": "模块依赖同时进入两个发布二进制。候选最后一个切片只改了这个文件。"
+    },
+    {
+      "path": "vpn/go.sum",
+      "primary_owner": "cross-module",
+      "secondary_modules": [
+        "enrollment-credentials",
+        "client-access"
+      ],
+      "reason": "依赖校验和。"
+    },
+    {
+      "path": "vpn/scripts/licenses.go",
+      "primary_owner": "cross-module",
+      "secondary_modules": [
+        "client-access",
+        "enrollment-credentials"
+      ],
+      "reason": "两个 cmd 二进制的许可证允许名单。"
+    },
+    {
+      "path": "vpn/internal/version/version.go",
+      "primary_owner": "cross-module",
+      "secondary_modules": [
+        "client-access",
+        "enrollment-credentials"
+      ],
+      "reason": "两个二进制的 ldflags 版本。"
+    },
+    {
+      "path": "vendors/references.lock.tsv",
+      "primary_owner": "cross-module",
+      "secondary_modules": [
+        "platform-services"
+      ],
+      "reason": "上游 Headscale/Tailscale 等引用锁。"
+    }
+  ],
+  "cross_module_requirements": [
+    "Trace enroll -> discovery -> identity certification -> access -> revoke, including in-flight dials and restart.",
+    "Trace wizard plan/join revision -> server confirmation -> credential files -> service installation -> completion.",
+    "Trace invite/revoke -> configuration/backup/lock ownership -> deployment backup/restore and runtime uid.",
+    "Validate all historical blocking content findings against final source and tests; approvals and patch-ids alone are insufficient.",
+    "Cover every changed path once with a primary owner; relevant interfaces have additional reviewers."
+  ],
+  "focused_fix_prs": [
+    {
+      "number": 189,
+      "paths": [
+        "vpn/internal/enroll/invite.go",
+        "vpn/internal/enroll/r5o_owner_unix_test.go"
+      ],
+      "status": "external review and full CI pending; not yet in candidate"
+    }
+  ],
+  "test_execution_notes": [
+    "Suggested checks are not claimed results. Inspect test definitions and prerequisites; zero selected tests or SKIP is not a pass.",
+    "Docker probe/restore tests operate on isolated test deployments; inspect scripts before running and do not use a production deployment.",
+    "Do not invoke credentials.sh, headplane-login.sh or tailnet-entrypoint.sh as standalone tests; those are harness helpers.",
+    "Native Windows/macOS installation and Linux service lifecycle need real-platform evidence; cross-compilation does not supply it."
+  ],
+  "acceptance": {
+    "coverage_assignment_verified": true,
+    "external_review_complete": false,
+    "release_ready": false
+  }
+}
