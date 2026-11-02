@@ -44,6 +44,7 @@ func TestR5ORootKeepsOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertR5OOwner(t, path, 65532, 65532, 0o640)
+	assertR5OOwner(t, path+".bak", 65532, 65532, 0o640)
 	assertR5OOwner(t, path+".lock", 65532, 65532, 0o600)
 
 	if _, err := Invite(path, "acme", "", "https://enroll.example.org", "lab2", false); err != nil {
@@ -53,6 +54,7 @@ func TestR5ORootKeepsOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertR5OOwner(t, path, 65532, 65532, 0o640)
+	assertR5OOwner(t, path+".bak", 65532, 65532, 0o640)
 	assertR5OOwner(t, path+".lock", 65532, 65532, 0o600)
 
 	out := runR5OChild(t, 65532, 65532, "^TestR5ORuntimeMutates$", path, "R5O_OWNER_LABEL=from-runtime")
@@ -60,6 +62,7 @@ func TestR5ORootKeepsOwner(t *testing.T) {
 		t.Fatalf("runtime output:\n%s", out)
 	}
 	assertR5OOwner(t, path, 65532, 65532, 0o640)
+	assertR5OOwner(t, path+".bak", 65532, 65532, 0o640)
 	assertR5OOwner(t, path+".lock", 65532, 65532, 0o600)
 }
 
@@ -99,6 +102,9 @@ func TestR5ORootForeignRefuse(t *testing.T) {
 	}
 	if _, err := os.Lstat(path + ".lock"); !os.IsNotExist(err) {
 		t.Fatalf("foreign invite created a lock: %v", err)
+	}
+	if _, err := os.Lstat(path + ".bak"); !os.IsNotExist(err) {
+		t.Fatalf("foreign invite created a backup: %v", err)
 	}
 }
 
