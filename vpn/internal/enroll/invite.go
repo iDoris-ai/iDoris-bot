@@ -217,7 +217,7 @@ func writeInPlace(path string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	if err := writeBak(resolved+".bak", original, st.Mode().Perm()); err != nil {
+	if err := writeBak(resolved+".bak", original, st.Mode().Perm(), resolved, st); err != nil {
 		return err
 	}
 	f, err := os.OpenFile(resolved, os.O_WRONLY|os.O_TRUNC, 0) //nolint:gosec // rewrite the same inode, including through a symlink
@@ -252,7 +252,7 @@ func writeInPlace(path string, data []byte) error {
 	return nil
 }
 
-func writeBak(path string, data []byte, mode os.FileMode) error {
+func writeBak(path string, data []byte, mode os.FileMode, cfgPath string, st os.FileInfo) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode) //nolint:gosec // backup beside the canonical config
 	if err != nil {
 		return err
@@ -262,6 +262,12 @@ func writeBak(path string, data []byte, mode os.FileMode) error {
 		// Mode on OpenFile applies only when the file is created. An existing
 		// .bak would otherwise keep a looser mode forever.
 		werr = f.Chmod(mode)
+	}
+	if werr == nil {
+		// Root creates this file while the config stays owned by the runtime
+		// user. That user must be able to replace the same backup later.
+		// preserveOwner does not call chown when the caller already owns it.
+		werr = preserveOwner(cfgPath, f, st)
 	}
 	if werr == nil {
 		werr = f.Sync()
